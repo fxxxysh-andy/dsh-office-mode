@@ -1,0 +1,8 @@
+# 依赖与运行时产物：本插件零第三方依赖，中间产物统一进工作目录的 .office/，不进版本库
+node_modules/
+.office/
+
+# 编辑器与系统杂项
+.DS_Store
+Thumbs.db
+*.log

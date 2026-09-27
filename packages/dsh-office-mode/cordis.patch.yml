@@ -1,0 +1,149 @@
+# dsh-office-mode bundle patch.
+#
+# 只插入一行：整能力挂在一个插件行上，配置项全部可选，空配置永远可用。
+#
+# 组合层配置（composition 层）—— 设置页里的改动（用户层）会覆盖这里的同名项：
+#
+#   - id: dsh-office-mode
+#     config:
+#       cacheDir: .office/cache     # 中间文件目录（相对会话工作目录）
+#       scriptTimeoutMs: 60000      # 单次批量执行的超时
+#       defaultTheme: plain         # 默认视觉主题（plain = 素色网格，无背景填充）
+#       keepCache: false            # 默认是否保留中间产物
+#       tools:                      # 工具开关（设置页也能改）
+#         office_help: true
+#         office_run: true
+#         office_memory: true
+#         office_search_run: true   # 内置检索直查（office_search_run）
+#         office_search_brief: true
+#         office_search_dispatch: true
+#         office_parse_findings: true
+#       search:
+#         engine: auto              # auto = 先派子代理、跑不了用内置检索 / subagent / builtin
+#         maxParallel: 4            # 同时铺开几个检索子代理（1-8）
+#         resultLimit: 40           # 解析结果最多列几条（1-40）
+#         outputDir: .office/search # 检索提纲与结果文件目录
+#         provider: auto            # 用哪条联网通道（第二十轮）：auto 按 providerOrder 试，
+#                                   # 也可以固定成 seam / anthropic / openai / tavily / brave /
+#                                   # bocha / exa / serper / searxng / duckduckgo
+#         providerOrder: [seam, anthropic, openai, tavily, brave, bocha, exa, serper, searxng, duckduckgo]
+#         providers:                # 每条通道各自的参数（键集 = 它真正用得上的那几个）
+#           anthropic: { apiKeyEnv: DEEPSEEK_API_KEY, baseURL: ..., model: ..., timeoutMs: 60000 }
+#           tavily:    { apiKeyEnv: TAVILY_API_KEY, timeoutMs: 30000 }
+#           bocha:     { apiKeyEnv: BOCHA_API_KEY, timeoutMs: 30000 }   # 中文长尾好
+#           searxng:   { baseURL: http://127.0.0.1:8080 }               # 自建实例
+#           duckduckgo: { baseURL: https://html.duckduckgo.com/html }   # 免 Key 兜底
+#           # 其余：openai / brave / exa / serper；seam 不吃参数
+#         preprocess:               # 取回来的网页先清洗再进上下文（第二十轮）
+#           mode: article           # article（去导航与样板）/ plain（只行级清洗）/ off（原样）
+#           dropBoilerplate: true   # 丢 cookie 条 / 登录注册 / 订阅分享 / 版权声明
+#           dedupeLines: true       # 重复出现的行只留第一次
+#           minLineChars: 12        # 短于这个长度又不像句子的行当导航丢掉（0 = 关）
+#           keepTitle: true         # 抽标题 / 作者 / 时间进报告
+#         builtin:                  # Anthropic 兼容通道（= providers.anthropic 的老入口）
+#           apiKeyEnv: DEEPSEEK_API_KEY   # 取 Key 的环境变量名（凭据服务 → 环境 → .credentials.yaml）
+#           apiKey: ""                    # 字面量 Key；一般留空
+#           baseURL: https://api.deepseek.com/anthropic/v1
+#           model: deepseek-v4-flash      # 要支持原生 web_search
+#           maxUses: 5                    # 一次检索最多几次原生 web_search
+#           maxTokens: 2048
+#           maxResults: 8                 # 每个渠道/每条直查查询最多几条来源
+#           fetchPages: 2                 # 最多打开几页取正文摘录（0 = 只用搜索片段）
+#           searchTimeoutMs: 60000
+#           fetchTimeoutMs: 20000
+#           maxBytes: 2097152
+#           maxChars: 20000
+#           maxRedirects: 3
+#         # 环境变量覆盖：DSH_OFFICE_SEARCH_BASE_URL / DSH_OFFICE_SEARCH_MODEL /
+#         # DSH_OFFICE_SEARCH_API_KEY_ENV，端点也认宿主的 DEEPSEEK_SEARCH_BASE_URL。
+#       memory:                     # 三层记忆（热记忆 / 台账 / 归档）
+#         enabled: true             # 总开关：关掉后记忆工具、提示段与自动台账一起停
+#         dir: .office/memory       # 记忆目录（相对会话工作目录）
+#         autoLedger: true          # office_run 写出文档时自动登记台账
+#         promptHint: true          # 往系统提示加一段静态说明（不含记忆内容）
+#         userLimitBytes: 4096      # 热记忆「用户偏好」容量上限
+#         projectLimitBytes: 10240  # 热记忆「项目与环境」容量上限
+#         ledgerLimit: 500          # 台账条数上限，超出的最旧记录滚进归档
+#         archiveKeep: 60           # 归档摘要文件数上限
+#         layers:                   # 层拓扑：关掉只是不读不写，不删数据
+#           hot: true
+#           ledger: true
+#           archive: true
+#         scope: workspace          # 记忆范围：workspace（只跟工作目录）/ global（所有项目共用）
+#                                   # / both（两者并存，全局在前、工作区在后）
+#         globalDir: ""             # 全局层目录；留空 = $DSH_HOME/.office/memory
+#         userScope: memory         # USER 偏好范围：memory（跟着 scope）/ global（始终落全局层）
+#         links: true               # 图关系：link / related / 实体视图
+#         autoCapture: true         # 主动记录指引（不是自主记录器）
+#         recallQuality:            # 召回质量 strict-v1（分数 = 命中词占比，不是余弦相似度）
+#           policy: strict-v1       # strict-v1 | off
+#           lowScoreThreshold: 0.25
+#           highScoreThreshold: 0.6
+#           candidateMultiplier: 3
+#           maxMediumResults: 4
+#           maxUnknownResults: 2
+#         quota:                    # 每回合配额（回合号从会话日志的 turn/start 读出）
+#           recallPerTurn: 1        # 第一次带 query 的检索
+#           recallRefinePerTurn: 1  # 后续换词细化
+#           relatedPerTurn: 1       # 图关系遍历
+#       subagentModel:              # 后台任务 Agent 的模型路由（检索子代理）
+#         mode: inherit             # inherit = 跟随主会话；fixed = 用下面的模型
+#         provider: ""              # 留空 = 只覆盖 model，仍在主会话那条路由上
+#         model: ""                 # 留空按 inherit 处理
+#
+# 设置页：设置对话框左侧的「记忆系统」与「办公模式」两个一级导航项
+# （命名空间 dsh-office-mode，两个 section id）。由浏览器半侧 lib/client.js
+# 渲染（通过 package.json 的 dsh.client 声明加载），注册进 settings.section 槽位。
+# 工具开关是即时生效的：关掉某个工具会立刻从模型工具面里移除，不用重启。
+# 「记忆系统」原本是 mnemon 提供的页面；mnemon 关闭后由本插件接住，
+# 迁移入口（node scripts/migrate-mnemon.mjs 或 office_memory 的 migrate 动作）
+# 也写在这一页上。
+#
+# 记忆浏览面板：侧栏的「记忆」入口（注册进 sidebar.panellist + main 两个槽位），
+# 数据来自本插件注册的只读端点 GET /office-memory/snapshot。该端点**只服务
+# 本进程真的跑过办公工具的工作目录**（见 src/view.js 的信任边界说明），
+# 且只接受 GET。组合里没有 webServer（例如 headless）时端点不注册，
+# 面板显示可读提示，插件其余功能不受影响。
+#
+# 设置页的可编辑字段来自 export const Config（schemastery；字段整片标 volatile
+# —— dsh-settings 只接受 volatile 路径的写入）。浏览器半侧按插件行 id 经
+# ctx.configForms 读写；宿主就地更新 volatile 引用并发 settings/document-updated，
+# 插件据此重建工具面，所以工具开关依旧是即时生效的。
+#
+# 宿主没有 settings 服务、或解析不到 schemastery 时，本插件的 Config 退回
+# 「无 schema」（config 原样透传），服务端的命名空间不注册，插件其余功能不受
+# 影响；浏览器半侧拿不到 configForms 时显示可读提示。
+#
+# 子代理：只有 office_search_dispatch 用到，且**不写进模块级 inject**，运行时按
+# ctx.get('subagents') 取（cordis 的 ctx 代理读未 inject 的服务属性会当场抛错，
+# 所以不能用 ctx.subagents）。拿不到服务时派工失败并指向 Agent Teams 的
+# spawn_teammate；精简部署（组合里没有 dsh-base 的 subagent 行）里插件其余功能照常。
+#
+# 内置检索（src/web.js + src/web-providers.js + src/web-preprocess.js）：办公 preset
+# 是一份**完整的**组合（plugins 列表就是那个会话的全部插件行），里面没有
+# @deepseek-ai/dsh-tool-web，所以办公会话的工具面里没有 web_search /
+# advanced_search / platform_search / web_fetch —— 派子代理检索会整批失败
+# （tools.restrict() names unknown global tools "web_search"…，2026-09-25
+# 的真实会话就是这样）。第二十轮起这条通道是**多条**：
+#   1) 接缝优先：宿主的 web 服务 ctx.web（host 层，办公会话照样在；它带来公网地址
+#      校验、地址钉死、同源跳转、体积与超时上限这些现成策略）；
+#   2) 拿不到接缝（或用户点名了别的通道）就按 search.provider / providerOrder 走
+#      多路通道：Anthropic 兼容 + 原生 web_search（默认 DeepSeek 官方）、OpenAI 兼容、
+#      Tavily、Brave、博查、Exa、Serper、自建 SearXNG、DuckDuckGo（免 Key）。
+#      每条通道自己发 HTTP、自己解析，返回统一形状；一条失败就试下一条，
+#      全部失败时把**每条通道的原因**分别写出来（配置缺失 / 网络不可达 / 被挡 / 没结果）。
+#   3) 取正文：接缝优先，其次自带的安全抓取（只许公网地址、只跟同源跳转、限长限时）。
+#      两者拿到的页面都过**内容级成败哨兵**（HTTP 200 也可能是区域封锁页），
+#      再走**脚本式预处理**（src/web-preprocess.js）：去脚本样式与语义骨架、按属性
+#      去样板区、挑主容器、丢样板行、去重、压空行，并把「洗掉多少」写进结果文件与反馈。
+#      哨兵读的是**清洗前**的文本（清洗会把拦截页的样板也删掉，拿清洗后的文本判会把
+#      「目标站拒绝」误判成「正文几乎为空」）。
+# office_search_dispatch 在 auto 引擎下先试子代理，失败（或没有 subagents 服务）就
+# 自动切到这条通道；两边写出的结果文件格式一致，office_parse_findings 一行都不用改。
+# office_search_run 还可以用 provider 参数按次点名一条通道（bocha 中文好、
+# serper 就是 Google、duckduckgo 免 Key），用 preprocess 参数按次改预处理强度。
+
+- insert:
+    - id: dsh-office-mode
+      name: dsh-office-mode
+      config: {}

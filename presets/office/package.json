@@ -1,0 +1,12 @@
+{
+  "name": "@local/dsh-office-preset",
+  "version": "1.0.0",
+  "private": true,
+  "description": "办公模式（office）agent preset 的声明式 bundle：一行 @deepseek-ai/dsh-agent-preset 声明。",
+  "type": "module",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
