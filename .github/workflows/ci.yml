@@ -1,0 +1,39 @@
+name: CI
+
+# 每次推到 main / 开 PR 就跑一遍「不依赖本机环境」的回归。
+#
+# 为什么只跑一部分：插件里有些套件是**量本机的**（preset-check 读 ~/.dsh 的
+# profile、preview / validate-libreoffice 要 LibreOffice、av 要 ffmpeg、
+# python 要解释器、web-verify 要无头 Chrome、web-live 要能出网）。CI runner
+# 上它们必然红，红了也不说明代码有问题。这一批是纯 Node、零依赖、不联网的
+# 那一档，作为「改坏了没有」的守门。（第四十九轮实测：本机 14/14 exit=0。）
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    name: 回归（无外部依赖的套件）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: packages/dsh-office-mode
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 跑套件
+        run: >-
+          node scripts/run-suites.mjs
+          smoke memory kb memory-recall memory-probes archive e2e sites seam
+          plain-default schema-format view format-ppt-math format-word

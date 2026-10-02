@@ -1,0 +1,112 @@
+name: Release
+
+# 打一个 v* 的 tag 就发一版 GitHub Release，并把安装包作为资产挂上去：
+#   - dsh-office-mode-<版本>.tgz    插件本体（npm pack 的产物，files 白名单内的文件）
+#   - dsh-office-preset-<版本>.zip  「办公模式」preset bundle
+#   - SHA256SUMS.txt                上面两个文件的校验和
+#
+# 发布前先跑一遍无外部依赖的回归；tag 与 packages/dsh-office-mode/package.json
+# 的 version 必须一致，不一致当场红（版本号只有一个真源）。
+# 重复跑同一个 tag 是安全的：Release 已存在时改成覆盖上传资产 + 更新说明。
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: 打包并发布
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 校验 tag 与版本号一致
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./packages/dsh-office-mode/package.json').version")"
+          echo "version=${version}" >> "$GITHUB_ENV"
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} 与 package.json 里的 ${version} 不一致（版本号只认 packages/dsh-office-mode/package.json）"
+            exit 1
+          fi
+
+      - name: 回归（发布守门）
+        working-directory: packages/dsh-office-mode
+        run: >-
+          node scripts/run-suites.mjs
+          smoke memory kb memory-recall memory-probes archive e2e sites seam
+          plain-default schema-format view format-ppt-math format-word
+
+      - name: 打包
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # 插件：npm pack 按 package.json 的 files 白名单产出 tgz
+          (cd packages/dsh-office-mode && npm pack --pack-destination "${GITHUB_WORKSPACE}/dist")
+          # preset bundle：解压后交给 plugin_manager 的 install_bundle
+          (cd presets && zip -qr "${GITHUB_WORKSPACE}/dist/dsh-office-preset-${version}.zip" office)
+          # 校验和（挂到 Release 上供核对）
+          (cd dist && sha256sum dsh-office-mode-*.tgz dsh-office-preset-*.zip > SHA256SUMS.txt)
+          ls -l dist
+
+      - name: 写 Release 说明
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/notes.md" <<'EOF'
+          ## 安装
+
+          两件东西分开装：插件是能力，preset 是「办公模式」的说话方式与精简工具目录。
+
+          ```powershell
+          # 1) 插件（能力）：所有模式都能用
+          dsh plugin --profile web add https://github.com/fxxxysh-andy/dsh-office-mode/releases/download/__TAG__/dsh-office-mode-__VERSION__.tgz
+
+          # 2) preset（模式）：解压 dsh-office-preset-__VERSION__.zip，
+          #    再在会话里用 plugin_manager → install_bundle 指向解压出的 office 目录
+          ```
+
+          下载不下来也可以直接下资产里的 tgz / zip 再给本地路径。装完插件后 `office_help`
+          在任意会话可用；选「办公模式」启动的会话才会吃到 persona 与精简工具目录。
+
+          ## 资产
+
+          | 文件 | 是什么 |
+          | --- | --- |
+          | `dsh-office-mode-__VERSION__.tgz` | 插件本体（`npm pack` 产物：`src` / `lib` / `scripts` / `docs` / `cordis.patch.yml` / `SPEC-formats.md` / `README.md`） |
+          | `dsh-office-preset-__VERSION__.zip` | 「办公模式」preset bundle（`presets/office`） |
+          | `SHA256SUMS.txt` | 上面两个文件的 SHA-256 |
+
+          完整源码（含 `test/`）用本页下方的 Source code 压缩包，或 `git clone` 本仓库。
+
+          ## 校验
+
+          ```powershell
+          Get-FileHash .\dsh-office-mode-__VERSION__.tgz -Algorithm SHA256
+          # 与本页 SHA256SUMS.txt 里的那一行对照
+          ```
+          EOF
+          sed -i "s/__VERSION__/${version}/g; s/__TAG__/${GITHUB_REF_NAME}/g" "${RUNNER_TEMP}/notes.md"
+
+      - name: 创建或更新 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
+            gh release edit "${GITHUB_REF_NAME}" --notes-file "${RUNNER_TEMP}/notes.md"
+          else
+            gh release create "${GITHUB_REF_NAME}" dist/* \
+              --title "dsh-office-mode ${GITHUB_REF_NAME}" \
+              --notes-file "${RUNNER_TEMP}/notes.md" \
+              --generate-notes
+          fi

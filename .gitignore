@@ -6,3 +6,7 @@ node_modules/
 .DS_Store
 Thumbs.db
 *.log
+
+# 发布资产：release.yml 在 CI 上打出来的 tgz / zip 只挂 Release，不进版本库
+dist/
+*.tgz

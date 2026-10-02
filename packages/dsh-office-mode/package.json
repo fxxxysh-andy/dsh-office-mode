@@ -1,15 +1,38 @@
 {
   "name": "dsh-office-mode",
   "version": "0.1.0",
-  "private": true,
   "description": "办公模式：极简工具面 + 批量执行 + 零依赖 Word/Excel/PPT 引擎。Office mode for DeepSeek Harness.",
   "type": "module",
   "main": "src/index.js",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fxxxysh-andy/dsh-office-mode.git",
+    "directory": "packages/dsh-office-mode"
+  },
+  "homepage": "https://github.com/fxxxysh-andy/dsh-office-mode#readme",
+  "bugs": {
+    "url": "https://github.com/fxxxysh-andy/dsh-office-mode/issues"
+  },
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "office",
+    "docx",
+    "xlsx",
+    "pptx",
+    "latex",
+    "pdf"
+  ],
   "files": [
     "src",
     "lib",
     "scripts",
+    "docs",
     "cordis.patch.yml",
+    "SPEC-formats.md",
     "README.md"
   ],
   "exports": {
@@ -58,6 +81,5 @@
   },
   "engines": {
     "node": ">=20"
-  },
-  "license": "MIT"
+  }
 }
