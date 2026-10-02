@@ -13,6 +13,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import assert from 'node:assert/strict';
 
 import { resolveHostPath } from './host-modules.mjs';
+// 站点目录是**服务端**的模块：测试跑在 node 侧，可以直接 import 真源，
+// 与 bundle 里镜像的那一份逐条比对（浏览器产物不能 import 它，只能镜像）。
+import { BUILTIN_SITES, SITE_PRIORITY_LIMITS, SITE_TYPES } from '../src/site-catalog.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const BUNDLE = join(here, '..', 'lib', 'client.js');
@@ -186,13 +189,18 @@ function makeSnapshot(overrides = {}) {
             quota: { recallPerTurn: 1, recallRefinePerTurn: 1, relatedPerTurn: 1 },
             limits: { userLimitBytes: 4096, projectLimitBytes: 10240, ledgerLimit: 500, archiveKeep: 60 },
         },
-        stores: [{ id: 'workspace', dir: '.office/memory', hot: 1, ledger: 1, archive: 1, archiveFiles: 1, links: 1 }],
-        // counts 有两个口径（见 src/view.js 的注释）：hot/ledger/archive/links/entities 是
-        // 「列表里现在有几条」（过滤并截断之后），ledgerTotal/archiveFiles/archiveItems 是
-        // 容量条用的未过滤总数。默认夹具里两者相等，专门的口径用例会造出差异。
+        stores: [{
+            id: 'workspace', dir: '.office/memory', hot: 1, ledger: 1, archive: 1, archiveFiles: 1, links: 1,
+            // 知识库计数（第四十二轮）：面板的存储卡按它画「知识库 N 篇 / M 块」。
+            kb: { docs: 1, chunks: 3, bytes: 4096, tiers: { verified: 1, user: 0, unverified: 0 } },
+        }],
+        // counts 有两个口径（见 src/view.js 的注释）：hot/ledger/archive/links/entities/kb 是
+        // 「列表里现在有几条」（过滤并截断之后），ledgerTotal/archiveFiles/archiveItems/kbTotal
+        // 是容量与「库里一共多少」用的未过滤总数。默认夹具里两者相等，专门的口径用例会造出差异。
         counts: {
-            hot: 1, ledger: 1, archive: 1, links: 1, entities: 1,
+            hot: 1, ledger: 1, archive: 1, links: 1, entities: 1, kb: 1,
             ledgerTotal: 1, archiveFiles: 1, archiveItems: 1,
+            kbTotal: 1, kbChunks: 3, kbBytes: 4096, kbTruncated: false,
         },
         hot: [{
             id: 'm-1', target: 'user', importance: 'critical', origin: 'global',
@@ -205,6 +213,12 @@ function makeSnapshot(overrides = {}) {
         archive: [{
             id: '', month: '2026-09', kind: 'mnemon', at: '2026-09-20T00:00:00.000Z', origin: 'workspace',
             importance: 'normal', category: 'fact', entities: ['系统A'], tags: ['迁移'], text: '长期记忆一条',
+        }],
+        // 知识库文档（kb 一期）：字段名照抄 src/view.js 里 kb[] 的契约。
+        kb: [{
+            id: 'kb:8f14e45f', path: '来源/方法论.md', title: '方法论笔记', hash: '8f14e45f',
+            bytes: 4096, chars: 2048, chunks: 3, tier: 'verified', at: '2026-09-30T10:00:00.000Z',
+            origin: 'workspace',
         }],
         links: [{
             id: 'K-1', sourceId: 'm-1', targetId: 'L-1', kind: 'related', note: '',
@@ -227,6 +241,9 @@ function loadBundle(options = {}) {
     // （reduced-motion 下的平滑滚动）。两者都从 window 上读，所以按需注入。
     if (options.navigator !== undefined) win.navigator = options.navigator;
     if (options.matchMedia !== undefined) win.matchMedia = options.matchMedia;
+    // 第三十五轮：设置页分组的开合状态记在 localStorage 里（拿不到就退回内存）。
+    // 注入一个假的才能验「跨刷新恢复」与「坏记录不抛错」这两条。
+    if (options.localStorage !== undefined) win.localStorage = options.localStorage;
     const fake = makeFakeReact();
     const require = (name) => {
         if (name === 'react') return fake.React;
@@ -516,13 +533,27 @@ const SAMPLE_VALUE = {
     },
     subagentModel: { mode: 'inherit', provider: '', model: '' },
     search: {
-        subagentTools: ["web_search", "advanced_search", "platform_search", "web_fetch", "read", "read_image", "write"],
+        subagentTools: ["office_web_search", "office_web_fetch", "read", "read_image", "write"],
         maxParallel: 4,
         resultLimit: 40,
         maxChannels: 12,
         outputDir: '.office/search',
         requireCrossSource: true,
         fallbackOnPlatformError: true,
+        // 站点清单：schema 的默认值就是内置目录（见 src/site-catalog.js），这里给它的
+        // 一个子集（四条、跨三组），行数才数得清；「恢复内置默认」另有断言对着
+        // BUILTIN_SITES.length，两条互不替代。
+        sites: {
+            enabled: true,
+            fallback: true,
+            maxPerCall: 3,
+            entries: [
+                { type: 'academic', domain: 'arxiv.org', label: 'arXiv', note: '预印本，理工科一手材料', enabled: true },
+                { type: 'academic', domain: 'sci-hub.se', label: 'Sci-Hub', note: '影子图书馆，默认关闭', enabled: false },
+                { type: 'code', domain: 'github.com', label: 'GitHub', note: '仓库、Issue 与讨论', enabled: true },
+                { type: 'custom', domain: 'example.com', label: '示例站', note: '自己加的站点', enabled: true },
+            ],
+        },
     },
     documents: {
         defaultTheme: 'plain',
@@ -531,6 +562,14 @@ const SAMPLE_VALUE = {
         cacheDir: '.office/cache',
         keepCache: false,
     },
+    // Python 组：第三十八轮补进界面。样例给一份**非默认**的值（解释器写绝对路径、
+    // 超时与产物目录都改过），这样「界面读到的是设置里的值，而不是兜底常量」才测得出。
+    python: {
+        enabled: true,
+        bin: 'C:\\Python313\\python.exe',
+        timeoutMs: 60000,
+        outDir: 'python/out',
+    },
     av: {
         enabled: true,
         ffmpegPath: '',
@@ -538,6 +577,7 @@ const SAMPLE_VALUE = {
         modelDir: '',
         language: 'zh',
         chunkSeconds: 120,
+        overlapSeconds: 0.5,
         maxSeconds: 3600,
         timeoutMs: 300000,
         precision: 'int8',
@@ -700,7 +740,7 @@ await check('主题用下拉，选项覆盖服务端支持的主题', () => {
 
 await check('子代理工具多选：点击会增删并写回数组', () => {
     const value = JSON.parse(JSON.stringify(SAMPLE_VALUE));
-    value.search.subagentTools = ['web_search', 'write'];
+    value.search.subagentTools = ['office_web_search', 'write'];
     const scope = makeScope(value);
     const { mod, ctx, registrations } = loadBundle({ forms: scope.forms });
     mod.apply(ctx);
@@ -708,27 +748,27 @@ await check('子代理工具多选：点击会增删并写回数组', () => {
     const row = findByLabel(tree, '子代理可用工具');
     assert.ok(row, '应渲染子代理工具这一行');
     const chips = walk(row).filter((node) => node.props && typeof node.props.onClick === 'function' && node.props.role === 'checkbox');
-    assert.equal(chips.length, 7, '应渲染七个可选工具');
-    // 勾上一个未选的（platform_search）
+    assert.equal(chips.length, 5, '应渲染五个可选工具');
+    // 勾上一个未选的（read）
     const target = chips.find((c) => walk(c).some((n) => {
         const kids = n.props && n.props.children;
-        return Array.isArray(kids) && kids.includes('平台检索');
+        return Array.isArray(kids) && kids.includes('读文本');
     }));
-    assert.ok(target, '应找到「平台检索」这个标签');
+    assert.ok(target, '应找到「读文本」这个标签');
     target.props.onClick(true);
-    assert.deepEqual(scope.writes[0], ['search.subagentTools', ['web_search', 'write', 'platform_search']]);
+    assert.deepEqual(scope.writes[0], ['search.subagentTools', ['office_web_search', 'write', 'read']]);
     // 再取消一个已选的（write）
     const writeChip = chips.find((c) => walk(c).some((n) => {
         const kids = n.props && n.props.children;
         return Array.isArray(kids) && kids.includes('写文件');
     }));
     writeChip.props.onClick(false);
-    assert.deepEqual(scope.writes[1], ['search.subagentTools', ['web_search']]);
+    assert.deepEqual(scope.writes[1], ['search.subagentTools', ['office_web_search']]);
 });
 
 await check('取消 write 时给出落盘警告', () => {
     const value = JSON.parse(JSON.stringify(SAMPLE_VALUE));
-    value.search.subagentTools = ['web_search'];
+    value.search.subagentTools = ['office_web_search'];
     const scope = makeScope(value);
     const { mod, ctx, registrations } = loadBundle({ forms: scope.forms });
     mod.apply(ctx);
@@ -766,6 +806,292 @@ await check('写入失败时把错误显示出来，而不是静默吞掉', asyn
     const after = render(officeReg(registrations));
     const texts = walk(after).map((n) => n.props && n.props.children).flat().filter((c) => typeof c === 'string');
     assert.ok(texts.some((t) => t.includes('写入失败')), '应显示写入失败');
+});
+
+// ── 站点清单（检索编排组里的可视化编辑器）─────────────────────────────────
+//
+// 数据契约（src/settings.js 的 search.sites 段，见 src/site-catalog.js）：
+//   enabled / fallback 两个布尔 + maxPerCall（1..8）+ entries 一条数组。
+// 界面把 entries 当**整条数组**写回（没有「只改第 n 条」的协议），所以下面每一条
+// 交互断言都要同时核对「路径是 search.sites.entries」与「写回的那条数组长什么样」。
+
+/**
+ * 从 bundle 源码里抠出一个顶层常量数组字面量并求值。
+ *
+ * 浏览器产物是 CJS 单文件、这些常量不导出，而「逐条比对」不能靠
+ * `source.includes(...)`（那是子串核对，改了字段名照样过）。数组里只有字符串与
+ * 布尔，跳掉字符串后按方括号配平，再用 new Function 求值即可（行注释不影响）。
+ */
+function bundleArrayLiteral(source, name) {
+    const marker = 'const ' + name + ' = [';
+    const at = source.indexOf(marker);
+    assert.ok(at >= 0, `bundle 里应有 ${name} 常量`);
+    const start = at + marker.length - 1;
+    let depth = 0;
+    let quote = null;
+    for (let index = start; index < source.length; index += 1) {
+        const ch = source[index];
+        if (quote !== null) {
+            if (ch === '\\') { index += 1; continue; }
+            if (ch === quote) quote = null;
+            continue;
+        }
+        if (ch === '"' || ch === "'") { quote = ch; continue; }
+        if (ch === '[') depth += 1;
+        else if (ch === ']') {
+            depth -= 1;
+            if (depth === 0) return new Function('return ' + source.slice(start, index + 1))();
+        }
+    }
+    throw new Error(`${name} 的数组字面量没有闭合`);
+}
+
+/** 用带站点清单的夹具渲染办公模式那一页（patch 为 null = 整个 search.sites 缺失）。 */
+function renderSites(patch, options = {}) {
+    const value = JSON.parse(JSON.stringify(SAMPLE_VALUE));
+    value.search.sites = patch === null
+        ? {}
+        : Object.assign({}, value.search.sites, patch);
+    const scope = makeScope(value, options);
+    const { mod, ctx, registrations } = loadBundle({ forms: scope.forms });
+    mod.apply(ctx);
+    const panel = officeReg(registrations);
+    return { tree: render(panel), panel, scope };
+}
+
+/** 某一行的启用开关（数据属性挂在 Toggle 外面那层，开关本身是里面的 input）。 */
+function siteToggleOf(tree, domain) {
+    const cell = byProp(tree, 'data-site-toggle', domain)[0];
+    assert.ok(cell, `应有 ${domain} 这一行的启用开关`);
+    const box = walk(cell).find((node) => node.type === 'input' && node.props.type === 'checkbox');
+    assert.ok(box, `${domain} 那一行应渲染出复选框`);
+    return box;
+}
+
+await check('站点清单：镜像目录与服务端 BUILTIN_SITES 逐条相等（含字段顺序）', () => {
+    const mirror = bundleArrayLiteral(readFileSync(BUNDLE, 'utf8'), 'SITE_CATALOG');
+    assert.equal(mirror.length, BUILTIN_SITES.length, '条数要与服务端一致');
+    assert.deepEqual(mirror, BUILTIN_SITES.map((item) => Object.assign({}, item)),
+        '字段名与取值都要与服务端一致（改了一边就必须改另一边）');
+    assert.deepEqual(mirror.map((item) => Object.keys(item)), BUILTIN_SITES.map((item) => Object.keys(item)),
+        '字段顺序也要一致：界面按这个顺序摆开关 / 域名 / 显示名 / 说明');
+    assert.deepEqual(mirror.map((item) => item.domain), BUILTIN_SITES.map((item) => item.domain),
+        '条目顺序就是默认优先顺序');
+});
+
+await check('站点清单：镜像类型表与服务端 SITE_TYPES 逐条相等', () => {
+    const mirror = bundleArrayLiteral(readFileSync(BUNDLE, 'utf8'), 'SITE_TYPES');
+    assert.deepEqual(mirror, SITE_TYPES.map((item) => Object.assign({}, item)));
+    assert.deepEqual(mirror.map((item) => Object.keys(item)), SITE_TYPES.map((item) => Object.keys(item)));
+});
+
+await check('站点清单：单次最多的区间与服务端 SITE_PRIORITY_LIMITS 一致', () => {
+    const mirror = bundleArrayLiteral(readFileSync(BUNDLE, 'utf8'), 'SITE_MAX_PER_CALL');
+    assert.deepEqual(mirror, [...SITE_PRIORITY_LIMITS.maxPerCall]);
+});
+
+await check('站点清单：两个开关分别写回 search.sites.enabled / fallback', () => {
+    const { tree, scope } = renderSites({});
+    const on = controlOf(findByLabel(tree, '站点优先检索'));
+    assert.ok(on, '应渲染「站点优先检索」这一行');
+    assert.equal(on.props.type, 'checkbox');
+    assert.equal(on.props.checked, true, '夹具里是开着的');
+    const back = controlOf(findByLabel(tree, '退回泛搜'));
+    assert.equal(back.props.type, 'checkbox');
+    assert.equal(back.props.checked, true);
+    on.props.onChange(eventOf({ checked: false }));
+    back.props.onChange(eventOf({ checked: false }));
+    assert.deepEqual(scope.writes[0], ['search.sites.enabled', false]);
+    assert.deepEqual(scope.writes[1], ['search.sites.fallback', false]);
+    // 值缺失（schema 还没接线 / 从没配过）时按「开」显示，与服务端默认一致。
+    const bare = renderSites({ enabled: undefined, fallback: undefined });
+    assert.equal(controlOf(findByLabel(bare.tree, '站点优先检索')).props.checked, true);
+    assert.equal(controlOf(findByLabel(bare.tree, '退回泛搜')).props.checked, true);
+});
+
+await check('站点清单：单次最多限定是 1..8 的数字输入，写回 search.sites.maxPerCall', () => {
+    const { tree, panel, scope } = renderSites({});
+    const input = controlOf(findByLabel(tree, '单次最多限定'));
+    assert.ok(input);
+    assert.equal(input.props.type, 'number');
+    assert.equal(String(input.props.value), '3', '夹具里是 3');
+    assert.equal(input.props.min, 1);
+    assert.equal(input.props.max, 8);
+    input.props.onChange(eventOf({ value: '6' }));
+    // 数字控件是「本地草稿 + 失焦提交」：草稿进 state 之后要重渲染一次，
+    // 新的 onBlur 才拿得到新草稿（真实 React 也是这个次序）。
+    const after = render(panel);
+    controlOf(findByLabel(after, '单次最多限定')).props.onBlur();
+    assert.deepEqual(scope.writes[scope.writes.length - 1], ['search.sites.maxPerCall', 6]);
+});
+
+await check('站点清单：按类型分组渲染，行数等于条目数', () => {
+    const { tree } = renderSites({});
+    const rows = byProp(tree, 'data-site-row');
+    assert.equal(rows.length, 4, '夹具四条就该有四行');
+    assert.deepEqual(rows.map((node) => node.props['data-site-row']),
+        ['arxiv.org', 'sci-hub.se', 'github.com', 'example.com']);
+    assert.deepEqual(byProp(tree, 'data-site-group').map((node) => node.props['data-site-group']),
+        ['academic', 'code', 'custom'], '分组顺序跟着 SITE_TYPES（空组不画）');
+    const texts = textsOf(tree);
+    for (const name of ['学术', '代码', '自定义']) {
+        assert.ok(texts.includes(name), `分组标题要用 SITE_TYPES 的 name：${name}`);
+    }
+    // 编辑器里不许漏出 undefined / NaN（属性、样式与文本一起查）。
+    for (const text of stringsOf(byProp(tree, 'data-site-editor')[0])) {
+        assert.ok(!text.includes('undefined') && !text.includes('NaN'), `界面上出现了 ${text}`);
+    }
+    // 勾选态的条数 = 清单里 enabled 的条数（夹具 4 条里 3 条是开的）。
+    const boxes = walk(byProp(tree, 'data-site-editor')[0]).filter((node) => node.type === 'input' && node.props.type === 'checkbox');
+    assert.equal(boxes.length, 4, '每条一行，行行一个开关');
+    assert.equal(boxes.filter((node) => node.props.checked === true).length, 3);
+});
+
+await check('站点清单：行内的启用开关写回整条数组（长度不变、只翻这一条）', () => {
+    const { tree, scope } = renderSites({});
+    const box = siteToggleOf(tree, 'sci-hub.se');
+    assert.equal(box.props.checked, false, '默认关闭的影子图书馆应显示未勾选');
+    box.props.onChange(eventOf({ checked: true }));
+    assert.equal(scope.writes[0][0], 'search.sites.entries');
+    const written = scope.writes[0][1];
+    assert.equal(written.length, 4);
+    assert.equal(written[1].enabled, true);
+    assert.deepEqual(written.map((item) => item.enabled), [true, true, true, true]);
+    assert.equal(written[0].enabled, true, '别的条目不受影响');
+});
+
+await check('站点清单：上移 / 下移交换数组里相邻的两项', () => {
+    const { tree, scope } = renderSites({});
+    byProp(tree, 'data-site-up', 'sci-hub.se')[0].props.onClick();
+    assert.equal(scope.writes[0][0], 'search.sites.entries');
+    assert.deepEqual(scope.writes[0][1].map((item) => item.domain),
+        ['sci-hub.se', 'arxiv.org', 'github.com', 'example.com']);
+    assert.equal(scope.writes[0][1][0].type, 'academic', '只是换位置，字段不带丢');
+    assert.equal(scope.writes[0][1][0].enabled, false, '关闭状态跟着走');
+    byProp(tree, 'data-site-down', 'sci-hub.se')[0].props.onClick();
+    assert.deepEqual(scope.writes[1][1].map((item) => item.domain),
+        ['arxiv.org', 'github.com', 'sci-hub.se', 'example.com']);
+    // 首行的「上移」与末行的「下移」没有去处，应当禁用。
+    assert.equal(byProp(tree, 'data-site-up', 'arxiv.org')[0].props.disabled, true);
+    assert.equal(byProp(tree, 'data-site-down', 'example.com')[0].props.disabled, true);
+});
+
+await check('站点清单：删除一行后写回 search.sites.entries，长度减一', () => {
+    const { tree, scope } = renderSites({});
+    byProp(tree, 'data-site-remove', 'github.com')[0].props.onClick();
+    assert.equal(scope.writes[0][0], 'search.sites.entries');
+    assert.equal(scope.writes[0][1].length, 3);
+    assert.deepEqual(scope.writes[0][1].map((item) => item.domain),
+        ['arxiv.org', 'sci-hub.se', 'example.com']);
+});
+
+await check('站点清单：恢复内置默认写回内置目录（长度等于 BUILTIN_SITES）', () => {
+    const { tree, scope } = renderSites({});
+    byProp(tree, 'data-site-reset')[0].props.onClick();
+    assert.equal(scope.writes[0][0], 'search.sites.entries');
+    const written = scope.writes[0][1];
+    assert.equal(written.length, BUILTIN_SITES.length);
+    assert.deepEqual(written, BUILTIN_SITES.map((item) => Object.assign({}, item)));
+});
+
+await check('站点清单：改域名先规范化（去协议 / 路径 / www. / 大写）再写回', () => {
+    const { tree, scope } = renderSites({});
+    const input = byProp(tree, 'data-site-domain', 'example.com')[0];
+    input.props.onBlur(eventOf({ value: '  HTTPS://WWW.Docs.Example.COM/guide?x=1  ' }));
+    assert.equal(scope.writes[0][0], 'search.sites.entries');
+    assert.equal(scope.writes[0][1][3].domain, 'docs.example.com');
+    assert.equal(scope.writes[0][1].length, 4, '长度不变');
+    assert.equal(scope.writes[0][1][3].label, '示例站', '只动域名，别的字段原样带回去');
+    // 规范化之后等于原值（只是大小写 / 前缀的差别）就不写设置。
+    byProp(tree, 'data-site-domain', 'example.com')[0].props.onBlur(eventOf({ value: 'www.EXAMPLE.com/' }));
+    assert.equal(scope.writes.length, 1, '没变就不该写');
+});
+
+await check('站点清单：非法域名不写入，并给一行错误提示', () => {
+    const { tree, panel, scope } = renderSites({});
+    byProp(tree, 'data-site-domain', 'github.com')[0].props.onBlur(eventOf({ value: '不是域名' }));
+    assert.equal(scope.writes.length, 0, '不合法的域名不该写进设置');
+    const after = render(panel);
+    assert.equal(byProp(after, 'data-site-error').length, 1, '应给一行错误提示');
+    const texts = textsOf(after);
+    assert.ok(texts.some((t) => t.includes('不合法')), '提示要说明哪一条不合法');
+    assert.ok(texts.some((t) => t.includes('不是域名')), '提示要带上写进来的那个值');
+});
+
+await check('站点清单：域名重复不写入，并点名重复的那个域名', () => {
+    const { tree, panel, scope } = renderSites({});
+    byProp(tree, 'data-site-domain', 'github.com')[0].props.onBlur(eventOf({ value: 'https://www.arXiv.org/list' }));
+    assert.equal(scope.writes.length, 0);
+    const texts = textsOf(render(panel));
+    assert.ok(texts.some((t) => t.includes('已经在清单里')), '要说明是重复');
+    assert.ok(texts.some((t) => t.includes('arxiv.org')), '要点名重复的域名（规范化之后的那一个）');
+});
+
+await check('站点清单：新增按表单追加到数组末尾（显示名留空回落域名）', () => {
+    const { tree, panel, scope } = renderSites({});
+    const typeSelect = walk(byProp(tree, 'data-site-add-type')[0]).find((node) => node.type === 'select');
+    assert.ok(typeSelect, '新增表单应有类型下拉');
+    assert.equal(typeSelect.props.value, 'custom', '默认类型是自定义');
+    typeSelect.props.onChange(eventOf({ value: 'book' }));
+    let now = render(panel);
+    byProp(now, 'data-site-add-domain')[0].props.onChange(eventOf({ value: 'https://www.Gutenberg.org/' }));
+    now = render(panel);
+    byProp(now, 'data-site-add-label')[0].props.onChange(eventOf({ value: '' }));
+    now = render(panel);
+    byProp(now, 'data-site-add-note')[0].props.onChange(eventOf({ value: '公版电子书' }));
+    now = render(panel);
+    byProp(now, 'data-site-add')[0].props.onClick();
+    assert.equal(scope.writes[0][0], 'search.sites.entries');
+    assert.equal(scope.writes[0][1].length, 5, '追加到末尾');
+    assert.deepEqual(scope.writes[0][1][4],
+        { type: 'book', domain: 'gutenberg.org', label: 'gutenberg.org', note: '公版电子书', enabled: true });
+
+    // 表单里的非法域名同样不写入，并且不会顺手把已有条目删掉。
+    byProp(render(panel), 'data-site-add-domain')[0].props.onChange(eventOf({ value: 'localhost' }));
+    const again = render(panel);
+    byProp(again, 'data-site-add')[0].props.onClick();
+    assert.equal(scope.writes.length, 1, '缺点的域名不该进清单');
+    assert.ok(textsOf(render(panel)).some((t) => t.includes('不合法')));
+});
+
+await check('站点清单：空清单给空态说明与「载入内置目录」', () => {
+    const { tree, scope } = renderSites({ entries: [] });
+    assert.equal(byProp(tree, 'data-site-row').length, 0, 'entries=[] 就是真的没有站点');
+    assert.ok(textsOf(tree).some((t) => t.includes('当前清单为空')), '要给一句空态说明');
+    assert.equal(byProp(tree, 'data-site-load').length, 1);
+    byProp(tree, 'data-site-load')[0].props.onClick();
+    assert.equal(scope.writes[0][0], 'search.sites.entries');
+    assert.equal(scope.writes[0][1].length, BUILTIN_SITES.length);
+});
+
+await check('站点清单：拿不到 entries 时按内置目录显示（不画空清单）', () => {
+    const { tree } = renderSites({ entries: undefined });
+    assert.equal(byProp(tree, 'data-site-row').length, BUILTIN_SITES.length);
+    assert.equal(byProp(tree, 'data-site-empty').length, 0);
+    const missing = renderSites(null);
+    assert.equal(byProp(missing.tree, 'data-site-row').length, BUILTIN_SITES.length,
+        '整个 search.sites 缺失时也按内置目录显示');
+});
+
+await check('站点清单：只读连接下所有控件禁用', () => {
+    const { tree } = renderSites({}, { writable: false });
+    const editor = byProp(tree, 'data-site-editor')[0];
+    assert.ok(editor, '应渲染出清单编辑器');
+    const controls = walk(editor).filter((node) => node.type === 'input' || node.type === 'select' || node.type === 'button');
+    assert.ok(controls.length >= 16, `应渲染出开关 / 输入框 / 按钮，实际 ${controls.length} 个`);
+    for (const node of controls) assert.equal(node.props.disabled, true, '只读时控件必须禁用');
+    assert.equal(controlOf(findByLabel(tree, '站点优先检索')).props.disabled, true);
+    assert.equal(controlOf(findByLabel(tree, '单次最多限定')).props.disabled, true);
+});
+
+await check('站点清单：改显示名与说明沿用同一个整条数组写回', () => {
+    const { tree, scope } = renderSites({});
+    byProp(tree, 'data-site-label', 'example.com')[0].props.onBlur(eventOf({ value: '示例站点' }));
+    byProp(tree, 'data-site-note', 'example.com')[0].props.onBlur(eventOf({ value: '  自己加的站点，随便写  ' }));
+    assert.deepEqual(scope.writes.map((item) => item[0]), ['search.sites.entries', 'search.sites.entries']);
+    assert.equal(scope.writes[0][1][3].label, '示例站点');
+    assert.equal(scope.writes[1][1][3].note, '自己加的站点，随便写', '首尾空白要去掉');
+    assert.equal(scope.writes[1][1].length, 4);
 });
 
 // ── 排版结构 ──────────────────────────────────────────────────────────────
@@ -870,8 +1196,8 @@ function assertCovers(source, schema, group) {
 }
 
 await check('界面覆盖服务端 search 组里的每个参数（含嵌套的 builtin）', async () => {
-    // 「办公 preset 里没有 web_search」这件事的修法就落在这一组参数上：
-    // schema 加了 search.builtin.* 而界面忘了加行 = 用户永远调不到它。
+    // 「工具面里没有 web_search 时，内置检索的每个参数都要能在界面上调到」这件事就落在这组参数上：
+    // schema 加了 search.builtin.* / search.proxy 而界面忘了加行 = 用户永远调不到它。
     const { createOfficeSettings } = await import('../src/settings.js');
     const z = await loadSchemastery();
     if (z === undefined) {
@@ -916,7 +1242,7 @@ await check('界面覆盖服务端 memory 组里的每个参数（含嵌套的 l
     const paths = assertCovers(source, schema.memory, 'memory');
     assert.ok(paths.length >= 20, `memory 组参数过少：${paths.length}`);
     // 嵌套组的叶子必须真的被摊出来，否则上面那条递归等于没跑。
-    for (const nested of ['memory.layers.hot', 'memory.recallQuality.policy', 'memory.quota.recallPerTurn']) {
+    for (const nested of ['memory.layers.hot', 'memory.recallQuality.policy', 'memory.quota.recallPerTurn', 'memory.quota.kbSearchPerTurn']) {
         assert.ok(paths.includes(nested), `没有解析出嵌套参数 ${nested}`);
     }
 });
@@ -948,6 +1274,83 @@ await check('界面覆盖服务端 av 组里的每个参数（音频与视频）
     return `${paths.length} 个参数都有对应控件`;
 });
 
+await check('界面覆盖服务端 python 组里的每个参数（计算与绘图）', async () => {
+    // 第二十二轮只给 av 组补了这条核对，python 组一直是「服务端有、界面没有」——
+    // 四个参数只能改配置文件，而两边（schema 与界面）都不会报错。
+    // 第三十八轮把这一组补进界面，同时把它钉在这条断言上。
+    const { createOfficeSettings } = await import('../src/settings.js');
+    const z = await loadSchemastery();
+    if (z === undefined) {
+        console.log('      （本机解析不到 @deepseek-ai/schemastery，跳过这一项）');
+        return;
+    }
+    const schema = await resolvePlain(z, createOfficeSettings(z));
+    const source = readFileSync(BUNDLE, 'utf8');
+    const paths = assertCovers(source, schema.python, 'python');
+    assert.deepEqual(paths.slice().sort(), ['python.bin', 'python.enabled', 'python.outDir', 'python.timeoutMs'],
+        'python 组就是这四个参数，多一个少一个都要在这里显形');
+    return `${paths.length} 个参数都有对应控件`;
+});
+
+await check('Python 计算与绘图：四个控件都在，读到的是设置里的值而不是兜底常量', () => {
+    const scope = makeScope(SAMPLE_VALUE);
+    const { mod, ctx, registrations } = loadBundle({ forms: scope.forms });
+    mod.apply(ctx);
+    const tree = render(officeReg(registrations));
+    for (const label of ['启用', '解释器路径', '运行超时', '产物目录']) {
+        assert.ok(rowInGroup(tree, 'python', label), `python 组缺少「${label}」这一行`);
+    }
+    // 解释器是文本输入：样例给的绝对路径要原样显示（不是 placeholder 的「留空自动探测」）。
+    const bin = controlOf(rowInGroup(tree, 'python', '解释器路径'));
+    assert.equal(bin.type, 'input');
+    assert.equal(bin.props.defaultValue, 'C:\\Python313\\python.exe');
+    assert.equal(bin.props.placeholder, '留空 = 自动探测');
+    const outDir = controlOf(rowInGroup(tree, 'python', '产物目录'));
+    assert.equal(outDir.props.defaultValue, 'python/out', '产物目录要显示设置里的值');
+    const timeout = controlOf(rowInGroup(tree, 'python', '运行超时'));
+    // NumberField 的受控值是字符串（`useState(String(props.value))`），所以比的是 '60000'。
+    assert.equal(timeout.props.value, '60000', '超时要显示设置里的值（60 秒），不是默认 120 秒');
+    assert.equal(timeout.props.max, 900000, '上界要与服务端 schema 一致');
+    return '四个控件都读到设置里的值';
+});
+
+await check('Python 计算与绘图：解释器路径失焦写回 python.bin（留空也写，自动探测要能改回来）', () => {
+    const scope = makeScope(SAMPLE_VALUE);
+    const { mod, ctx, registrations } = loadBundle({ forms: scope.forms });
+    mod.apply(ctx);
+    const tree = render(officeReg(registrations));
+    const bin = controlOf(rowInGroup(tree, 'python', '解释器路径'));
+
+    // 写回值故意用正斜杠：Windows 路径里的 `\P` / `\p` 不是合法转义序列，
+    // 写在源码里容易被解析器吞掉（本轮踩过：`'  D:\\Python\\python.exe  '` 变成了空串，
+    // 断言报的是「写回空值」，看着像功能坏了）。插件的写回是原样字符串，与分隔符无关。
+    bin.props.onBlur(eventOf({ value: '  D:/Python/python.exe  ' }));
+    assert.deepEqual(scope.writes[scope.writes.length - 1], ['python.bin', 'D:/Python/python.exe'],
+        '两端空格要收掉');
+
+    bin.props.onBlur(eventOf({ value: '' }));
+    assert.deepEqual(scope.writes[scope.writes.length - 1], ['python.bin', ''],
+        '清空要真的写回空串（= 回到自动探测），不能因为「空 = 没改」就吞掉');
+    return '写回 python.bin，两端截断、空值照写';
+});
+
+await check('Python 计算与绘图：关掉启用开关写回 python.enabled', () => {
+    const scope = makeScope(SAMPLE_VALUE);
+    const { mod, ctx, registrations } = loadBundle({ forms: scope.forms });
+    mod.apply(ctx);
+    const tree = render(officeReg(registrations));
+    const owner = rowInGroup(tree, 'python', '启用');
+    assert.ok(owner, 'python 组应有「启用」这一行');
+    const toggle = walk(owner).find((node) => node.type === 'input' && node.props && node.props.type === 'checkbox');
+    assert.ok(toggle, '「启用」行里应有勾选框');
+    assert.equal(toggle.props.checked, true, '样例里是开着的');
+    // Toggle 的 DOM 处理器读 event.target.checked，再把**布尔值**交给面板的 write ——
+    // 所以这里给的是事件对象（与既有开关用例同一写法）。
+    toggle.props.onChange(eventOf({ checked: false }));
+    assert.deepEqual(scope.writes[scope.writes.length - 1], ['python.enabled', false]);
+    return '写回 python.enabled';
+});
+
 await check('音频与视频：语言下拉覆盖服务端的六种取值', () => {
     const scope = makeScope(SAMPLE_VALUE);
     const { mod, ctx, registrations } = loadBundle({ forms: scope.forms });
@@ -960,6 +1363,27 @@ await check('音频与视频：语言下拉覆盖服务端的六种取值', () =
     const ids = options.map((node) => node.props.value);
     assert.deepEqual(ids, ['auto', 'zh', 'yue', 'en', 'ja', 'ko'], '语言下拉要覆盖服务端 AV_LANGUAGES');
     return `六个选项：${ids.join(' / ')}`;
+});
+
+await check('音频与视频：块间重叠能调到（小数步长，写回 av.overlapSeconds）', () => {
+    // 第三十一轮新增：块之间的小重叠是「一个音不被切点切开」的第一道措施，
+    // 界面上必须能调；步长是 0.5，不能被取整吃掉（NumberField 有小数步长分支）。
+    const scope = makeScope(SAMPLE_VALUE);
+    const { mod, ctx, registrations } = loadBundle({ forms: scope.forms });
+    mod.apply(ctx);
+    const tree = render(officeReg(registrations));
+    const row = findByLabel(tree, '块间重叠');
+    assert.ok(row, '应渲染「块间重叠」这一行');
+    const input = controlOf(row);
+    assert.equal(input.props.type, 'number');
+    assert.equal(input.props.min, 0);
+    assert.equal(input.props.max, 30);
+    assert.equal(input.props.step, 0.5);
+    input.props.onChange(eventOf({ value: '1.2' }));
+    const after = render(officeReg(registrations));
+    controlOf(findByLabel(after, '块间重叠')).props.onBlur();
+    assert.deepEqual(scope.writes[scope.writes.length - 1], ['av.overlapSeconds', 1]);
+    return '写回 av.overlapSeconds，0.5 步长吸附';
 });
 
 await check('记忆系统面板：开关、目录、容量控件写回 memory.<name>', () => {
@@ -1131,7 +1555,33 @@ await check('召回质量：策略下拉 + 五个数字，阈值按 0.05 吸附�
     assert.deepEqual(scope.writes[1], ['memory.recallQuality.lowScoreThreshold', 0.35]);
 });
 
-await check('每回合配额：三个数字写回 memory.quota.<项>', () => {
+await check('容量上限：整数步长也吸附到网格（新-3），min=512 / step=512 输 1000 该得到 1024', () => {
+    const scope = makeScope(SAMPLE_VALUE);
+    const { mod, ctx, registrations } = loadBundle({ forms: scope.forms });
+    mod.apply(ctx);
+    const tree = renderMemory(registrations);
+
+    const row = findByLabel(tree, '用户偏好上限');
+    assert.ok(row, '应渲染「用户偏好上限」这一行');
+    const input = controlOf(row);
+    assert.equal(input.props.min, 512);
+    assert.equal(input.props.step, 512);
+    // 关键回归：整数步长原来只做 Math.trunc，1000 会原样写回 —— 而 512 + k×512 的网格上
+    // 没有 1000，schema 会拒掉它，界面看着像「改了但没生效」。吸附之后最近的格点是 1024。
+    input.props.onChange(eventOf({ value: '1000' }));
+    const after = renderMemory(registrations);
+    controlOf(findByLabel(after, '用户偏好上限')).props.onBlur();
+    assert.deepEqual(scope.writes[scope.writes.length - 1], ['memory.userLimitBytes', 1024]);
+    // 网格上已有的值不该被挪动。
+    const again = renderMemory(registrations);
+    controlOf(findByLabel(again, '用户偏好上限')).props.onChange(eventOf({ value: '4096' }));
+    const latest = renderMemory(registrations);
+    const writes = scope.writes.length;
+    controlOf(findByLabel(latest, '用户偏好上限')).props.onBlur();
+    assert.equal(scope.writes.length, writes, '值本来就在网格上时不该多写一次');
+});
+
+await check('每回合配额：四个数字写回 memory.quota.<项>', () => {
     const scope = makeScope(SAMPLE_VALUE);
     const { mod, ctx, registrations } = loadBundle({ forms: scope.forms });
     mod.apply(ctx);
@@ -1139,6 +1589,8 @@ await check('每回合配额：三个数字写回 memory.quota.<项>', () => {
     const rows = [
         ['首次检索', 'memory.quota.recallPerTurn'],
         ['换词细化', 'memory.quota.recallRefinePerTurn'],
+        // 第二十四轮 24-11：kb 检索单独一档（语料与代价都与记忆检索不同，不能共用名额）。
+        ['知识块检索', 'memory.quota.kbSearchPerTurn'],
         ['图关系遍历', 'memory.quota.relatedPerTurn'],
     ];
     for (const [label, path] of rows) {
@@ -1179,6 +1631,335 @@ await check('子代理模型：模式下拉与两个文本框写回 subagentMode
     assert.ok(model, '应渲染「模型 id」这一行');
     model.props.onBlur(eventOf({ value: 'deepseek-chat' }));
     assert.deepEqual(scope.writes[2], ['subagentModel.model', 'deepseek-chat']);
+});
+
+// ── 新增：分组折叠与「定位」（第三十五轮） ────────────────────────────────
+//
+// 这一层做在**元素树**上（不是 DOM 查询）：分组的开合由 data-group-open 表达，
+// 组体收起时只是 display:none（控件仍在树里，所以「界面覆盖服务端每个参数」
+// 那几条断言不用先展开每一组）。定位过滤则**真的把不命中的行摘掉**，
+// 所以下面用「剩下的行标题」来钉住过滤口径。
+
+/** 造一个假的 localStorage（Node 里没有 window.localStorage）。 */
+function makeLocalStorage() {
+    const map = new Map();
+    return {
+        map,
+        getItem: (key) => (map.has(key) ? map.get(key) : null),
+        setItem: (key, value) => { map.set(key, String(value)); },
+        removeItem: (key) => { map.delete(key); },
+    };
+}
+
+/** 某个分组的折叠头按钮。 */
+function groupToggle(tree, id) {
+    return walk(tree).find((node) => node.props && node.props['data-group-toggle'] === id);
+}
+
+/** 某个分组的组体（收起时 style 为 display:none）。 */
+function groupBody(tree, id) {
+    return walk(tree).find((node) => node.props && node.props['data-group-body'] === id);
+}
+
+/** 分组的开合态：读的是渲染出来的 data-group-open，不是内部 state。 */
+function groupOpen(tree, id) {
+    const box = walk(tree).find((node) => node.props && node.props['data-group'] === id);
+    return box === undefined ? undefined : box.props['data-group-open'];
+}
+
+/** 把一棵渲染树里的字符串全铺出来（子元素是数组，直接取 props.children 会漏）。 */
+function stringsIn(node, out = []) {
+    if (typeof node === 'string') { out.push(node); return out; }
+    if (Array.isArray(node)) { for (const item of node) stringsIn(item, out); return out; }
+    if (node !== null && typeof node === 'object' && node.props) stringsIn(node.props.children, out);
+    return out;
+}
+
+/** 折叠头上那一串「N 项」/「a / b 项」。 */
+function groupCount(tree, id) {
+    const toggle = groupToggle(tree, id);
+    return stringsIn(toggle).find((text) => /\d+ 项$/.test(text));
+}
+
+/** 当前树里还有哪些设置行（按 Row 收到的 label）。 */
+function rowLabels(tree) {
+    return walk(tree).filter((node) => node.source && node.source.name === 'Row')
+        .map((node) => node.source.props.label);
+}
+
+/**
+ * 「某个分组里的某一行」，取**最后一次渲染**的那一个。
+ *
+ * 两个坑都在这一行里：
+ * ① 不能用 `findByLabel` 全局找：「启用」这种短标签在办公模式页出现多次
+ *    （Python 与音频与视频各一行），全局找只会打到最先渲染的那一行；
+ * ② 要用**最后一个**匹配节点而不是第一个：render() 为了收敛 setState 会重复展开
+ *    （NumberField 的 useState+useEffect 就会触发一次重渲染），walk 会把每一轮的节点
+ *    都收进来。第一轮那份的闭包里读到的还是空值 —— 拿它去触发 onBlur，
+ *    写回的是空串，而断言看起来像「功能没生效」（本轮踩过）。
+ * 组体是收起状态也照样找得到（收起只用 display:none，内容照渲染）。
+ */
+function rowInGroup(tree, group, label) {
+    const body = groupBody(tree, group);
+    if (body === undefined) return undefined;
+    const found = walk(body).filter((node) => node.source && node.source.name === 'Row'
+        && node.source.props.label === label);
+    return found[found.length - 1];
+}
+
+/** 本页所有分组折叠头的 id（顺序即页面顺序）。 */
+function groupIds(tree) {
+    return walk(tree).filter((node) => node.props && typeof node.props['data-group-toggle'] === 'string')
+        .map((node) => node.props['data-group-toggle']);
+}
+
+/** 本页定位框/状态行的元素。 */
+function locatorInput(tree, page) {
+    return walk(tree).find((node) => node.props && node.props['data-locator-input'] === page);
+}
+
+function locatorText(tree, page) {
+    const line = walk(tree).find((node) => node.props && node.props['data-locator-stats'] === page);
+    assert.ok(line, '应有定位状态行');
+    return stringsIn(line).join('');
+}
+
+/** 把关键词打进定位框，返回重渲染后的树。 */
+function locate(registration, tree, page, query) {
+    locatorInput(tree, page).props.onChange(eventOf({ value: query }));
+    return render(registration);
+}
+
+const OFFICE_GROUP_ORDER = ['tools', 'search', 'subagents', 'documents', 'python', 'av'];
+const MEMORY_GROUP_ORDER = ['memory', 'layers', 'scope', 'graph', 'capacity', 'recall', 'quota', 'migrate'];
+
+await check('分组折叠：两页都有定位框与分组头，且默认全部收起', () => {
+    const scope = makeScope(SAMPLE_VALUE);
+    const { mod, ctx, registrations } = loadBundle({ forms: scope.forms });
+    mod.apply(ctx);
+
+    const office = render(officeReg(registrations));
+    assert.deepEqual(groupIds(office), OFFICE_GROUP_ORDER, '办公模式页六个分组，顺序即页面顺序');
+    for (const id of OFFICE_GROUP_ORDER) {
+        assert.equal(groupOpen(office, id), 'false', id + ' 默认应收起（用户口径：进页面先看分组目录）');
+        assert.deepEqual(groupBody(office, id).props.style, { display: 'none' }, id + ' 收起时组体不占位');
+    }
+    assert.ok(locatorInput(office, 'office'), '办公模式页应有定位框');
+    assert.equal(locatorInput(office, 'office').props.value, '', '定位框初始为空');
+    assert.ok(/默认收起/.test(locatorText(office, 'office')), '状态行要说清默认收起与怎么定位');
+
+    const memory = renderMemory(registrations);
+    assert.deepEqual(groupIds(memory), MEMORY_GROUP_ORDER, '记忆系统页八个分组');
+    for (const id of MEMORY_GROUP_ORDER) {
+        assert.equal(groupOpen(memory, id), 'false', id + ' 默认应收起');
+    }
+    assert.ok(locatorInput(memory, 'memory'), '记忆系统页也应有定位框');
+});
+
+await check('分组折叠：收起只是 display:none —— 控件仍在树里（既有覆盖断言不必展开）', () => {
+    const scope = makeScope(SAMPLE_VALUE);
+    const { mod, ctx, registrations } = loadBundle({ forms: scope.forms });
+    mod.apply(ctx);
+    const tree = render(officeReg(registrations));
+    const labels = rowLabels(tree);
+    // 每组都至少还有一行在树里，且总量是「各组 N 项」之和（>40：三件套 + 检索 + 音视频）。
+    for (const id of OFFICE_GROUP_ORDER) assert.ok(groupBody(tree, id), id + ' 应有组体');
+    assert.ok(labels.length > 40, '收起不该把控件从树里摘掉，实际剩 ' + labels.length + ' 行');
+    assert.ok(labels.includes('office_help'), '工具开关那一组仍在');
+    assert.ok(labels.includes('默认主题'), '文档与缓存那一组仍在');
+});
+
+await check('分组折叠：折叠头上的「N 项」等于该组体内的行数', () => {
+    const scope = makeScope(SAMPLE_VALUE);
+    const { mod, ctx, registrations } = loadBundle({ forms: scope.forms });
+    mod.apply(ctx);
+    const tree = render(officeReg(registrations));
+    for (const id of OFFICE_GROUP_ORDER) {
+        const rows = walk(groupBody(tree, id)).filter((node) => node.source && node.source.name === 'Row').length;
+        assert.equal(groupCount(tree, id), rows + ' 项', id + ' 的项数应等于组内行数');
+    }
+});
+
+await check('分组折叠：点标题展开、再点收起，并把状态写进 localStorage', () => {
+    const store = makeLocalStorage();
+    const scope = makeScope(SAMPLE_VALUE);
+    const { mod, ctx, registrations } = loadBundle({ forms: scope.forms, localStorage: store });
+    mod.apply(ctx);
+    const office = officeReg(registrations);
+
+    const start = render(office);
+    assert.equal(groupOpen(start, 'search'), 'false');
+
+    groupToggle(start, 'search').props.onClick();
+    const opened = render(office);
+    assert.equal(groupOpen(opened, 'search'), 'true', '点标题应展开');
+    assert.equal(groupBody(opened, 'search').props.style, undefined, '展开后组体不再 display:none');
+    assert.equal(groupOpen(opened, 'tools'), 'false', '只开被点的那一组');
+    assert.equal(JSON.parse(store.getItem('dsh-office-mode.groups.office')).search, true, '开合状态写进 localStorage');
+
+    groupToggle(opened, 'search').props.onClick();
+    const closed = render(office);
+    assert.equal(groupOpen(closed, 'search'), 'false', '再点一次收起');
+    assert.equal(JSON.parse(store.getItem('dsh-office-mode.groups.office')).search, false);
+});
+
+await check('分组折叠：localStorage 里有记录时按记录恢复；坏记录退回全部收起', () => {
+    const store = makeLocalStorage();
+    store.setItem('dsh-office-mode.groups.office', JSON.stringify({ av: true }));
+    const scope = makeScope(SAMPLE_VALUE);
+    const first = loadBundle({ forms: scope.forms, localStorage: store });
+    first.mod.apply(first.ctx);
+    const tree = render(officeReg(first.registrations));
+    assert.equal(groupOpen(tree, 'av'), 'true', '上次开着的那一组应恢复展开');
+    assert.equal(groupOpen(tree, 'tools'), 'false');
+
+    // 坏记录（半截 JSON）：解析失败按「全部收起」处理，不抛错、不打不开页面。
+    const broken = makeLocalStorage();
+    broken.setItem('dsh-office-mode.groups.memory', '{oops');
+    const second = loadBundle({ forms: makeScope(SAMPLE_VALUE).forms, localStorage: broken });
+    second.mod.apply(second.ctx);
+    const memoryTree = renderMemory(second.registrations);
+    assert.equal(groupOpen(memoryTree, 'memory'), 'false', '坏记录退回全部收起');
+});
+
+await check('分组折叠：全部展开 / 全部收起作用于本页，不影响另一页', () => {
+    const store = makeLocalStorage();
+    const scope = makeScope(SAMPLE_VALUE);
+    const { mod, ctx, registrations } = loadBundle({ forms: scope.forms, localStorage: store });
+    mod.apply(ctx);
+
+    const start = render(officeReg(registrations));
+    walk(start).find((node) => node.props && node.props['data-groups-expand'] === 'office').props.onClick();
+    const opened = render(officeReg(registrations));
+    for (const id of OFFICE_GROUP_ORDER) assert.equal(groupOpen(opened, id), 'true', id + ' 应被全部展开');
+
+    const memory = renderMemory(registrations);
+    assert.equal(groupOpen(memory, 'memory'), 'false', '两页的开合状态按页分开，互不影响');
+
+    walk(opened).find((node) => node.props && node.props['data-groups-collapse'] === 'office').props.onClick();
+    const closed = render(officeReg(registrations));
+    for (const id of OFFICE_GROUP_ORDER) assert.equal(groupOpen(closed, id), 'false', id + ' 应被全部收起');
+});
+
+await check('定位：只留下命中的行、命中组自动展开、报出命中数', () => {
+    const scope = makeScope(SAMPLE_VALUE);
+    const { mod, ctx, registrations } = loadBundle({ forms: scope.forms });
+    mod.apply(ctx);
+    const office = officeReg(registrations);
+
+    const tree = locate(office, render(office), 'office', '出口代理');
+    assert.deepEqual(groupIds(tree), ['search'], '只有命中的那一组留下');
+    assert.equal(groupOpen(tree, 'search'), 'true', '命中组自动展开');
+    const labels = rowLabels(tree);
+    assert.deepEqual(labels, ['出口代理'], '只留下命中那一行');
+    assert.ok(/命中 1 项/.test(locatorText(tree, 'office')), '状态行应报命中 1 项：' + locatorText(tree, 'office'));
+
+    // 过滤后剩下的仍是**活的控件**：改一改照样写回。
+    const row = findByLabel(tree, '出口代理');
+    const proxyInput = controlOf(row);
+    assert.equal(proxyInput.type, 'input');
+    proxyInput.props.onBlur(eventOf({ value: 'http://127.0.0.1:7897' }));
+    assert.deepEqual(scope.writes[0], ['search.proxy', 'http://127.0.0.1:7897']);
+});
+
+await check('定位：命中分组标题时整组保留（搜「音频与视频」）', () => {
+    const scope = makeScope(SAMPLE_VALUE);
+    const { mod, ctx, registrations } = loadBundle({ forms: scope.forms });
+    mod.apply(ctx);
+    const office = officeReg(registrations);
+
+    const tree = locate(office, render(office), 'office', '音频与视频');
+    assert.deepEqual(groupIds(tree), ['av'], '只有音频与视频那一组留下');
+    const labels = rowLabels(tree);
+    assert.ok(labels.includes('ffmpeg 路径') && labels.includes('抽帧宽度'), '整组保留：首尾两行都在');
+    const count = groupCount(tree, 'av');
+    const parts = count.replace(' 项', '').split(' / ');
+    assert.equal(parts[0], parts[1], '整组保留时命中数等于组内行数：' + count);
+});
+
+await check('定位：折在 Fold 里的高级参数命中时，折叠块自动展开', () => {
+    const scope = makeScope(SAMPLE_VALUE);
+    const { mod, ctx, registrations } = loadBundle({ forms: scope.forms });
+    mod.apply(ctx);
+    const office = officeReg(registrations);
+
+    const tree = locate(office, render(office), 'office', 'search.providers.anthropic.timeoutMs');
+    assert.deepEqual(rowLabels(tree), ['超时（毫秒）'], '按配置路径命中了那一行');
+    const fold = walk(tree).find((node) => node.props && node.props['data-fold'] === 'search-advanced');
+    assert.ok(fold, '高级参数折叠块仍在');
+    assert.equal(walk(fold).find((node) => node.props && node.props['data-fold-toggle'] === 'search-advanced').props['aria-expanded'],
+        true, '定位期间折叠块要展开，否则命中了也看不见');
+    assert.equal(walk(fold).find((node) => node.props && node.props['data-fold-body'] === 'search-advanced').props.style,
+        undefined, '折叠块体不再 display:none');
+});
+
+await check('定位：多词按「与」匹配、大小写不敏感（搜「LATEX thuthesis」）', () => {
+    const scope = makeScope(SAMPLE_VALUE);
+    const { mod, ctx, registrations } = loadBundle({ forms: scope.forms });
+    mod.apply(ctx);
+    const office = officeReg(registrations);
+
+    const tree = locate(office, render(office), 'office', 'LATEX thuthesis');
+    assert.deepEqual(groupIds(tree), ['documents'], '只留文档与缓存那一组');
+    assert.deepEqual(rowLabels(tree), ['LaTeX 编译入口'], '两个词都要出现：只有它同时含 latexmk 与 thuthesis');
+});
+
+await check('定位：没有命中时给可读提示，而不是一片空白', () => {
+    const scope = makeScope(SAMPLE_VALUE);
+    const { mod, ctx, registrations } = loadBundle({ forms: scope.forms });
+    mod.apply(ctx);
+    const office = officeReg(registrations);
+
+    const tree = locate(office, render(office), 'office', 'zzz-没有这一项');
+    assert.deepEqual(groupIds(tree), [], '没有命中的分组');
+    assert.deepEqual(rowLabels(tree), [], '没有命中的行');
+    assert.ok(/没有匹配的项/.test(locatorText(tree, 'office')), '状态行应给出可读提示');
+});
+
+await check('定位：清空关键词后回到全量（分组回到各自的收起状态）', () => {
+    const scope = makeScope(SAMPLE_VALUE);
+    const { mod, ctx, registrations } = loadBundle({ forms: scope.forms });
+    mod.apply(ctx);
+    const office = officeReg(registrations);
+
+    const located = locate(office, render(office), 'office', 'latex');
+    assert.ok(groupIds(located).length < OFFICE_GROUP_ORDER.length, '定位期间只留部分分组');
+
+    const cleared = locate(office, located, 'office', '');
+    assert.deepEqual(groupIds(cleared), OFFICE_GROUP_ORDER, '清空后分组全回来');
+    for (const id of OFFICE_GROUP_ORDER) assert.equal(groupOpen(cleared, id), 'false', id + ' 回到默认收起');
+    assert.ok(/默认收起/.test(locatorText(cleared, 'office')));
+});
+
+await check('定位：办公模式页那条「记忆在左侧面板」的指路说明跟着定位走', () => {
+    const scope = makeScope(SAMPLE_VALUE);
+    const { mod, ctx, registrations } = loadBundle({ forms: scope.forms });
+    mod.apply(ctx);
+    const office = officeReg(registrations);
+
+    const start = render(office);
+    assert.ok(walk(start).some((node) => node.props && node.props['data-locator-note'] === 'memory'),
+        '平时应画着这条指路说明');
+
+    const other = locate(office, start, 'office', '出口代理');
+    assert.ok(!walk(other).some((node) => node.props && node.props['data-locator-note'] === 'memory'),
+        '定位到别的功能时，指路的说明应让位');
+
+    const hits = locate(office, other, 'office', '记忆系统');
+    assert.ok(walk(hits).some((node) => node.props && node.props['data-locator-note'] === 'memory'),
+        '搜「记忆系统」时应留下这条指路说明');
+});
+
+await check('定位：记忆系统页同样过滤（搜「召回」只留召回质量一组）', () => {
+    const scope = makeScope(SAMPLE_VALUE);
+    const { mod, ctx, registrations } = loadBundle({ forms: scope.forms });
+    mod.apply(ctx);
+    const memory = memoryReg(registrations);
+
+    const tree = locate(memory, render(memory), 'memory', '召回');
+    assert.deepEqual(groupIds(tree), ['recall'], '只留召回质量那一组');
+    assert.ok(rowLabels(tree).includes('低分阈值'), '整组保留（标题命中）');
+    assert.ok(/命中 \d+ 项/.test(locatorText(tree, 'memory')));
 });
 
 // ── 新增：slot 注册面 ─────────────────────────────────────────────────────
@@ -1254,7 +2035,7 @@ async function renderPanelLoaded(panel) {
     return render(panel);
 }
 
-await check('记忆面板：挂载后取数，五个 Tab 显示 counts 里的条数', async () => {
+await check('记忆面板：挂载后取数，六个 Tab 显示 counts 里的条数', async () => {
     const { mod, ctx, registrations } = loadBundle();
     mod.apply(ctx);
     const panel = regOf(registrations, 'main', 'office-memory');
@@ -1262,7 +2043,7 @@ await check('记忆面板：挂载后取数，五个 Tab 显示 counts 里的条
     const texts = textsOf(tree);
 
     assert.ok(texts.some((t) => t.includes('记忆 · temp1')), '应显示工作目录短名');
-    for (const label of ['热记忆（1）', '台账（1）', '归档（1）', '关系（1）', '实体（1）']) {
+    for (const label of ['热记忆（1）', '台账（1）', '归档（1）', '知识库（1）', '关系（1）', '实体（1）']) {
         assert.ok(texts.some((t) => t === label), `Tab 应显示条数：${label}`);
     }
     // 默认 Tab 是热记忆：显示内容 + 来源徽标 + 重要度
@@ -1293,6 +2074,18 @@ await check('记忆面板：切换 Tab 显示对应层的条目', async () => {
     assert.ok(texts.some((t) => t.includes('长期记忆一条')), '归档 Tab 应显示条目文本');
     assert.ok(texts.some((t) => t === 'mnemon'), '归档应显示 kind 徽标');
     assert.ok(texts.some((t) => t === '2026-09'), '归档应显示月份');
+
+    // 知识库 Tab（第四十二轮）
+    const kbTab = walk(tree).find((n) => n.props && n.props.role === 'tab' && Array.isArray(n.props.children) && n.props.children.includes('知识库（1）'));
+    assert.ok(kbTab, '应找到知识库 Tab');
+    kbTab.props.onClick();
+    tree = render(panel);
+    texts = textsOf(tree);
+    assert.ok(texts.some((t) => t.includes('来源/方法论.md')), '知识库 Tab 应显示入库路径');
+    assert.ok(texts.some((t) => t.includes('方法论笔记')), '知识库 Tab 应显示标题');
+    assert.ok(texts.some((t) => t === 'verified'), '知识库 Tab 应显示来源档');
+    assert.ok(texts.some((t) => t === '3 块'), '知识库 Tab 应显示块数');
+    assert.ok(texts.some((t) => t === '4 KB'), '知识库 Tab 应显示人读化的体积');
 
     // 关系 Tab
     const linksTab = walk(tree).find((n) => n.props && n.props.role === 'tab' && Array.isArray(n.props.children) && n.props.children.includes('关系（1）'));
@@ -1368,8 +2161,9 @@ await check('记忆面板：端点报错时显示服务端给的 error，并保�
     const tree = await renderPanelLoaded(panel);
     const texts = textsOf(tree);
     assert.ok(texts.some((t) => t.includes('不在已知列表里')), '应显示服务端给的错误');
-    // 出错不等于白屏：Tab 仍在（条数退化成 0）。
-    assert.ok(texts.some((t) => t === '热记忆（0）'), '出错时也应保留 Tab 骨架');
+    // 出错不等于白屏：Tab 仍在。这一份**根本没有 counts**（失败响应里没有 data），
+    // 所以条数按「这个端点没告诉我」显示破折号，而不是谎报 0（与指标块同一口径）。
+    assert.ok(texts.some((t) => t === '热记忆（—）'), '出错时也应保留 Tab 骨架');
 });
 
 await check('记忆面板：环境没有 fetch 时给出可读提示，不抛错', () => {
@@ -1449,18 +2243,18 @@ function parseTranslate(value) {
     return match === null ? null : { x: Number(match[1]), y: Number(match[2]) };
 }
 
-await check('可视化：标题下五枚指标块显示 counts 里的条数', async () => {
+await check('可视化：标题下六枚指标块显示 counts 里的条数', async () => {
     const { tree } = await panelFrom(makeSnapshot());
     const tiles = byProp(tree, 'data-metric');
-    assert.deepEqual(tiles.map((n) => n.props['data-metric']), ['hot', 'ledger', 'archive', 'links', 'entities'],
-        '五枚指标块：热记忆 / 台账 / 归档 / 关系 / 实体');
+    assert.deepEqual(tiles.map((n) => n.props['data-metric']), ['hot', 'ledger', 'archive', 'kb', 'links', 'entities'],
+        '六枚指标块：热记忆 / 台账 / 归档 / 知识库 / 关系 / 实体');
     const values = byProp(tree, 'data-metric-value');
-    assert.equal(values.length, 5);
+    assert.equal(values.length, 6);
     for (const tile of values) {
         assert.deepEqual(tile.props.children, ['1'], `${tile.props['data-metric-value']} 应显示 counts 里的 1`);
     }
     const texts = textsOf(tree);
-    for (const label of ['热记忆', '台账', '归档', '关系', '实体']) {
+    for (const label of ['热记忆', '台账', '归档', '知识库', '关系', '实体']) {
         assert.ok(texts.some((t) => t === label), `指标块应有名称 ${label}`);
     }
 });
@@ -1515,6 +2309,75 @@ await check('可视化：存储域卡片显示目录、四层条数与可读的�
     }
     assert.ok(texts.includes('2 KB'), '字节数要人读化（2048 → 2 KB）');
     assert.ok(texts.includes('7 个文件'), '有 files 时要显示文件数');
+});
+
+await check('可视化：存储卡给出知识库的文档数与块数（第四十二轮）', async () => {
+    const { tree } = await panelFrom(makeSnapshot({
+        stores: [{
+            id: 'workspace', dir: '.office/memory', hot: 1, ledger: 1, archive: 1, links: 1,
+            kb: { docs: 2, chunks: 7, bytes: 8192, tiers: { verified: 1, user: 1, unverified: 0 } },
+        }],
+    }));
+    const card = byProp(tree, 'data-store', 'workspace')[0];
+    const texts = textsOf(card);
+    assert.ok(texts.includes('知识库 2 篇 / 7 块'), '存储卡要同时给文档数与块数');
+});
+
+await check('知识库页签：详情条给档位 / 块数 / 文档 id，并如实报「库里一共多少」', async () => {
+    // 列表里只给了 1 条，但库里其实有 5 篇：面板要说清差额，不能让 1 看起来像全部。
+    const { tree, panel } = await panelFrom(makeSnapshot({
+        counts: {
+            hot: 1, ledger: 1, archive: 1, links: 1, entities: 1, kb: 1,
+            ledgerTotal: 1, archiveFiles: 1, archiveItems: 1,
+            kbTotal: 5, kbChunks: 3, kbBytes: 4096, kbTruncated: true,
+        },
+    }));
+    const kbTree = openTab(tree, panel, '知识库（1）');
+    const kbNote = byProp(kbTree, 'data-kb-note')[0];
+    assert.ok(kbNote, '知识库页签要有那条只读说明');
+    const noteText = textsOf(kbNote).join(' ');
+    assert.ok(noteText.includes('库里共 5 篇'), '要报真实总数（不是列表里那 1 篇）');
+    assert.ok(noteText.includes('3 块'), '要报块总数');
+    assert.ok(noteText.includes('这一页列了 1 篇'), '被单次上限截断时要说明（不写「最新的」，at 撞毫秒时那句话撑不住）');
+    const card = byProp(kbTree, 'data-item-key', 'kb:8f14e45f')[0];
+    assert.ok(card, '知识库条目要按文档 id 建卡片');
+    const cardTexts = textsOf(card);
+    assert.ok(cardTexts.some((t) => t.includes('来源/方法论.md')), '卡片要显示入库路径');
+    assert.ok(cardTexts.some((t) => t === 'verified'), '卡片要显示来源档');
+
+    // 悬停 → 底部详情条（键盘聚焦走同一条路）
+    card.props.onMouseEnter();
+    const detail = byProp(render(panel), 'data-item-detail', 'kb:8f14e45f')[0];
+    assert.ok(detail, '悬停知识库条目时要出详情条');
+    const detailText = textsOf(detail).join('\n');
+    assert.ok(detailText.includes('来源档：verified'), '详情要写档位');
+    assert.ok(detailText.includes('知识块：3 块'), '详情要写块数');
+    assert.ok(detailText.includes('kb:8f14e45f'), '详情要给会话侧 kb-read 用的文档 id');
+});
+
+await check('归档页签：用 counts.archiveItems 报真实总数，列表被上限截断时说清楚', async () => {
+    const many = [];
+    for (let index = 0; index < 25; index += 1) {
+        many.push({
+            id: '', month: '2026-09', kind: 'hot', at: '2026-09-0' + ((index % 9) + 1) + 'T00:00:00.000Z',
+            origin: 'workspace', importance: 'normal', category: 'fact', entities: [], tags: [],
+            text: '归档条目 ' + index,
+        });
+    }
+    // 端点只给了 25 条（列表上限），库里其实有 260 条。
+    const { tree, panel } = await panelFrom(makeSnapshot({
+        archive: many,
+        counts: {
+            hot: 1, ledger: 1, archive: 25, links: 1, entities: 1, kb: 1,
+            ledgerTotal: 1, archiveFiles: 2, archiveItems: 260,
+        },
+    }));
+    const archiveTree = openTab(tree, panel, '归档（25）');
+    const note = byProp(archiveTree, 'data-archive-note')[0];
+    assert.ok(note, '归档页签要有那条只读说明');
+    const text = textsOf(note).join(' ');
+    assert.ok(text.includes('归档共 260 条'), '要报真实总数（不是列表里那 25 条）');
+    assert.ok(text.includes('这一页只给了 25 条'), '被单次上限截断时要说明这一页给了多少');
 });
 
 await check('可视化：台账按天、归档按月画时间线，柱高按峰值折算', async () => {
@@ -1724,8 +2587,10 @@ await check('可视化：空快照照样渲染（指标 0、图谱空态），�
         hot: [], ledger: [], archive: [], links: [], entities: [],
     }));
 
-    assert.equal(byProp(tree, 'data-metric').length, 5, '空快照也保留五枚指标块');
-    assert.deepEqual(byProp(tree, 'data-metric-value').map((n) => n.props.children[0]), ['0', '0', '0', '0', '0']);
+    assert.equal(byProp(tree, 'data-metric').length, 6, '空快照也保留六枚指标块');
+    // 老版本端点没有 counts.kb（第四十二轮才加）：那一枚显示破折号，**不谎报 0**
+    // ——「知识库 0 篇」与「这个端点不知道知识库」是两件事。
+    assert.deepEqual(byProp(tree, 'data-metric-value').map((n) => n.props.children[0]), ['0', '0', '0', '—', '0', '0']);
     assert.equal(byProp(tree, 'data-panel', 'stores').length, 0, '没有 stores 就不画存储域');
     assert.equal(byProp(tree, 'data-gauge', 'ledger')[0].props['data-percent'], 0, '0 / 500 = 0%');
     assert.equal(byProp(tree, 'data-panel', 'ledger-timeline').length, 0, '没有台账就不画时间线');
@@ -1767,7 +2632,7 @@ await check('样式表：面板自带 <style> 节点，含关键帧与减少动�
 await check('版式：分段控件的页签带层色点，且页签文字仍是整串（含条数）', async () => {
     const { tree } = await panelFrom(makeSnapshot());
     const tabs = byProp(tree, 'data-tab');
-    assert.deepEqual(tabs.map((n) => n.props['data-tab']), ['hot', 'ledger', 'archive', 'links', 'entities']);
+    assert.deepEqual(tabs.map((n) => n.props['data-tab']), ['hot', 'ledger', 'archive', 'kb', 'links', 'entities']);
     assert.ok(tabs.every((n) => n.props.role === 'tab'), '页签要有 tab 语义');
     assert.ok(tabs.every((n) => Array.isArray(n.props.children) && n.props.children.length === 2),
         '每个页签 = 层色点 + 整串文字（拆开就丢了条数）');
@@ -1823,9 +2688,9 @@ await check('图谱：滚轮只在按住修饰键时缩放，普通滚轮留给�
 await check('指标卡：数字用等宽字、卡片走抬升表面与悬停态', async () => {
     const { tree } = await panelFrom(makeSnapshot());
     const values = byProp(tree, 'data-metric-value');
-    assert.equal(values.length, 5);
+    assert.equal(values.length, 6);
     for (const value of values) {
-        assert.match(String(value.props.style.fontFamily), /mono/, '指标数字要用等宽字（五枚并排才对得齐）');
+        assert.match(String(value.props.style.fontFamily), /mono/, '指标数字要用等宽字（六枚并排才对得齐）');
         assert.deepEqual(value.props.children, ['1']);
     }
     for (const tile of byProp(tree, 'data-metric')) {
@@ -1945,20 +2810,42 @@ await check('关系图：选中画虚线环、详情栏给出层 / 邻居 / 状�
     assert.ok(texts.includes('热记忆'), '详情栏要写层名');
 });
 
-await check('主题令牌：不再用宿主里不存在的 --dsh-*，改用 --dsw-alias-* 且保留字面兜底', () => {
+await check('主题令牌：用到的 --dsw-* 与宿主主题逐个核对（名单从源码现取，不再手写）', () => {
     const source = readFileSync(BUNDLE, 'utf8');
     // 宿主主题只定义 --dsw-alias-*；--dsh-border / --dsh-accent / --dsh-input-bg /
     // --dsh-danger 在 52 个 dsh-client-ui-* 包里一个都没有 —— 用它们等于永远走兜底。
     assert.ok(!source.includes('--dsh-'), '不能用宿主里不存在的 --dsh-* 变量');
-    for (const token of [
-        '--dsw-alias-border-l1', '--dsw-alias-border-l2', '--dsw-alias-state-business-primary',
-        '--dsw-alias-state-error-primary', '--dsw-alias-interactive-bg-hover',
-    ]) {
-        assert.ok(source.includes(token), `应使用宿主真实令牌 ${token}`);
-    }
     // 兜底必须还在：令牌缺失时不能变成透明边框 / 无背景。
     assert.ok(source.includes('var(--dsw-alias-state-error-primary, #e5484d)'));
     assert.ok(source.includes('var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,0.1))'));
+
+    // 12-3：名单从**源码里现取**，不再手写那五个。手写名单的代价是「加了一个新令牌，
+    // 测试仍然全绿」——而界面用了宿主里不存在的令牌时，表现是永远走兜底（不报错、只是难看），
+    // 恰恰是测试该拦的那类问题。这里反向做：**用到的每一个**都要在宿主主题的定义里找得到。
+    //
+    // 两种取法都要有：静态的 `var(--dsw-x, 兜底)` 直接取；**拼出来的**类型刻度
+    // （`TYPE("s-14", …)` → `var(--dsw-font-s-14-font-size, …)`）要把后缀补全，
+    // 只取静态那一半会漏掉整个字号刻度（那正是第二十轮刚换上的那一套）。
+    const used = new Set();
+    for (const match of source.matchAll(/var\(\s*(--dsw-[a-z0-9-]+)\s*[,)]/g)) used.add(match[1]);
+    const typeScale = [...source.matchAll(/TYPE\(\s*"([a-z0-9-]+)"/g)].map((match) => match[1]);
+    assert.ok(typeScale.length >= 5, `宿主类型刻度该被用到，实际只认出 ${typeScale.length} 个`);
+    for (const token of typeScale) {
+        for (const part of ['font-size', 'line-height', 'font-weight']) used.add(`--dsw-font-${token}-${part}`);
+    }
+    assert.ok(used.size >= 20, `至少该用到一批宿主令牌，实际 ${used.size}`);
+
+    const themeManifest = resolveHostPath('@deepseek-ai/dsh-client-ui-theme/package.json');
+    if (themeManifest === undefined) {
+        console.log('      （本机解析不到宿主的主题包 dsh-client-ui-theme，跳过令牌存在性核对）');
+        return;
+    }
+    const themeSource = readFileSync(join(dirname(themeManifest), 'lib', 'client.js'), 'utf8');
+    const defined = new Set([...themeSource.matchAll(/--dsw-[a-z0-9-]+(?=\s*:)/g)].map((match) => match[0]));
+    assert.ok(defined.size > 20, `宿主主题里该定义了一大批令牌，实际只有 ${defined.size} 个`);
+    const missing = [...used].filter((token) => !defined.has(token));
+    assert.deepEqual(missing, [], `这些令牌宿主的主题里没有定义（用了等于永远走兜底）：${missing.join('、')}`);
+    return `核过 ${used.size} 个令牌（宿主定义 ${defined.size} 个）`;
 });
 
 await check('回合记忆条：保留边框与背景（S.turnBar 曾被同名键覆盖成无框）', () => {

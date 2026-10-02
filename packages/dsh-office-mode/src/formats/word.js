@@ -21,6 +21,7 @@ import {
     TWIPS_PER_CM,
 } from '../engine/kit.js';
 import { DEFAULT_THEME_ID, THEMES, resolveTheme, shadeOf, toHex } from '../engine/theme.js';
+import { looksLikeLatex } from './ppt-math.js';
 
 const W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
 const R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
@@ -1370,17 +1371,19 @@ function renderTable(block, ctx) {
 }
 
 function renderImage(block, ctx) {
-    const { widthCm, caption, alt } = block;
+    const { widthCm, caption, alt, source } = block;
     const cx = Math.round(widthCm * EMU_PER_CM);
     const cy = block.heightCm ? Math.round(block.heightCm * EMU_PER_CM) : Math.round(cx * 0.6);
     const relId = block.relId;
     const drawingId = block.drawingId;
     const name = `图片 ${drawingId}`;
+    // 署名（source）也进 descr：图注可能被裁掉，替代文本里留着才追得回来源。
+    const description = [alt ?? caption ?? '', source ? `来源：${source}` : ''].filter((part) => part !== '').join('；');
     const drawing = '<w:r><w:drawing>'
         + '<wp:inline distT="0" distB="0" distL="0" distR="0">'
         + `<wp:extent cx="${cx}" cy="${cy}"/>`
         + '<wp:effectExtent l="0" t="0" r="0" b="0"/>'
-        + `<wp:docPr id="${drawingId}" name="${escapeXml(name)}" descr="${escapeXml(alt ?? caption ?? '')}"/>`
+        + `<wp:docPr id="${drawingId}" name="${escapeXml(name)}" descr="${escapeXml(description)}"/>`
         + '<wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>'
         + `<a:graphic><a:graphicData uri="${PIC_NS}">`
         + `<pic:pic><pic:nvPicPr><pic:cNvPr id="${drawingId}" name="${escapeXml(block.fileName)}"/><pic:cNvPicPr/></pic:nvPicPr>`
@@ -1389,9 +1392,16 @@ function renderImage(block, ctx) {
         + '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic>'
         + '</a:graphicData></a:graphic></wp:inline></w:drawing></w:r>';
     const imagePara = `<w:p>${pPrXml({ align: 'center', spacing: '<w:spacing w:before="120" w:after="60" w:line="240" w:lineRule="auto"/>' })}${drawing}</w:p>`;
-    if (!caption) return imagePara;
-    const captionPara = `<w:p>${pPrXml({ styleId: 'Caption' })}${runXml(caption, { size: STYLE_INFO.Caption.size, color: ctx.ink.muted }, ctx)}</w:p>`;
-    return imagePara + captionPara;
+    if (!caption && !source) return imagePara;
+    const parts = [imagePara];
+    if (caption) {
+        parts.push(`<w:p>${pPrXml({ styleId: 'Caption' })}${runXml(caption, { size: STYLE_INFO.Caption.size, color: ctx.ink.muted }, ctx)}</w:p>`);
+    }
+    if (source) {
+        // 一行更小的字：署名与正文图注分得开，但不抢视线。
+        parts.push(`<w:p>${pPrXml({ styleId: 'Caption', align: 'center' })}${runXml(`来源：${source}`, { size: Math.max(7, STYLE_INFO.Caption.size - 1), color: ctx.ink.muted }, ctx)}</w:p>`);
+    }
+    return parts.join('');
 }
 
 function pageFieldRuns(template, ctx, opts = {}) {
@@ -1666,7 +1676,7 @@ function cellText(cell) {
  * create 与 read 都调它，因此两边的数字天然一致；分析本身与主题无关
  * （主题只决定颜色，不影响行长与页数），所以不接 theme 参数。
  */
-function analyzeDocument(documentXml) {
+function analyzeDocument(documentXml, { reportStrayLatex = true } = {}) {
     const doc = parseXml(documentXml);
     const root = doc.children.find((node) => node.name === 'w:document') ?? doc.children[0];
     const body = root ? (root.children.find((node) => node.name === 'w:body') ?? descendant(root, 'w:body')) : undefined;
@@ -1678,7 +1688,7 @@ function analyzeDocument(documentXml) {
     const stats = {
         paragraphs: 0, bodyParagraphs: 0, headings: 0, lists: 0, listItems: 0,
         quotes: 0, codeBlocks: 0, tables: 0, images: 0, words: 0, chars: 0,
-        formulas: 0, pagesEstimate: 1, pageSize: page.label, contentWidthCm: Number((contentTw / TWIPS_PER_CM).toFixed(2)),
+        formulas: 0, formulaErrors: 0, pagesEstimate: 1, pageSize: page.label, contentWidthCm: Number((contentTw / TWIPS_PER_CM).toFixed(2)),
     };
     const outline = [];
     const warnings = [];
@@ -1709,6 +1719,23 @@ function analyzeDocument(documentXml) {
             // 公式按 m:oMath 的个数数，块级（m:oMathPara）与行内共用同一套统计
             const mathNodes = descendants(node, 'm:oMath');
             if (mathNodes.length) stats.formulas += mathNodes.length;
+            // 兜底扫描（第四十八轮 P0-1）：公式里的未知命令会「按纯文本原样输出」——
+            // 字面量留在 m:t 里（PPT 那边留在 a:t 里），只看 m:oMath 的个数会以为一切正常。
+            // 判据分两档：数学区（m:t）里出现 `\命令` 就足够可疑（解析成功的公式不会留下反斜杠）；
+            // 普通文本里则用 ppt-math 的保守判据，免得把 Windows 路径当成公式。
+            const mathText = descendants(node, 'm:t').map((child) => textOf(child)).join(' ');
+            const suspect = /\\[a-zA-Z]+/.test(mathText) || (mathText === '' && looksLikeLatex(text));
+            if (suspect) {
+                stats.formulaErrors += 1;
+                // 创建路径上解析器自己已经精确报过那一条（「未识别的命令 \foo」），
+                // 兜底扫描只补数字与给 read() 用，不再重复报一遍（删掉分路径会丢掉
+                // read() 侧唯一的证据，所以只是分路径，不是不做）
+                if (reportStrayLatex && stats.formulaErrors <= 3) {
+                    const sample = (mathText === '' ? text : mathText).trim().slice(0, 32);
+                    warnings.push(`第 ${stats.paragraphs} 段有疑似未解析的 LaTeX 文本（「${sample}」）：`
+                        + '公式里的未知命令会按纯文本原样输出，这几处要么改成支持的命令，要么写成普通文字');
+                }
+            }
             const blockMath = !!descendant(node, 'm:oMathPara');
             const pageBreak = chunks.some((chunk) => chunk.kind === 'break' && chunk.page);
             const breaks = chunks.filter((chunk) => chunk.kind === 'break' && !chunk.page).length;
@@ -1770,7 +1797,21 @@ function analyzeDocument(documentXml) {
                     warnings.push(`标题层级跳跃：H${headingLevels[headingLevels.length - 1]} 之后直接出现 H${level}（“${text}”），建议补一级标题`);
                 }
                 headingLevels.push(level);
-                if ([...text].length > 40) warnings.push(`标题“${text.slice(0, 18)}…”共 ${[...text].length} 字，可能折行，建议控制在 40 字内`);
+                // 标题过长 = **真的放不下**，不是「超过 40 字」。
+                //
+                // 第十八轮 V10 的根因：原先只按字数（>40）报，而 40 字这个常数与版心宽度、
+                // 字号都无关 —— 一份 11pt 正文里 41 个汉字并不会折行，模型却要为这 1 个字
+                // 再跑一轮（11 条折行警告改到剩 1 条，仍然没消解）。现在按
+                // `estimateLines` 估的实际行数报（与折行估算、pagesEstimate 同一套算法），
+                // 报出来的是「会折成几行、版心一排最多放得下几个字」这类可以直接照做的信息。
+                // 标题各级字号不同，所以容量要逐级算，不能写成一个常数。
+                const headingWidthPt = textWidth(0);
+                if (estimateLines(text, headingWidthPt, size) > 1) {
+                    const capacity = Math.max(1, Math.floor((headingWidthPt / size) * 0.98));
+                    warnings.push(`标题“${text.slice(0, 18)}…”共 ${[...text].length} 字，`
+                        + `按 ${size}pt 字号在 ${Math.round(headingWidthPt)}pt 版心里放不下（约折 ${estimateLines(text, headingWidthPt, size)} 行），`
+                        + `建议压到 ${capacity} 字以内`);
+                }
                 // headingIndex 让分页那一步能把「第几个标题落在第几页」记下来，
                 // 目录的预渲染页码就是从这里来的
                 flow.push({ kind: 'heading', heightPt: wrapLines() * size * factor + base, headingIndex: headingSeq });
@@ -1991,6 +2032,10 @@ export function create(spec = {}, env = {}) {
         subject: options.subject,
         created: options.created,
     });
+    // 构建期警告要能到 office_run 的 warnings（第四十八轮 P0-1）：顶层的 warnings 只由
+    // env.warnings + read() 复检警告拼成，只放进 report 的返回值等于没报 —— 批量脚本
+    // 一旦不 return 那份 report，用户就什么都看不到。excel.js 一直是这么做的。
+    ctx.env = env;
 
     let cache = null;
 
@@ -2091,6 +2136,10 @@ export function create(spec = {}, env = {}) {
                 heightCm,
                 caption: opts.caption ? asString(opts.caption) : '',
                 alt: opts.alt ? asString(opts.alt) : asString(opts.caption, target),
+                // 来源/署名（历史遗留 1-2「配图无来源」）：给了就渲染成图注下面的一行小字，
+                // 并进 docPr 的 descr（读屏与「图注被裁掉」时还在）。传 office.image.fetch
+                // 返回的 credit 即可。
+                source: opts.source ? asString(opts.source) : '',
             });
             env.note?.(`嵌入图片 ${target} → word/media/${fileName}（${widthCm.toFixed(2)}×${heightCm.toFixed(2)}cm）`);
             return this;
@@ -2140,15 +2189,25 @@ export function create(spec = {}, env = {}) {
         // 第二遍里仍然成立（页码数字的宽度差异可以忽略）。
         let entries = buildParts(context);
         let documentPart = entries.find((entry) => entry.name === 'word/document.xml').data;
-        let analysis = analyzeDocument(documentPart);
+        let analysis = analyzeDocument(documentPart, { reportStrayLatex: false });
         if (context.blocks.some((block) => block.type === 'toc')) {
             context.tocPages = analysis.headingPages ?? [];
             entries = buildParts(context);
             documentPart = entries.find((entry) => entry.name === 'word/document.xml').data;
-            analysis = analyzeDocument(documentPart);
+            analysis = analyzeDocument(documentPart, { reportStrayLatex: false });
         }
         const bytes = zip(entries);
         const warnings = [...context.warnings, ...analysis.warnings];
+        // 双写 env.warn（第四十八轮 P0-1），按 context 去重：renderPackage 带目录时会跑两遍，
+        // 同一份文档不该报两遍。见 create() 里 ctx.env 的注释。
+        if (context.env !== undefined && typeof context.env.warn === 'function') {
+            context.reportedWarnings ??= new Set();
+            for (const message of warnings) {
+                if (context.reportedWarnings.has(message)) continue;
+                context.reportedWarnings.add(message);
+                context.env.warn(`word：${message}`);
+            }
+        }
         return { bytes, stats: analysis.stats, outline: analysis.outline, warnings };
     }
 
@@ -2489,7 +2548,7 @@ export const meta = {
             "    columns: ['季度', {title:'营收', width:5, align:'right'}]",
             "    rows 单元格: '文本' 或 {text, colspan, rowspan, align, bold, italic, fill, color, size}",
             '  builder.para([{math:\'x^2\'}]) 行内公式 / builder.formula(latex, {align, number, size}) 块级公式',
-            '  builder.image(path, {widthCm, caption, alt})   内嵌 PNG/JPEG，超版心自动等比缩放',
+            '  builder.image(path, {widthCm, caption, alt, source})   内嵌 PNG/JPEG，超版心自动等比缩放',
             '  builder.pageBreak() / builder.spacer(cm) / builder.toc()   目录（H1–H3 条目与页码预渲染进 TOC 域）',
             '  opts: {bold, italic, underline, color, size, font, align, indent, spaceBefore, spaceAfter, lineSpacing}',
             '  builder.render() → Uint8Array / builder.save(path?) → report',
@@ -2519,7 +2578,9 @@ export const meta = {
             '    caption 用 Caption 题注段落（默认表上方，captionPosition:\'below\' 放下方）；headerRepeat:false 不重复表头',
             '  builder.formula(latex, {align:\'center\'|\'left\', number:\'（1）\', size})  块级公式（OMML）',
             '    LaTeX 子集: ^ _ \\frac \\sqrt[n] \\left( \\right) \\sum \\prod \\int \\oint \\iint \\sin \\lim \\alpha \\times \\text{中文} \\mathrm \\mathbf \\, \\quad 等',
-            '  builder.image(path, {widthCm, caption, alt}) 内嵌 PNG/JPEG，超版心自动等比缩放',
+            '  builder.image(path, {widthCm, caption, alt, source}) 内嵌 PNG/JPEG，超版心自动等比缩放',
+            '    source 是署名（通常传 office.image.fetch 的 credit）：图注下面多一行小字「来源：…」，',
+            '    同时进替代文本；配图必须能追到来源，正式稿别省这一项',
             '  builder.pageBreak() / builder.spacer(cm) / builder.toc()',
             '    toc() 生成 TOC 域，并把 H1–H3 的条目与页码**预渲染**进域的缓存结果：打开即见完整目录、',
             '    条目可点击跳转（标题上有书签），且不带任何「打开时更新域」标记 —— 那类标记会让 Word 弹',

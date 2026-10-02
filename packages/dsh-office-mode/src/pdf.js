@@ -606,7 +606,11 @@ export async function pdfText(filePath, options = {}, env, cache) {
         if (result.code === 0) engine = 'fitz';
     }
     if (engine === null) {
-        const reason = result?.error ?? String(result?.err ?? '').trim().split(/\r?\n/)[0] ?? '未知原因';
+        // 两个回退都要落到「未知原因」：`result?.err` 为空时 split(...)[0] 是空串，
+        // 而空串不是 nullish —— 原先那句 `?? '未知原因'` 永远不生效，消息里会出现
+        // 一个悬空的「：」（审查 P2-5）。
+        const stderr = String(result?.err ?? '').trim().split(/\r?\n/)[0];
+        const reason = result?.error || stderr || '未知原因';
         throw new Error(`抽文本失败（可用引擎：${engines.text.join(' / ') || '无'}）：${reason}`);
     }
 

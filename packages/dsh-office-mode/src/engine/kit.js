@@ -210,17 +210,60 @@ export function displayPath(root, absolute) {
 }
 
 /**
+ * 相对路径必须落在工作目录内（`../` 逃逸当场拒绝），绝对路径按「显式选择」放行。
+ *
+ * 为什么需要它：插件整体允许绝对路径（文档里写着「也可以用绝对路径」），但
+ * `office.archive.extract` / `office.image.fetch` / `office.preview.pdf` 的 `to`
+ * 文档说的是「落到工作目录」。没有这道闸时，一个手滑的 `to: '../x'` 会把文件写到
+ * 工作目录之外，而调用方以为自己只是在工作目录里起个名。
+ *
+ * @param {string} filePath 调用方给的 `to`
+ * @param {object} env 引擎环境（要 env.root）
+ * @param {string} who 报错前缀（哪个动作）
+ * @returns {string} 解析后的绝对路径
+ */
+export function assertInsideRoot(filePath, env, who) {
+    const text = String(filePath ?? '');
+    if (isAbsolute(text)) return resolve(text);
+    const root = resolve(env?.root ?? process.cwd());
+    const absolute = resolve(root, text);
+    const rel = relative(root, absolute);
+    if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
+        throw new Error(`${who}：${text} 会写到工作目录之外（${absolute}）。`
+            + '相对路径必须在工作目录内；确实要写到别处请给绝对路径。');
+    }
+    return absolute;
+}
+
+/**
  * 构造文件环境。格式模块只通过它读写，因此可以在测试里替换成内存实现。
  */
 export function createEnv(options = {}) {
     const root = resolve(options.root ?? process.cwd());
     const themeResolver = options.themeResolver;
     const writes = [];
+    // 读过的文件也记一份（第十九轮 P1-4）：台账要能回答「这份产物依据了什么」。
+    // 只记**真的读了内容**的调用（readFile / readText）；exists / stat / list 不算依据。
+    //
+    // 有界：同一个文件读多次只记一条（原地 revise 会反复读同一份），最多记 64 条 ——
+    // 脚本里循环读几千个文件时，env 不该跟着长成一份文件清单（台账只取前 8 条当来源）。
+    const reads = [];
+    const readPaths = new Set();
+    const READ_TRACK_MAX = 64;
+    // 外部来源（图片的图库页 / 许可页等）：不是本地文件，但同样是「这份产物依据了什么」。
+    // 由 office.image.fetch 这类取外部素材的动作登记，office_run 把它们并进台账的 source。
+    const citations = [];
     const notes = [];
     const warnings = [];
     const logs = [];
 
     const resolvePath = (filePath) => (isAbsolute(filePath) ? resolve(filePath) : resolve(root, filePath));
+
+    const noteRead = (absolute, bytes) => {
+        if (readPaths.has(absolute) || reads.length >= READ_TRACK_MAX) return;
+        readPaths.add(absolute);
+        reads.push({ path: displayPath(root, absolute), absolute, bytes });
+    };
 
     const env = {
         root,
@@ -230,9 +273,27 @@ export function createEnv(options = {}) {
         // 需要配置的地方（LaTeX 编译的引擎/超时/模板目录）从这里取；单测里可以为空。
         config: options.config !== null && typeof options.config === 'object' ? options.config : {},
         writes,
+        reads,
+        citations,
         notes,
         warnings,
         logs,
+        /**
+         * 登记一条外部引用（图库页 / 许可页 / 其它网络来源）。
+         * 有界：同一地址只记一次，最多 32 条 —— 批量取图时 env 不该长成一份图片清单。
+         */
+        cite(entry) {
+            const url = typeof entry?.url === 'string' ? entry.url.trim() : '';
+            if (url === '' || citations.length >= 32) return false;
+            if (citations.some((item) => item.url === url)) return false;
+            citations.push({
+                url,
+                title: typeof entry?.title === 'string' ? entry.title.slice(0, 120) : '',
+                license: typeof entry?.license === 'string' ? entry.license.slice(0, 60) : '',
+                kind: typeof entry?.kind === 'string' ? entry.kind.slice(0, 24) : 'source',
+            });
+            return true;
+        },
         writeFile(filePath, data) {
             const absolute = resolvePath(filePath);
             mkdirSync(dirname(absolute), { recursive: true });
@@ -243,10 +304,16 @@ export function createEnv(options = {}) {
             return entry;
         },
         readFile(filePath) {
-            return readFileSync(resolvePath(filePath));
+            const absolute = resolvePath(filePath);
+            const data = readFileSync(absolute);
+            noteRead(absolute, data.length);
+            return data;
         },
         readText(filePath) {
-            return readFileSync(resolvePath(filePath), 'utf8');
+            const absolute = resolvePath(filePath);
+            const text = readFileSync(absolute, 'utf8');
+            noteRead(absolute, Buffer.byteLength(text, 'utf8'));
+            return text;
         },
         exists(filePath) {
             return existsSync(resolvePath(filePath));

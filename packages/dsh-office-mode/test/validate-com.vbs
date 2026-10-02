@@ -61,7 +61,7 @@ For Each file In folder.Files
                 doc.Close 0
             End If
         ElseIf ext = "xlsx" Then
-            Dim excel, wb
+            Dim excel, wb, charts
             Set excel = AppFor("excel", "Excel.Application")
             ' Call with a single argument on purpose. Through pure IDispatch, passing
             ' the optional UpdateLinks/ReadOnly positionally makes Excel answer
@@ -74,12 +74,23 @@ For Each file In folder.Files
                 failed = True
                 detail = Err.Description
             Else
+                charts = 0
+                Dim si
+                For si = 1 To wb.Worksheets.Count
+                    charts = charts + wb.Worksheets.Item(si).ChartObjects.Count
+                    If Err.Number <> 0 Then
+                        charts = -1
+                        Err.Clear
+                        Exit For
+                    End If
+                Next
                 detail = "sheets=" & wb.Worksheets.Count & " first=" & wb.Worksheets.Item(1).Name
+                If charts >= 0 Then detail = detail & " charts=" & charts
                 If Err.Number <> 0 Then detail = "(statistics failed: " & Err.Description & ")"
                 wb.Close False
             End If
         ElseIf ext = "pptx" Then
-            Dim ppt, pres, slides
+            Dim ppt, pres, slides, shape, chartShapes
             Set ppt = AppFor("ppt", "PowerPoint.Application")
             ' -1 = msoTrue: WithWindow has to be true or media-bearing files refuse to open.
             Set pres = ppt.Presentations.Open(file.Path, -1, 0, -1)
@@ -88,10 +99,25 @@ For Each file In folder.Files
                 detail = Err.Description
             Else
                 slides = pres.Slides.Count
+                chartShapes = 0
                 If Err.Number <> 0 Then
                     detail = "(Slides.Count failed: " & Err.Description & ")"
                 Else
+                    Dim pi, qi
+                    For pi = 1 To slides
+                        For qi = 1 To pres.Slides.Item(pi).Shapes.Count
+                            Set shape = pres.Slides.Item(pi).Shapes.Item(qi)
+                            If shape.HasChart Then chartShapes = chartShapes + 1
+                            If Err.Number <> 0 Then
+                                chartShapes = -1
+                                Err.Clear
+                                Exit For
+                            End If
+                        Next
+                        If chartShapes < 0 Then Exit For
+                    Next
                     detail = "slides=" & slides
+                    If chartShapes >= 0 Then detail = detail & " chartShapes=" & chartShapes
                 End If
                 pres.Close
             End If

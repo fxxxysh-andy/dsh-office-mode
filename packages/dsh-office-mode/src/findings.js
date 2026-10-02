@@ -85,6 +85,16 @@ function hostOf(url) {
 }
 
 /**
+ * 「未找到」这类**空手标记**不是结论。
+ *
+ * 第三十三轮实测：整条通道全灭时，子代理按任务书老老实实写下
+ * `## 泛搜（定术语与体系）` + `- 未找到`，而这里把它当成了「1 条到手结论」——
+ * 摘要于是显示「到手结论 1 条｜已覆盖渠道：泛搜」，把「一条通道都没通」
+ * 说成了「有一个渠道查到了」。空手标记要能认出来。
+ */
+const EMPTY_CLAIM = /^[（(\[【]?\s*(?:未找到|没找到|没有找到|未发现|没有发现|未检索到|查不到|检索不到|无结果|暂无|无|none|not\s*found|no\s*results?)\s*[）)\]】]?[。.！!]?$/i;
+
+/**
  * 提纲里的一个渠道是否被结果里的某个分组覆盖。
  *
  * 判定按「关键区分词」做：手册类的官方文档只看「官方文档 / 手册 / reference」，
@@ -201,10 +211,13 @@ export function parseFindings(markdown, typeId, topic) {
     const seen = new Map();
     const findings = [];
     const notes = [];
+    // 一条结论都没产出的分组：空手渠道（含只写「未找到」的那种）。
+    const emptySections = [];
 
     for (const section of splitSections(text)) {
         const channel = channelOf(section.heading);
         const rawHeading = String(section.heading ?? '');
+        let produced = 0;
         for (const rawLine of section.lines) {
             const line = rawLine.trim();
             if (line === '') continue;
@@ -213,6 +226,8 @@ export function parseFindings(markdown, typeId, topic) {
             if (bullet === null) continue;
             const claim = bullet[1].trim();
             if (claim === '') continue;
+            // 空手标记：记下这个渠道没材料，但不当成一条结论。
+            if (EMPTY_CLAIM.test(claim)) continue;
             const urls = urlsIn(claim);
             // 把 URL 从正文里摘掉：结论本身与出处要分开，引用时不该把长链
             // 一起抄进文档。末尾的括号链接、行尾裸链都算出处。
@@ -233,6 +248,7 @@ export function parseFindings(markdown, typeId, topic) {
                 const existing = seen.get(key);
                 for (const url of urls) if (!existing.urls.includes(url)) existing.urls.push(url);
                 existing.hosts = existing.urls.map(hostOf).filter((host) => host !== '');
+                produced += 1;
                 continue;
             }
             const item = {
@@ -245,8 +261,11 @@ export function parseFindings(markdown, typeId, topic) {
             };
             seen.set(key, item);
             findings.push(item);
+            produced += 1;
         }
+        if (produced === 0 && channel !== '未分组') emptySections.push(channel);
     }
+    const emptyChannels = [...new Set(emptySections)];
 
     // 覆盖度：提纲里标了 ★ 的渠道是否都出现过。
     const type = contentType(typeId) ?? guessContentType(topic ?? text);
@@ -291,6 +310,12 @@ export function parseFindings(markdown, typeId, topic) {
     if (missing.length > 0) {
         notes.push('提纲里必须覆盖的渠道还缺：' + missing.join('、') + '。');
     }
+    if (emptyChannels.length > 0 && findings.length === 0) {
+        // 只在**一条结论都没有**时说这句话。有真结论时它只是噪声 ——
+        // 「哪些渠道还缺」由上面的 coverage 那句更准地报出来。
+        notes.push(emptyChannels.length + ' 个渠道只写了「未找到」或没有任何条目：' + emptyChannels.join('、')
+            + ' —— 这不等于「没有资料」，先确认检索通道是通的（office_search_run 直查一轮再派工）。');
+    }
     if (findings.length === 0) {
         notes.push('没有解析出任何结论条目：确认文件是 Markdown，且每条结论是 - 或 1. 开头的列表项。');
     }
@@ -299,6 +324,7 @@ export function parseFindings(markdown, typeId, topic) {
         topic: String(topic ?? '').trim(),
         type,
         findings,
+        emptyChannels,
         coverage: {
             channels: [...present].filter((name) => name !== '未分组'),
             covered,
@@ -324,7 +350,9 @@ export function renderFindings(result) {
     lines.push('检索结果解析（' + name + (result.topic ? '：' + result.topic : '') + '）');
     lines.push('到手结论 ' + result.risks.total + ' 条｜来源站点 ' + result.risks.distinctHosts
         + ' 个｜已跨源核对 ' + result.risks.corroborated + ' 组｜待核 ' + result.risks.unverified
-        + ' 组｜缺 URL ' + result.risks.noUrl + ' 条');
+        + ' 组｜缺 URL ' + result.risks.noUrl + ' 条'
+        + (Array.isArray(result.emptyChannels) && result.emptyChannels.length > 0
+            ? '｜空手渠道 ' + result.emptyChannels.length + ' 个' : ''));
     const covered = result.coverage.covered;
     if (covered.length > 0) lines.push('已覆盖渠道：' + covered.join('、'));
     if (result.coverage.missing.length > 0) lines.push('★ 仍缺渠道：' + result.coverage.missing.join('、'));

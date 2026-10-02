@@ -26,6 +26,18 @@
  *   - 推理跑在**独立子进程**里（`asr-worker.mjs`），不占宿主的事件循环 ——
  *     一段十分钟的音频在 2 线程下要几秒到几十秒，放主进程里会卡住整个会话。
  *
+ * ## 分块：重叠 + 边界回退（第三十一轮）
+ *
+ * 长音频要切成块才能控住内存与单次超时，但块是硬切的，VAD 又在块内独立跑 ——
+ * 切点落在句子中间时两边各拿到半句。第三十一轮起两条措施一起上：
+ *
+ *   1. 相邻块留 `overlapSeconds`（默认 0.5 秒）的重叠：跨在切点上的短音在同一块
+ *      里被完整解出来（`planChunks` 的 `end` 比 `ownedEnd` 多出这一段）；
+ *   2. 跨得更深、在窗口末尾被切断的句子，本块不出稿，把下一块的起点回退到它的
+ *      话头，让它整句在下一块里解一遍（`resolveChunkBoundary`）—— 不丢字、不重复。
+ *
+ * 只做重叠是不够的：重叠区之外的长句会在两块里各断一次、逐字稿里出现重复片段。
+ *
  * ## 默认值来自「设备上本来就有」
  *
  * 默认认为设备上有 ffmpeg 与 SenseVoice（用户口径）。四样东西缺任何一个都
@@ -57,6 +69,18 @@ export const AV_VIDEO_EXTENSIONS = new Set([
 export const AV_LANGUAGES = ['auto', 'zh', 'en', 'yue', 'ja', 'ko'];
 /** 单块默认秒数：官方那条链默认上限 131 秒，这里取 120 秒留余量。 */
 export const AV_CHUNK_SECONDS = 120;
+/**
+ * 相邻两块之间的默认重叠秒数（第三十一轮）。
+ *
+ * 为什么要有它：块是硬切开的，VAD 又在块内独立跑 —— 一句话正好跨在切点上时，
+ * 两边各拿到半句，转写结果是两段都不像话的碎片。给块尾巴留 0.5 秒的重叠，
+ * 跨在切点上的短音（一个词、一个音节）就能在**同一块**里被完整解出来。
+ * 为什么是 0.5 秒：它只买「切点附近那一点音频的余量」，不是拿重叠换上下文；
+ * 重叠越长，重复解码的量越大（每块多算 overlap/chunk 的比例），而真正
+ * 「一句话不许被切开」的保证由 `resolveChunkBoundary` 的边界回退给出（见下），
+ * 不靠把这个数字调大。
+ */
+export const AV_CHUNK_OVERLAP_SECONDS = 0.5;
 /** 单次处理的音频时长上限（秒）：超过就报错并要求先切，而不是把内存吃满。 */
 export const AV_MAX_SECONDS = 3600;
 /** 单次转写 / 抽帧的默认超时（毫秒）。 */
@@ -133,6 +157,10 @@ export function avSettings(config) {
     };
     const str = (value) => (typeof value === 'string' ? value.trim() : '');
     const language = AV_LANGUAGES.includes(str(raw.language)) ? str(raw.language) : 'auto';
+    const chunkSeconds = num(raw.chunkSeconds, AV_CHUNK_SECONDS, 10, 600);
+    // 重叠必须小于半块：等于或超过半块时「重叠」已经变成「同一段音频解两遍」，
+    // 重叠区里的话会被两块各报一次。上限取块的一半，是能保住去重不变量的边界。
+    const overlapSeconds = Math.min(num(raw.overlapSeconds, AV_CHUNK_OVERLAP_SECONDS, 0, 30), chunkSeconds / 2);
     return {
         enabled: raw.enabled !== false,
         ffmpegPath: str(raw.ffmpegPath),
@@ -143,7 +171,8 @@ export function avSettings(config) {
         precision: raw.precision === 'fp32' ? 'fp32' : 'int8',
         threads: Math.round(num(raw.threads, 2, 1, 16)),
         language,
-        chunkSeconds: num(raw.chunkSeconds, AV_CHUNK_SECONDS, 10, 600),
+        chunkSeconds,
+        overlapSeconds,
         maxSeconds: num(raw.maxSeconds, AV_MAX_SECONDS, 10, 21_600),
         timeoutMs: num(raw.timeoutMs, AV_TIMEOUT_MS, 5_000, 1_800_000),
         framesDir: str(raw.framesDir) || 'av/frames',
@@ -289,6 +318,55 @@ export function resetAvProbe() {
 }
 
 /**
+ * **同步**版的可用性判据（能力地图用，见 src/capabilities.js）。
+ *
+ * 为什么要有它：地图必须与 `office.av.check` 说同一件事。第四十七轮复核实测过两处
+ * 不一致 —— 只按 `ffmpeg` 判时，`ffprobe` 配错也报「可用」（`probeAv` 的 missing 里有
+ * `ffprobe`），而按 PATH 找 ffmpeg 时又漏掉 `AV_EXTRA_BIN_DIRS` 里的那份（报「缺件」
+ * 而通道其实可用）。所以判据留在这里、与 `probeAv` 共用同一批解析函数：
+ *
+ *   - 五样（ffmpeg / ffprobe / SenseVoice 权重 + 词表 / Silero VAD / sherpa-onnx 运行时）
+ *     齐全才算 `available`，与 `probeAv().missing.length === 0` 同一口径；
+ *   - **不真跑** ffmpeg / ffprobe（那是 `probeAv` 的异步部分），所以「找得到」不等于
+ *     「跑得起来」——地图末尾那句「能不能真跑看各自的 check」就是这条边界；
+ *   - `enabled:false` 照实报关闭，不假装有能力。
+ *
+ * @param {object} [config] 插件配置（取 av 组）
+ * @returns {{enabled: boolean, ffmpeg: boolean, ffprobe: boolean, model: boolean, vad: boolean, runtime: boolean, available: boolean, missing: string[]}}
+ */
+export function probeAvSync(config = {}) {
+    const settings = avSettings(config);
+    if (settings.enabled === false) {
+        return { enabled: false, ffmpeg: false, ffprobe: false, model: false, vad: false, runtime: false, available: false, missing: ['已关闭'] };
+    }
+    const ffmpeg = findAvExecutable(['ffmpeg'], settings.ffmpegPath) !== undefined;
+    const ffprobe = findAvExecutable(['ffprobe'], settings.ffprobePath) !== undefined;
+    const model = existsSync(modelFileFor(settings)) && existsSync(join(settings.modelDir, 'tokens.txt'));
+    const vad = existsSync(settings.vadModel);
+    // 与 probeAv 同一口径：配置路径优先，否则从宿主锚点解析，且**必须真的存在**。
+    const resolved = settings.runtimePath !== '' && existsSync(settings.runtimePath)
+        ? settings.runtimePath
+        : resolveHostAsset('sherpa-onnx-node');
+    const runtime = typeof resolved === 'string' && resolved !== '' && existsSync(resolved);
+    const missing = [];
+    if (!ffmpeg) missing.push('ffmpeg');
+    if (!ffprobe) missing.push('ffprobe');
+    if (!model) missing.push('SenseVoice 模型');
+    if (!vad) missing.push('Silero VAD');
+    if (!runtime) missing.push('sherpa-onnx 运行时');
+    return {
+        enabled: true,
+        ffmpeg,
+        ffprobe,
+        model,
+        vad,
+        runtime,
+        available: missing.length === 0,
+        missing,
+    };
+}
+
+/**
  * 探测本机的「能读到什么程度」。
  *
  * @param {object} [config] 插件配置（取 av 组）
@@ -341,6 +419,7 @@ export async function probeAv(config = {}) {
         },
         language: settings.language,
         chunkSeconds: settings.chunkSeconds,
+        overlapSeconds: settings.overlapSeconds,
         maxSeconds: settings.maxSeconds,
         hint: missing.length === 0
             ? 'ffmpeg / ffprobe / SenseVoice 模型 / sherpa-onnx 运行时都在，可以转写与抽帧。'
@@ -678,7 +757,7 @@ export async function avInfo(filePath, options, env, cache, config) {
         hint: summary.hasAudio
             ? (summary.kind === 'video'
                 ? '要文字就 office.av.transcribe(path)，要画面就 office.av.frames(path)，两样一起 office.av.extract(path)。'
-                : '要文字就 office.av.transcribe(path)（可传 language / chunkSeconds）。')
+                : '要文字就 office.av.transcribe(path)（可传 language / chunkSeconds / overlapSeconds）。')
             : '这份文件里没有音频轨，转写不了；有画面就 office.av.frames(path) 抽帧。',
     };
 }
@@ -738,17 +817,158 @@ async function decodeToCanonicalWav(input, probe, settings, cache, logBase) {
 /**
  * 把总时长切成若干块（最后一块可能更短）。
  * 块是给推理端用的：一次请求的音频越长，内存与单次超时越难控。
+ *
+ * 第三十一轮起每块多两个量，**别把 start/end 当成「这块的全部音频」**：
+ *
+ *   - `ownedSeconds` 这块**自己负责出稿**的区间，是 `[start, ownedEnd)`；
+ *   - `end` 是这块真正喂给 VAD 的窗口末尾 —— 比 ownedEnd 多出 `overlapSeconds`
+ *     的重叠（最后一块没有下一块，重叠自然截到总长）。
+ *
+ * 重叠的作用是让跨在 `ownedEnd` 上的短音在同一块里被完整解出来；跨得更深的
+ * 长句由 `resolveChunkBoundary` 的边界回退兜住。两者合起来才是不丢字、不重复的
+ * 完整契约，只用重叠是不够的（见那个函数的注释）。
+ *
+ * @param {number} seconds 音频总秒数
+ * @param {number} chunkSeconds 单块秒数（own 区间长度）
+ * @param {number} overlapSeconds 相邻块的重叠秒数
  */
-export function planChunks(seconds, chunkSeconds) {
+export function planChunks(seconds, chunkSeconds, overlapSeconds = AV_CHUNK_OVERLAP_SECONDS) {
     const total = Math.max(0, Number(seconds) || 0);
     const size = Math.max(1, Number(chunkSeconds) || AV_CHUNK_SECONDS);
-    if (total === 0) return [{ index: 0, start: 0, end: 0, seconds: 0 }];
+    const overlap = Math.max(0, Number(overlapSeconds) || 0);
+    const round = (value) => Math.round(value * 1000) / 1000;
+    if (total === 0) return [{ index: 0, start: 0, end: 0, ownedEnd: 0, seconds: 0, ownedSeconds: 0 }];
     const chunks = [];
     for (let start = 0; start < total; start += size) {
-        const end = Math.min(total, start + size);
-        chunks.push({ index: chunks.length, start: Math.round(start * 1000) / 1000, end: Math.round(end * 1000) / 1000, seconds: Math.round((end - start) * 1000) / 1000 });
+        const ownedEnd = Math.min(total, start + size);
+        const end = Math.min(total, ownedEnd + overlap);
+        chunks.push({
+            index: chunks.length,
+            start: round(start),
+            end: round(end),
+            ownedEnd: round(ownedEnd),
+            seconds: round(end - start),
+            ownedSeconds: round(ownedEnd - start),
+        });
     }
     return chunks;
+}
+
+/**
+ * 一块窗口解出来的句子，哪些留在本块、下一块从哪儿接着跑。
+ *
+ * ## 为什么光有重叠不够
+ *
+ * 重叠只保证「结束点落在重叠区里」的句子能在同一块里解完。一句话如果开始得早、
+ * 结束得比窗口末尾还晚，它在两块里**都是断的**：本块截到窗口末尾，下一块从窗口
+ * 起点开始（话头已经被上一块吃掉了），逐字稿里就会出现一小段重复、且这句被切成
+ * 两段。做了重叠之后这个问题反而更容易暴露 —— 旧代码（完全没有重叠）只是把它
+ * 切成两句，不会重复。
+ *
+ * ## 契约
+ *
+ * 输入是「本块窗口解出来的全部句子」（绝对时间），输出是两条：
+ *
+ *   - `keep`：留在本块的句子下标 —— 起点落在自有区间 `[base, ownedEnd)` 里、
+ *     没有被窗口末尾切断的句子。起点落在重叠区（`>= ownedEnd`）的句子属于
+ *     下一块，本块不留：下一块的窗口从 `nextBase` 起一定覆盖它。
+ *   - `nextBase`：下一块的起点。默认是 `ownedEnd`；只要有一条句子要被下一块
+ *     重新解（起点在重叠区里，或者被窗口末尾切断），就回退到它的起点，
+ *     让它连同话头一起在下一块里被完整解一遍。
+ *
+ * 唯一的例外是「回退无路可走」：被切断的那句话起点就是窗口起点（回退等于原地
+ * 打转）时照常出稿、截断在窗口末尾 —— 宁可少几个字，也不能为了回退把整句丢掉，
+ * 更不能让循环挂住。
+ *
+ * 回退为什么是安全的（这是整个分块方案的正确性依据）：
+ *   1. VAD 的句子在时间上不重叠且有先后顺序，被回退的那些句子一定排在所有
+ *      `keep` 的句子之后 —— 所以回退不会把已经出稿的音频再解一遍（不重复）。
+ *   2. 回退点是那条句子自己的起点 —— 所以它不会丢话头（不丢字）。
+ *   3. 回退点在 `(base, ownedEnd]` 里，窗口长度又是 `chunk + overlap`，所以
+ *      「一句话能被某个窗口完整装下」的条件只要求这句话不长于单块秒数；
+ *      而 VAD 的 `maxSpeechDuration` 在 worker 里被夹到不超过单块秒数，
+ *      这条前提是成立的（同时也是这个 while 循环一定前进的依据）。
+ *
+ * ## 水位线：`emittedUntil`
+ *
+ * 光有重叠会**重复出稿**：上一块的窗口尾巴把一句完整的话解了出来（这是重叠
+ * 想要的效果），下一块的窗口从更早的地方开始，又看见了这句话的尾巴 ——
+ * 只按「起点落在自有区间里」判断的话，这条尾巴会在下一块再报一次。
+ * 所以还要记住**已经出稿到哪一秒**（worker 每收一条就推进一次），并据此处理
+ * 本窗口解出来的句子：
+ *
+ *   - 起点在水位线之前、整条都在水位线之前：上一块已经报过，丢掉；
+ *   - 起点在水位线之前、跨在水位线上（前半截报过）：本块不出稿，把下一块的
+ *     起点放到水位线上，让后半截在下一块里从水位线接着解 —— 不重复，也不丢
+ *     后半截；
+ *   - 起点在水位线之后：照常按上面的契约判断。
+ *
+ * 判「起点在水位线之前」用的是**窗口起点被夹住**（`start === base`）而不是
+ * 「离水位线够远」：VAD 按 512 样本（≈32 ms）切帧，上一块留下的尾巴可能只有
+ * 几毫秒，按距离判会漏掉它、让这半句在下一块里再报一次。
+ *
+ * @param {object} input
+ *   base          本块窗口起点（秒）
+ *   ownedEnd      本块自有区间末尾（秒）
+ *   winEnd        本块窗口末尾（秒）
+ *   total         音频总时长（秒）—— 窗口末尾正好等于总长时，末尾那句是自然结束，不能回退
+ *   raw           本块窗口解出来的句子 `[{start, end}]`（绝对秒，按时间升序）
+ *   emittedUntil  已经出稿到的时刻（秒），默认 0
+ * @returns {{keep: number[], nextBase: number, rolledBack: boolean}}
+ */
+export function resolveChunkBoundary({ base, ownedEnd, winEnd, total, raw = [], emittedUntil = 0 }) {
+    const epsilon = 0.05;
+    const waterlineEpsilon = 0.005;
+    const keep = [];
+    let nextBase = ownedEnd;
+    let rolledBack = false;
+    for (let index = 0; index < raw.length; index += 1) {
+        const segment = raw[index];
+        // 起点被窗口起点夹住（`start === base`）说明这句话**可能在窗口之前就开始了**；
+        // 这时只要窗口起点落在水位线之前，它就是上一块报过的那句的尾巴 —— 逐字稿里
+        // 不能再来一份。VAD 的句子是按 512 样本（≈32 ms）切帧的，尾巴可能只有几毫秒，
+        // 所以判据是「夹在窗口起点」而不是「离水位线够远」。
+        const clampedAtBase = segment.start <= base + 1e-9;
+        const behindWaterline = (clampedAtBase && base < emittedUntil - waterlineEpsilon)
+            || segment.start < emittedUntil - waterlineEpsilon;
+        if (behindWaterline) {
+            if (segment.end > emittedUntil + waterlineEpsilon) {
+                // 前半截报过、后半截还没：把下一块挪到水位线上接着解后半截。
+                // 必须就此打住：下一块会从水位线（比后面几句的起点更早）重跑，
+                // 后面几句跟着一起交给它，水位线才能一直是「这之前的都出过稿」。
+                nextBase = Math.max(base, emittedUntil);
+                break;
+            }
+            // 整条都在水位线之前：上一块已经报过，丢掉；后面的句子照常处理。
+            continue;
+        }
+        // 窗口末尾被切断（且后面还有音频）→ 这句不能在本块出稿，交给下一块从它的
+        // 起点重新解。0.05 秒的余量是给 VAD 的帧长（512 样本 ≈ 32 ms）留的：
+        // 一句在窗口末尾自然结束、又恰好落在余量里时最多多解一遍，不会丢字。
+        const cutAtEnd = winEnd < total - 1e-9 && segment.end >= winEnd - epsilon;
+        if (cutAtEnd && segment.start > base + 1e-9) {
+            nextBase = Math.max(base, segment.start);
+            rolledBack = true;
+            break;
+        }
+        // 起点落在重叠区：这一句属于下一块，本块不留（下一块的窗口从 nextBase 起
+        // 一定覆盖它）。
+        if (segment.start >= ownedEnd - 1e-9) {
+            nextBase = Math.max(base, segment.start);
+            break;
+        }
+        // 剩下的两种都留在本块：
+        //   - 完整的句子（起点在自有区间里、没被窗口末尾切断）；
+        //   - 被窗口末尾切断、但**回退无路可走**的句子（它的起点就是窗口起点，
+        //     回退等于原地打转）。这种情况只在一句话长到横跨整个窗口时出现
+        //     （VAD 的单句上限已被夹到不超过单块秒数，所以理论上不该发生），
+        //     宁可照出稿、让它截断在窗口末尾，也不能为了回退把整句丢掉。
+        keep.push(index);
+    }
+    // 兜底：回退点至少要往前走一个样本级别，否则同一块会被反复解（理论上前提
+    // 不成立时才会走到这里，但那意味着死循环，宁可少一次回退也不能挂住）。
+    if (!(nextBase > base)) nextBase = ownedEnd > base ? ownedEnd : base + 1;
+    return { keep, nextBase, rolledBack };
 }
 
 /** 转写结果里每段的文本拼接规则：中日韩之间不加空格，拉丁语之间加一个空格。 */
@@ -783,9 +1003,11 @@ function readJsonFile(path) {
 /**
  * office.av.transcribe(path, options)：把声音转成文字。
  *
- * options: { language?, chunkSeconds?, maxSeconds?, out?, words?, keepAudio? }
+ * options: { language?, chunkSeconds?, overlapSeconds?, maxSeconds?, out?, words?, keepAudio? }
  *   - language      语言提示（auto / zh / en / yue / ja / ko），默认取设置
  *   - chunkSeconds  分块秒数（默认 120）
+ *   - overlapSeconds 相邻两块的重叠秒数（默认 0.5，上限是半块）—— 块不再是完全切开，
+ *                    跨在切点上的短音能在同一块里解完；再深的长句由边界回退兜住
  *   - out           把带时间戳的转写稿写成工作目录里的文件（长稿必须给，否则会被反馈截断）
  *   - words         是否带上词级时间戳（默认不带，体积大）
  *
@@ -816,7 +1038,11 @@ export async function avTranscribe(filePath, options, env, cache, config) {
         throw avError('OFFICE_AV_TOO_LONG', `解码出来的音频时长 ${formatClock(audio.seconds)} 超过单次上限 ${formatClock(maxSeconds)}。`);
     }
     const chunkSeconds = clampOption(options?.chunkSeconds, settings.chunkSeconds, 10, 600);
-    const chunks = planChunks(audio.seconds, chunkSeconds);
+    const overlapSeconds = Math.min(
+        clampOption(options?.overlapSeconds, settings.overlapSeconds, 0, 30),
+        chunkSeconds / 2,
+    );
+    const chunks = planChunks(audio.seconds, chunkSeconds, overlapSeconds);
     const resultPath = cache !== undefined && cache !== null && typeof cache.path === 'function'
         ? cache.path(`${settings.audioDir}/result-${slugOf(input.relative)}-${Date.now().toString(36)}.json`)
         : tempPath('result.json');
@@ -830,6 +1056,7 @@ export async function avTranscribe(filePath, options, env, cache, config) {
         threads: settings.threads,
         language: AV_LANGUAGES.includes(String(options?.language ?? '')) ? String(options.language) : settings.language,
         chunkSeconds,
+        overlapSeconds,
         maxSegmentSeconds: settings.maxSegmentSeconds,
         vadThreshold: settings.vadThreshold,
         minSpeechSeconds: settings.minSpeechSeconds,
@@ -856,6 +1083,11 @@ export async function avTranscribe(filePath, options, env, cache, config) {
 
     const segments = Array.isArray(payload.segments) ? payload.segments : [];
     const text = typeof payload.text === 'string' ? payload.text : joinTranscript(segments.map((item) => item.text));
+    // 词级时间是否真的产出了：请求了 words 但模型侧没给出 tokens/timestamps 时，
+    // 段里不会有 words 字段 —— 这一行让「开了但没算出」不用把整段 words 读一遍就能看出来。
+    const wordSegments = settings.words === true || options?.words === true
+        ? segments.filter((item) => Array.isArray(item.words) && item.words.length > 0)
+        : [];
     cleanupLogs([stdoutPath, stderrPath]);
     const value = {
         ok: true,
@@ -872,8 +1104,21 @@ export async function avTranscribe(filePath, options, env, cache, config) {
             ? Math.round((payload.inferenceSeconds / audio.seconds) * 1000) / 1000
             : null,
         chunkSeconds,
+        overlapSeconds,
         chunks: payload.chunks ?? chunks.length,
+        // 边界回退的次数：0 表示每块都正好在句子之间切开（最省），大于 0 表示有
+        // 句子跨在切点上、被下一块从话头重新解过。它是「重叠够不够」的实测信号。
+        rolls: payload.rolls ?? 0,
         segmentCount: segments.length,
+        ...(settings.words === true || options?.words === true
+            ? {
+                wordTimings: {
+                    segments: wordSegments.length,
+                    count: wordSegments.reduce((sum, item) => sum + item.words.length, 0),
+                    unit: '中日韩按字 / 西文按词',
+                },
+            }
+            : {}),
         segments: segments.map((item) => ({
             index: item.index,
             start: item.start,
@@ -908,6 +1153,9 @@ export async function avTranscribe(filePath, options, env, cache, config) {
     return value;
 }
 
+/** 转写稿里词级时间的封顶（个词）：默认关的字段，写进文件时也要有界。 */
+const TRANSCRIPT_WORD_LIMIT = 600;
+
 /** 转写稿的 Markdown 形态：头部元信息 + 逐句时间戳。 */
 export function renderTranscript(result) {
     const lines = [
@@ -932,6 +1180,35 @@ export function renderTranscript(result) {
     if (extras.length > 0) {
         lines.push('', '## 非中性情绪 / 非语音事件', '');
         for (const item of extras) lines.push(`- ${item.clock}：${item.emotion} ${item.event ?? ''}`);
+    }
+    // 词级时间只在真的算出来时才有这一节（words:true 且 tokens/timestamps 可用）。
+    // 有界：词级时间默认关就是因为它会长，写进稿子时也要封顶，不然一份长会议能到几百 KB。
+    const withWords = (result.segments ?? []).filter((item) => Array.isArray(item.words) && item.words.length > 0);
+    if (withWords.length > 0) {
+        lines.push('', `## 词级时间（秒；中日韩按字、西文按词；共 ${withWords.length} 句）`, '');
+        let printed = 0;
+        let omittedWords = 0;
+        let omittedSegments = 0;
+        for (const item of withWords) {
+            const room = TRANSCRIPT_WORD_LIMIT - printed;
+            if (room <= 0) {
+                // 硬上限：跨过上限的那一句只印**装得下**的那几个词，
+                // 而不是整句印完再停（那会让「最多 600 个词」这句话不成立）。
+                omittedSegments += 1;
+                omittedWords += item.words.length;
+                continue;
+            }
+            const shown = item.words.slice(0, room);
+            printed += shown.length;
+            if (shown.length < item.words.length) {
+                omittedWords += item.words.length - shown.length;
+                omittedSegments += 1;
+            }
+            lines.push(`- ${item.clock ?? ''}：${shown.map((word) => `${Number(word.start ?? 0).toFixed(2)} ${String(word.text ?? '')}`).join(' / ')}`);
+        }
+        if (omittedWords > 0) {
+            lines.push(`- （另有 ${omittedWords} 个词（${omittedSegments} 句）被省略：单份转写稿最多列 ${TRANSCRIPT_WORD_LIMIT} 个词）`);
+        }
     }
     return `${lines.join('\n')}\n`;
 }
@@ -1124,6 +1401,7 @@ export async function avCheck(options = {}) {
         },
         language: settings.language,
         chunkSeconds: settings.chunkSeconds,
+        overlapSeconds: settings.overlapSeconds,
         maxSeconds: settings.maxSeconds,
         maxFrames: settings.maxFrames,
         audioDir: settings.audioDir,

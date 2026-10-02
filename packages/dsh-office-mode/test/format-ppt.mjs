@@ -2156,6 +2156,132 @@ assert(hpReport.outline[7].includes('6 个图标'), `outline[7]：${hpReport.out
         `组合页告警里不应出现 undefined/NaN：${rfReport.warnings.join(' / ')}`);
 }
 
+// ── 8.5 公式（原生 OMML）与三级字体 ─────────────────────────────────────────
+
+{
+    const math = create({
+        title: '公式与字体', theme: 'business', path: 'math-font.pptx', author: '测试',
+        // 全篇字体覆盖：正文槽 + 标题槽分开指定
+        font: { body: '楷体', bodyEn: 'Georgia', title: '黑体', titleEn: 'Georgia' },
+    }, env);
+    // 行内公式混排在 bullets 里
+    math.bullets({
+        title: '质能方程',
+        items: [
+            { runs: [{ text: '质能方程 ' }, { math: 'E=mc^2', size: 20 }, { text: ' 是狭义相对论的推论' }] },
+            { runs: [{ text: '欧拉恒等式 ' }, { math: 'e^{i\\pi}+1=0' }] },
+            { text: '没有公式的普通要点' },
+        ],
+    });
+    // 展示式公式：statement 整段只有一条 math run
+    math.statement({ runs: [{ math: '\\int_{-\\infty}^{\\infty} e^{-x^2}\\,dx = \\sqrt{\\pi}' }] });
+    // 表格单元格里放公式
+    math.table({
+        title: '公式表',
+        columns: ['名称', '表达式'],
+        rows: [['勾股定理', { runs: [{ math: 'a^2+b^2=c^2' }] }]],
+    });
+    // 解析失败的公式：回退成文字 + warning
+    math.bullets({ title: '坏公式', items: [{ runs: [{ math: '\\unknowncmd{x}' }] }] });
+    const mfReport = math.save();
+    const mfParts = unzip(math.render());
+    const mfText = new Map([...mfParts].map(([name, data]) => [name, new TextDecoder('utf-8').decode(data)]));
+    const mfSlide = (page) => mfText.get(`ppt/slides/slide${page}.xml`) ?? '';
+
+    // 结构：AlternateContent + a14:m + oMath + fallback
+    const s1 = mfSlide(1);
+    assert(s1.includes('<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">'),
+        '公式用 mc:AlternateContent 包装');
+    assert(s1.includes('xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main" Requires="a14"'),
+        'mc:Choice 声明 a14 并 Requires');
+    assert((s1.match(/<a14:m>/g) ?? []).length === 2, '第 1 页两条行内公式');
+    assert(s1.includes('<m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">'),
+        '行内公式是 oMath（无 oMathPara）');
+    assert(s1.includes('E = mc²'), 'fallback 里是纯文本近似');
+    assert(s1.includes('sz="2000"'), '公式的 size 写进 m:r 内嵌的 a:rPr');
+
+    // 展示式：statement 页
+    const s2 = mfSlide(2);
+    assert(s2.includes('<m:oMathPara'), '整段一条 math run 排成展示式（oMathPara）');
+    assert(s2.includes('<m:nary>'), '积分是 nary');
+    assert(s2.includes('<m:rad>'), '根号是 rad');
+    // 浅色主题的陈述页公式必须用深色（onPrimary 白字在浅色主题上隐形 —— 第三十七轮修）
+    assert(!s2.includes('<a:srgbClr val="FFFFFF"/></a:solidFill></a:rPr><m:t>'),
+        '浅色主题 statement 的公式不能是白字');
+
+    // 表格与坏公式
+    assert(mfSlide(3).includes('<a14:m>'), '表格单元格里的公式也能写入');
+    const s4 = mfSlide(4);
+    assert(!s4.includes('<a14:m>'), '解析失败的公式不写 a14:m');
+    assert(s4.includes('\\unknowncmd{x}'), '坏公式按原样排成文字');
+    assert(mfReport.warnings.some((line) => line.includes('公式无法解析') && line.includes('第 4 页')),
+        `坏公式要报带页码的 warning：${mfReport.warnings.join(' / ')}`);
+    // 第四十八轮 P0-1：告警要能定位到「哪个形状、第几条 math run」，并且必须双写 env.warn ——
+    // office_run 顶层的 warnings 只由 env.warnings + read() 复检警告拼成，只放进 report
+    // 的返回值等于没报（批量脚本一不 return 那份 report，用户就什么都看不到）
+    assert(mfReport.warnings.some((line) => line.includes('个 math run')),
+        `坏公式的警告要指到形状与 run 序号：${mfReport.warnings.join(' / ')}`);
+    equal(mfReport.stats.formulaErrors, 1, 'create 侧 stats.formulaErrors 数出那一条坏公式');
+    equal(mfReport.stats.formulas, 4, '坏公式不算进 formulas（a14:m 只有 4 条）');
+    assert(env.warnings.some((line) => line.startsWith('ppt：') && line.includes('公式无法解析')),
+        `构建期警告要双写 env.warn：${env.warnings.join(' / ')}`);
+    const warningsBeforeRecompile = env.warnings.length;
+    math.render();
+    equal(env.warnings.length, warningsBeforeRecompile, '重编译不重复报同一条构建期警告');
+    // read() 侧的兜底扫描：只数 a14:m 的话，这一页会被报成「没有公式、也没有问题」
+    const badRead = read('math-font.pptx', env);
+    equal(badRead.stats.formulaErrors, 1, 'read() 侧扫出残留的 LaTeX 文本');
+    assert(badRead.warnings.some((line) => line.includes('未解析的 LaTeX')),
+        `read() 要报残留 LaTeX：${badRead.warnings.join(' / ')}`);
+
+    // 字体：全篇覆盖要落到 theme 的 fontScheme 与页面文字
+    const theme1 = mfText.get('ppt/theme/theme1.xml') ?? '';
+    assert(theme1.includes('<a:majorFont><a:latin typeface="Georgia"/><a:ea typeface="黑体"/>'),
+        'fontScheme majorFont 用标题槽覆盖');
+    assert(theme1.includes('<a:minorFont><a:latin typeface="Georgia"/><a:ea typeface="楷体"/>'),
+        'fontScheme minorFont 用正文槽覆盖');
+    assert((mfSlide(1).match(/<a:latin typeface="Georgia"\/>/g) ?? []).length >= 4, '正文 run 用覆盖后的西文字体');
+    assert((mfSlide(1).match(/<a:ea typeface="楷体"\/>/g) ?? []).length >= 4, '正文 run 用覆盖后的中文字体');
+    assert(mfSlide(1).includes('<a:ea typeface="黑体"/>'), '页面标题用标题槽字体');
+
+    // 统计：create 侧与 read() 侧的 formulas 同口径
+    equal(mfReport.stats.formulas, 4, 'create 侧 stats.formulas（2 行内 + 1 展示式 + 1 表格）');
+    const mfBack = read(mfReport.path, env);
+    equal(mfBack.stats.formulas, 4, 'read() 侧 stats.formulas');
+    equal(mfBack.pages[0].formulas, 2, '第 1 页 pages[0].formulas');
+    equal(mfBack.pages[1].formulas, 1, '第 2 页 pages[1].formulas');
+    // 字数统计把公式近似算进去（不然「带公式的要点」按空段落估高）
+    assert(mfBack.pages[0].words > 0, '带公式的页 words 不为 0');
+
+    // 段落/run 级字体：字符串与 {en,cn} 两种写法
+    const ff = create({ title: 'run 字体', theme: 'plain', path: 'run-font.pptx' }, env);
+    ff.shape({
+        preset: 'rect', x: 1, y: 1, w: 10, h: 4, fill: 'F1F5F9',
+        textOpts: {
+            font: '隶书',
+            paras: [{ runs: [{ text: '段落字体' }, { text: 'run 覆盖', font: { en: 'Consolas', cn: '宋体' } }] }],
+        },
+    });
+    const ffText = new Map([...unzip(ff.render())].map(([name, data]) => [name, new TextDecoder('utf-8').decode(data)]));
+    const ff1 = ffText.get('ppt/slides/slide1.xml') ?? '';
+    assert(ff1.includes('<a:ea typeface="隶书"/>'), '段落 font 字符串作用于未覆盖的 run');
+    assert(ff1.includes('<a:latin typeface="Consolas"/><a:ea typeface="宋体"/>'),
+        'run font 对象 {en,cn} 分别落 latin/ea');
+    // 全篇 font 也可以是字符串
+    const fs2 = create({ title: '字符串字体', theme: 'plain', path: 'str-font.pptx', font: '微软雅黑' }, env);
+    fs2.bullets({ title: '一页', items: ['甲', '乙'] });
+    const fsText = new Map([...unzip(fs2.render())].map(([name, data]) => [name, new TextDecoder('utf-8').decode(data)]));
+    assert((fsText.get('ppt/slides/slide1.xml') ?? '').includes('<a:latin typeface="微软雅黑"/>'),
+        'font 字符串连西文槽一起换');
+    // 超长字体名要 warning 且被忽略
+    const longFont = create({ title: '超长', theme: 'plain', path: 'long.pptx', font: 'x'.repeat(70) }, env);
+    longFont.bullets({ title: '一页', items: ['甲'] });
+    const longReport = longFont.save();
+    assert(longReport.warnings.some((line) => line.includes('超过 64')), '超长字体名报 warning');
+    assert(!(unzip(longFont.render()).get('ppt/slides/slide1.xml')?.toString('utf8') ?? '').includes('x'.repeat(70)),
+        '超长字体名没有写进文件');
+}
+
 // ── 9. 枚举属性收敛（真实 PowerPoint 对非法取值零容忍）────────────────────
 
 {

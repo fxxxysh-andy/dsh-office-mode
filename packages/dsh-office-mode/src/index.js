@@ -17,12 +17,15 @@ import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+import { CAPABILITY_VARIABLE, renderCapabilityMap, syncCapabilities } from './capabilities.js';
 import { resolveConfig } from './config.js';
 import { OFFICE_GUIDE } from './guide.js';
 import { MEMORY_PROMPT_HINT } from './memory.js';
 import { createOfficeSettings, OFFICE_SETTINGS_NS } from './settings.js';
-import { buildTools } from './tools.js';
+import { subagentsOf } from './search.js';
+import { buildTools, officeRunErrorResult } from './tools.js';
 import { registerMemoryView } from './view.js';
+import { disposeProxy, installProxy } from './web-proxy.js';
 
 export const name = 'dsh-office-mode';
 export const inject = ['tools'];
@@ -167,6 +170,95 @@ export function apply(ctx, config = {}) {
         }
     };
 
+    /**
+     * 能力快照 + 把它注入 persona（`{{office_capabilities}}`）。
+     *
+     * 为什么非要变量不可：办公 preset 的 persona 是 `complete: true` 的**唯一**提示段，
+     * 宿主 dsh-system-prompt 在装配最后会把 sections 收敛成那一段 —— 插件注册的
+     * section（guide / 记忆说明）在办公会话里根本进不了提示词，只有 `{{变量}}` 的插值
+     * 发生在收集之后的 renderPrompt 里，能跟着 persona 一起到模型面前。
+     *
+     * 代价写清楚：preset 引用了一个只有本插件才注册的变量，所以**办公 preset 必须与
+     * 本插件同装**（两者本来就是一对，见 README）。缺了插件时宿主会明确报
+     * `unknown prompt variable "{{office_capabilities}}"`，不是静默少一段。
+     */
+    let capabilitySnapshot;
+    const refreshCapabilities = (options = {}) => {
+        try {
+            capabilitySnapshot = syncCapabilities({ config: resolved, refresh: options.refresh === true });
+        } catch {
+            // 探测失败不该让插件起不来：地图会照实说「没探到」。
+            capabilitySnapshot = undefined;
+        }
+    };
+
+    /**
+     * 组合里有没有**能用的**子代理服务（决定 `office_search_dispatch` 走哪条路）。
+     *
+     * 用 search.js 的 `subagentsOf` 而不是自己写 `ctx.get('subagents') !== undefined`：
+     * 那一个还查 `service.start`、并把 `ctx.get` 的抛错吃掉（第四十七轮复核 F1 ——
+     * 弱的那个判据会让地图说「走子代理」，而派工回执给的是「没有 subagents 服务」）。
+     */
+    const subagentsPresent = () => subagentsOf(ctx) !== undefined;
+
+    const registerCapabilityMap = () => {
+        const systemPrompt = typeof ctx.get === 'function' ? ctx.get('systemPrompt') : undefined;
+        if (systemPrompt === undefined || typeof systemPrompt.variable !== 'function') {
+            // 这一段不能像 guide / 记忆说明那样静默跳过：preset 的 persona 引用了这个变量，
+            // 没注册的话办公会话**每一次装配都会抛** unknown prompt variable。组合顺序出问题
+            // 时，这条警告是唯一能指出原因的线索。
+            ctx.logger?.warn?.('[dsh-office-mode] 当前组合里没有 systemPrompt 服务：'
+                + '{{' + CAPABILITY_VARIABLE + '}} 未注册 —— 办公 preset 的 persona 会因未知变量装配失败。');
+            return;
+        }
+        // provider 在**每一次装配**时求值（每个请求一次），而它现在成了办公会话能不能装配
+        // 的前置：探测再抛错也不能把请求带下去（复核 F3）。快照没探到时顺手带 refresh 重探，
+        // 免得拿别的配置留下的旧快照（复核 F2）。
+        disposers.push(systemPrompt.variable(CAPABILITY_VARIABLE, () => {
+            let snapshot = capabilitySnapshot;
+            try {
+                if (snapshot === undefined) snapshot = syncCapabilities({ config: resolved, refresh: true });
+                return renderCapabilityMap(snapshot, { subagents: subagentsPresent() });
+            } catch {
+                return renderCapabilityMap(undefined, { subagents: subagentsPresent() });
+            }
+        }));
+    };
+
+    /**
+     * 把「office_run 脚本失败」变成一个**宿主认识的失败结果**（第十八轮 P0-1）。
+     *
+     * 宿主调度器只认 `isError`：工具体正常返回就一律算成功。脚本失败在插件这一侧
+     * 是 `ok:false`，宿主看不见 —— 会话日志里的失败率因此被低估（第十八轮实测
+     * 5/25 漏记）。这里挂在宿主留的 `tools/execute` 环绕点上（`dsh-timeout` 那种
+     * 策略插件用的就是同一个点），只对 office_run 且 `ok === false` 的结果动手。
+     *
+     * 要点：
+     *   - 只认 `exec.name === 'office_run'`，别的工具原样透传；
+     *   - 已经是失败（宿主自己抛的错）就不动，不把错误再包一层；
+     *   - 不改脚本返回值本身，只替换这一次调用的结果形状（见 tools.js 的
+     *     officeRunErrorResult），所以 office_run 的内部契约与测试不受影响。
+     */
+    const registerRunErrorGuard = () => {
+        if (typeof ctx.on !== 'function') return;
+        disposers.push(ctx.on('tools/execute', async (exec, next) => {
+            const result = await next();
+            if (exec?.name !== 'office_run') return result;
+            if (result === null || typeof result !== 'object' || result.isError === true) return result;
+            const failure = officeRunErrorResult(result.value);
+            if (failure === null) return result;
+            // 结果里已经渲染好的那段文本最完整（含失败前写出的文件与全部告警），用它；
+            // meta 与 additionalContexts 要跟着带过去 —— 宿主的 isError 分支只保留
+            // content / error / meta / additionalContexts，漏掉就等于把展示元数据丢了。
+            return {
+                ...failure,
+                ...(Array.isArray(result.content) && result.content.length > 0 ? { content: result.content } : {}),
+                ...(result.meta !== undefined ? { meta: result.meta } : {}),
+                ...(result.additionalContexts !== undefined ? { additionalContexts: result.additionalContexts } : {}),
+            };
+        }));
+    };
+
     const registerGuide = () => {
         if (!resolved.injectGuide) return;
         const systemPrompt = typeof ctx.get === 'function' ? ctx.get('systemPrompt') : undefined;
@@ -205,8 +297,12 @@ export function apply(ctx, config = {}) {
     const rebuild = () => {
         disposeAll();
         registerTools();
+        registerRunErrorGuard();
         registerGuide();
         registerMemoryHint();
+        // 设置改动可能换了 python.bin / ffmpeg / 模型目录，能力快照跟着重探。
+        refreshCapabilities({ refresh: true });
+        registerCapabilityMap();
     };
 
     /** 重读配置：拆掉 volatile 引用，重新解析成运行期配置。 */
@@ -214,9 +310,30 @@ export function apply(ctx, config = {}) {
         resolved = safeResolveConfig(config);
     };
 
+    /**
+     * 按当前设置装一次出口代理（第二十九轮）。
+     *
+     * 只装不改：装不上（运行时不支持 / 地址不合法）记一条警告就够了 —— 它是
+     * 「让联网换条出口」的增益项，不该让插件激活失败。装了之后**清不掉**
+     * （Node 的 setGlobalProxyFromEnv 只有装没有清），所以清空设置时这里只把
+     * 「要重启才回直连」照实记下来，见 src/web-proxy.js。
+     */
+    const applyProxy = () => {
+        // resolveHostModule 给的是「宿主那侧的 undici」：拿得到就建私有分派器
+        // （只影响本插件），拿不到才退回进程级环境变量那条路。
+        const result = installProxy(resolved?.search?.proxy ?? '', { resolveModule: resolveHostModule });
+        if (result.ok !== true) {
+            ctx.logger?.warn?.('[dsh-office-mode] 代理设置未生效：' + result.reason);
+        }
+    };
+
     registerTools();
+    registerRunErrorGuard();
     registerGuide();
     registerMemoryHint();
+    refreshCapabilities();
+    registerCapabilityMap();
+    applyProxy();
 
     // ── 记忆浏览面板的数据端点 ─────────────────────────────────────────────
     //
@@ -251,6 +368,7 @@ export function apply(ctx, config = {}) {
                 if (ns !== OFFICE_SETTINGS_NS) return;
                 try {
                     refresh();
+                    applyProxy();
                     rebuild();
                 } catch {
                     // 重建失败不该把插件打挂：下一次工具调用仍用旧的那份配置。
@@ -271,6 +389,12 @@ export function apply(ctx, config = {}) {
                 } catch {
                     // 释放失败不应影响其它资源回收。
                 }
+            }
+            // 私有代理分派器持有连接池，卸载时要放掉；进程级那条不是本插件的资源，不碰。
+            try {
+                disposeProxy();
+            } catch {
+                // 同上：释放失败不该影响插件卸载。
             }
         });
     }
@@ -299,9 +423,17 @@ export {
     renderExport,
     renderImport,
     renderStatus,
+    renderKb,
+    tierTag,
+    conflictStateText,
     MEMORY_PROMPT_HINT,
     MEMORY_ACTIONS,
     LINK_KINDS,
+    CONFLICT_CLASSES,
+    CONFLICT_STATES,
+    MEMORY_TIME_WORDS,
+    MEMORY_TIME_HINTS,
+    MEMORY_TIME_PATTERNS,
     DEFAULT_LAYERS,
     DEFAULT_RECALL_QUALITY,
     DEFAULT_QUOTA,
@@ -310,8 +442,28 @@ export {
     PACK_FORMAT,
     PACK_VERSION,
 } from './memory.js';
+export {
+    splitDocument,
+    chunkHeaderOf,
+    chunkIdOf,
+    chunkCharsFor,
+    docIdOf,
+    kbPathsFor,
+    kbDirOf,
+    kbCountsOf,
+    kbLiveIdsOf,
+    kbTierOf,
+    normalizeKbChunk,
+    normalizeManifestRow,
+    KB_TIERS,
+    KB_CHUNK_CHARS,
+    KB_CHUNK_CHARS_BY_KIND,
+    KB_MAX_DOC_BYTES,
+    KB_READ_CHARS,
+    KB_VERSION,
+} from './kb.js';
 export { createTurnQuota, turnKeyOf } from './quota.js';
-export { registerMemoryView, buildSnapshot, noteWorkspace, knownWorkspaces, resetWorkspaces, MEMORY_VIEW_PATH, VIEW_LIMITS } from './view.js';
+export { registerMemoryView, buildSnapshot, noteWorkspace, knownWorkspaces, resetWorkspaces, registryWorkspacesOf, sessionWorkspacesOf, MEMORY_VIEW_PATH, VIEW_LIMITS } from './view.js';
 export { migrateMnemon, renderMigration, readMnemonInsights, mnemonWorkspaceRoot, mnemonGlobalRoot, DEFAULT_MNEMON_DIR } from './migrate.js';
 export { pdfEngines, pdfInfo, pdfPages, pdfText, probePdfEngines } from './pdf.js';
 export {
@@ -327,6 +479,7 @@ export {
     canonicalizeWav,
     isCanonicalWav,
     planChunks,
+    resolveChunkBoundary,
     planFrameTimes,
     joinTranscript,
     renderTranscript,
@@ -337,6 +490,7 @@ export {
     AV_LANGUAGES,
     AV_ERROR_CODES,
     AV_WORKER_PATH,
+    AV_CHUNK_OVERLAP_SECONDS,
     AV_AUDIO_EXTENSIONS,
     AV_VIDEO_EXTENSIONS,
 } from './av.js';
@@ -364,6 +518,8 @@ export {
     isPublicAddress,
     validateUrl,
     classifyContentType,
+    looksLikePdf,
+    defaultPdfReader,
     charsetOf,
     httpFetch,
     webSeamOf,
@@ -372,6 +528,23 @@ export {
     WEB_ENGINE_SEAM,
 } from './web.js';
 export { PROVIDER_IDS, PROVIDERS, resolveProviderOptions, resolveProviderOrder, searchProvider } from './web-providers.js';
+export {
+    activeDispatcher,
+    disposeProxy,
+    installProxy,
+    maskProxyUrl,
+    normalizeProxyUrl,
+    PROXY_ENV_KEYS,
+    proxyStatus,
+    shouldBypassProxy,
+} from './web-proxy.js';
 export { preprocessPage, resolvePreprocessOptions, extractMeta, PREPROCESS_MODES, DEFAULT_PREPROCESS } from './web-preprocess.js';
 export { compileTex, texEngines, probeTexEngines, locateTemplateDir, escapeLatex } from './tex.js';
+export {
+    CAPABILITY_VARIABLE,
+    CAPABILITY_MAP_BUDGET_BYTES,
+    syncCapabilities,
+    resetCapabilities,
+    renderCapabilityMap,
+} from './capabilities.js';
 export { createOfficeSettings, OFFICE_SETTINGS_NS, SUBAGENT_TOOL_CATALOG, LIMITS } from './settings.js';

@@ -13,6 +13,10 @@
  * 传输，0.1.7 起取代了 ctx.settingsScope）：读来自共享 describe mirror，写带回
  * revision 栅栏，所以多个页签同时改也不会互相覆盖。写入只允许落在 volatile
  * 字段上 —— 服务端 schema 里已经整片标好（见 src/settings.js）。
+ *
+ * 第三十五轮起，两页的骨架都是**可折叠的分组**（默认全部收起，进页面先看到一份
+ * 分组目录），顶上一条「定位」框按名称 / 配置项过滤。细节见下面「分组折叠与
+ * 定位」那一段与 SettingsGroup / SettingsBody 的说明。
  */
 window.__ModuleLoader__.load({
     id: "dsh-office-mode",
@@ -38,6 +42,8 @@ window.__ModuleLoader__.load({
             { key: "office_help", label: "office_help", note: "按需查 Word / Excel / PPT 的写法与主题。关掉会明显增加写错 API 的概率" },
             { key: "office_run", label: "office_run", note: "批量执行：生成或修改三件套，以及批量改文本文件" },
             { key: "office_memory", label: "office_memory", note: "三层记忆：读写热记忆（偏好与约定）、检索台账与归档" },
+            { key: "office_web_search", label: "office_web_search", note: "查一个事实点（网页抓取通道，免 Key）：来源直接回到对话，不落盘" },
+            { key: "office_web_fetch", label: "office_web_fetch", note: "打开一个页面取正文（网页抓取通道）；PDF 由 office.pdf 抽文本" },
             { key: "office_search_run", label: "office_search_run", note: "内置检索直查：给几条查询，插件的联网通道去找来源并落盘" },
             { key: "office_search_brief", label: "office_search_brief", note: "检索第一步：按内容类型出检索提纲" },
             { key: "office_search_dispatch", label: "office_search_dispatch", note: "检索执行：有子代理就派子代理，没有就用内置检索逐渠道跑" },
@@ -46,14 +52,86 @@ window.__ModuleLoader__.load({
 
         /** 子代理可用工具。键名必须与服务端白名单一致。 */
         const SUBAGENT_TOOLS = [
-            { id: "web_search", label: "网页搜索", note: "泛搜与兜底检索" },
-            { id: "advanced_search", label: "带时间窗检索", note: "热点事件锁定近期事实" },
-            { id: "platform_search", label: "平台检索", note: "百科 / 仓库 / 问答 / 视频等" },
-            { id: "web_fetch", label: "取回正文", note: "打开具体页面拿原文" },
+            { id: "office_web_search", label: "抓取搜索", note: "插件的免 Key 网页搜索，渠道分流的基础" },
+            { id: "office_web_fetch", label: "抓取正文", note: "打开具体页面拿原文；PDF 由 office.pdf 抽文本" },
             { id: "read", label: "读文本", note: "读结果文件与已抓取内容" },
             { id: "read_image", label: "读图片", note: "图表 / 截图 / 扫描件" },
             { id: "write", label: "写文件", note: "子代理唯一的交付方式，建议保持开启" },
         ];
+
+        /**
+         * 站点清单的类型表与服务端 src/site-catalog.js 的 SITE_TYPES 同一份。
+         *
+         * 浏览器产物是单文件（factory 只拿到 require），服务端模块不在它的作用域里，
+         * 所以只能镜像；漂移由 test/client.mjs 逐项核对，改一边就要改另一边。
+         */
+        const SITE_TYPES = [
+            { id: "academic", name: "学术", note: "预印本、引用索引、文献库与文献检索" },
+            { id: "book", name: "图书", note: "开放书库、书目与电子书" },
+            { id: "code", name: "代码", note: "代码仓库、问答与包索引" },
+            { id: "custom", name: "自定义", note: "自己加的站点（只按域名限定）" },
+        ];
+
+        /**
+         * 内置目录：与服务端 BUILTIN_SITES 逐条一致（字段名与顺序都不能变，有测试核对）。
+         *
+         * 这一份同时是三样东西：`search.sites.entries` 的 schema 默认值（没配过的用户
+         * 看到的就是它）、「恢复内置默认」写回去的内容，以及拿不到设置值时的兜底显示。
+         * 顺序即默认优先级顺序；影子图书馆类只进目录、默认关闭（要用就在行上打开，
+         * 或检索时按域名点名）。
+         */
+        const SITE_CATALOG = [
+            // ── 学术 ──
+            { type: "academic", domain: "arxiv.org", label: "arXiv", note: "预印本，理工科一手材料", enabled: true },
+            { type: "academic", domain: "scholar.google.com", label: "Google 学术", note: "覆盖广，通常要代理才通", enabled: true },
+            { type: "academic", domain: "cnki.net", label: "中国知网", note: "中文期刊与学位论文（多为摘要页）", enabled: true },
+            { type: "academic", domain: "crossref.org", label: "CrossRef", note: "DOI 与引用元数据，核实出处最省事", enabled: true },
+            { type: "academic", domain: "semanticscholar.org", label: "Semantic Scholar", note: "语义检索 + 引用关系", enabled: true },
+            { type: "academic", domain: "pubmed.ncbi.nlm.nih.gov", label: "PubMed", note: "生物医学文献库", enabled: true },
+            { type: "academic", domain: "researchgate.net", label: "ResearchGate", note: "作者自存的全文，质量参差", enabled: true },
+            { type: "academic", domain: "sciencedirect.com", label: "ScienceDirect", note: "付费墙，通常只有摘要", enabled: false },
+            { type: "academic", domain: "springer.com", label: "Springer", note: "付费墙，通常只有摘要", enabled: false },
+            { type: "academic", domain: "ieee.org", label: "IEEE Xplore", note: "付费墙，通常只有摘要", enabled: false },
+            { type: "academic", domain: "sci-hub.se", label: "Sci-Hub", note: "第三方镜像（影子图书馆），默认关闭；可用性与版权状态自行判断", enabled: false },
+
+            // ── 图书 ──
+            { type: "book", domain: "openlibrary.org", label: "Open Library", note: "书目与借阅入口", enabled: true },
+            { type: "book", domain: "gutenberg.org", label: "Project Gutenberg", note: "公版电子书全文", enabled: true },
+            { type: "book", domain: "book.douban.com", label: "豆瓣读书", note: "中文书目、目录与书评", enabled: true },
+            { type: "book", domain: "standardebooks.org", label: "Standard Ebooks", note: "校订过的公版电子书", enabled: true },
+            { type: "book", domain: "libgen.is", label: "Library Genesis", note: "影子图书馆，默认关闭；镜像域名常变", enabled: false },
+            { type: "book", domain: "z-lib.io", label: "Z-Library", note: "影子图书馆，默认关闭；镜像域名常变", enabled: false },
+            { type: "book", domain: "annas-archive.org", label: "Anna's Archive", note: "影子图书馆聚合，默认关闭", enabled: false },
+
+            // ── 代码 ──
+            { type: "code", domain: "github.com", label: "GitHub", note: "仓库、Issue 与讨论", enabled: true },
+            { type: "code", domain: "stackoverflow.com", label: "Stack Overflow", note: "问答，常有可复现的答案", enabled: true },
+            { type: "code", domain: "gitee.com", label: "Gitee", note: "国内仓库，直连更稳", enabled: true },
+            { type: "code", domain: "developer.mozilla.org", label: "MDN", note: "Web 平台参考文档", enabled: true },
+            { type: "code", domain: "pypi.org", label: "PyPI", note: "Python 包与文档入口", enabled: true },
+            { type: "code", domain: "npmjs.com", label: "npm", note: "Node 包与文档入口", enabled: true },
+        ];
+
+        /** 单次最多限定几个站点，与服务端 SITE_PRIORITY_LIMITS.maxPerCall 同一条区间。 */
+        const SITE_MAX_PER_CALL = [1, 8];
+
+        /**
+         * 域名的规范化：去掉协议、路径与 `www.` 前缀，转小写（与服务端
+         * normalizeSiteEntry 的口径一致）。查重必须排在规范化之后 ——
+         * `WWW.Arxiv.org/abs` 与 `arxiv.org` 是同一条。
+         */
+        function normalizeSiteDomain(raw) {
+            return String(raw === undefined || raw === null ? "" : raw).trim().toLowerCase()
+                .replace(/^https?:\/\//, "")
+                .replace(/\/.*$/, "")
+                .replace(/^www\./, "");
+        }
+
+        /**
+         * 合法域名只认 `a.b` 形状（与服务端 site-catalog.js 的 DOMAIN_PATTERN 同一条）。
+         * 不合法就不写入：宁可少一条，也不把坏域名塞进限定查询。
+         */
+        const SITE_DOMAIN_PATTERN = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i;
 
         /** 主题下拉。 */
         // 顺序与服务端 engine/theme.js 的 THEMES 一致（有测试逐项核对）。
@@ -129,6 +207,8 @@ window.__ModuleLoader__.load({
             { key: "maxBytes", path: "search.builtin.maxBytes", label: "单页体积上限", note: "单页正文的体积上限（字节），超出即截断", kind: "number", min: 32768, max: 33554432, step: 32768, unit: "B" },
             { key: "maxChars", path: "search.builtin.maxChars", label: "单页字符上限", note: "单页正文的字符上限，超出即截断", kind: "number", min: 1000, max: 400000, step: 1000, unit: "字" },
             { key: "maxRedirects", path: "search.builtin.maxRedirects", label: "跳转次数上限", note: "取正文最多跟随几次同源跳转（跨站跳转一律不跟）", kind: "number", min: 0, max: 10, step: 1, unit: "次" },
+            { key: "pdfMaxBytes", path: "search.builtin.pdfMaxBytes", label: "PDF 体积上限", note: "取正文撞上 PDF 时的体积上限（字节）。超了直接放弃（截断的 PDF 抽不出文本）：换来源，或先下载到本地用 office.pdf 读", kind: "number", min: 1048576, max: 134217728, step: 1048576, unit: "B" },
+            { key: "pdfMaxPages", path: "search.builtin.pdfMaxPages", label: "PDF 页数上限", note: "PDF 抽文本最多抽前几页，用来圈住抽取耗时（1-500）", kind: "number", min: 1, max: 500, step: 1, unit: "页" },
         ];
 
         /**
@@ -144,11 +224,14 @@ window.__ModuleLoader__.load({
             { key: "archive", path: "memory.layers.archive", label: "归档层", note: "下沉的旧条目与滚动的旧台账。关掉后检索不到归档，但文件仍在盘上" },
         ];
 
-        /** 记忆浏览面板的五个 Tab；key 对应快照里的数组字段名。 */
+        /** 记忆浏览面板的六个 Tab；key 对应快照里的数组字段名。 */
         const BROWSER_TABS = [
             { key: "hot", label: "热记忆" },
             { key: "ledger", label: "台账" },
             { key: "archive", label: "归档" },
+            // 第四十二轮：知识库（kb 一期）的文档清单。面板只读：入库 / 读取都由
+            // 会话里的 office_memory 执行，这里给的是 manifest 行（路径 / 块数 / 档位）。
+            { key: "kb", label: "知识库" },
             { key: "links", label: "关系" },
             { key: "entities", label: "实体" },
         ];
@@ -372,6 +455,47 @@ window.__ModuleLoader__.load({
             },
             foldCaret: Object.assign({ color: M.textTertiary, flex: "0 0 auto" }, T.note),
             foldCount: Object.assign({ color: M.caption }, T.tiny),
+            // ── 分组折叠与定位（第三十五轮）──
+            // 分组头：整行可点，左边 caret + 组名，右边「N 项 / 展开」。
+            // 底下一条细线把它和组体分开，收起时一排组名本身就是目录。
+            groupHead: {
+                display: "flex",
+                alignItems: "center",
+                gap: "8px",
+                width: "100%",
+                padding: "6px 0",
+                background: "none",
+                border: "none",
+                borderBottom: "1px solid var(--dsw-alias-border-l2, rgba(128,128,128,0.18))",
+                color: "inherit",
+                cursor: "pointer",
+                textAlign: "left"
+            },
+            groupHeadTitle: T.heading,
+            groupHeadCount: Object.assign({ color: M.caption }, T.tiny),
+            groupHeadHint: Object.assign({ marginLeft: "auto" }, dim(T.tiny)),
+            // 定位条吸顶：分组展开后这一页很长，输入框滑出视野就没法连着换词定位。
+            // 底色取宿主的 base 表面色（与记忆面板的吸顶头同一套写法）。
+            locator: {
+                position: "sticky",
+                top: 0,
+                zIndex: 2,
+                padding: "8px 0 10px",
+                marginBottom: "8px",
+                background: "var(--dsw-alias-bg-base, #fff)",
+                borderBottom: "1px solid var(--dsw-alias-border-l2, rgba(128,128,128,0.18))"
+            },
+            locatorRow: { display: "flex", flexWrap: "wrap", gap: "8px", alignItems: "center" },
+            locatorInput: Object.assign({
+                flex: "1 1 260px",
+                minWidth: "200px",
+                padding: "6px 10px",
+                borderRadius: "8px",
+                border: "1px solid var(--dsw-alias-border-l1, rgba(128,128,128,0.3))",
+                background: "var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,0.1))",
+                color: "inherit"
+            }, T.label),
+            locatorStats: Object.assign({ marginTop: "6px" }, dim(T.note)),
             quickBar: { display: "flex", flexWrap: "wrap", gap: "8px", alignItems: "center", marginBottom: "10px" },
             callout: {
                 padding: "10px 12px",
@@ -394,7 +518,7 @@ window.__ModuleLoader__.load({
             },
             // ── 记忆浏览面板 ──
             //
-            // 版式：头部（图标 + 标题 + 目录 + 工具）→ 分段控件（五个页签）→ 指标卡 →
+            // 版式：头部（图标 + 标题 + 目录 + 工具）→ 分段控件（六个页签）→ 指标卡 →
             // 两栏（容量 / 存储域）→ 随页签出现的可视化 → 条目列表 → 页脚元信息。
             //
             // 宽度收在 1120px：这一格在宽屏下会拉满，一行路径能拖到屏幕另一头，
@@ -485,7 +609,7 @@ window.__ModuleLoader__.load({
                 boxShadow: M.soft
             },
             // 分段控件：一条浅底轨道 + 选中项浮起。比原来那种「整颗实心蓝药丸」
-            // 安静得多，五个页签并排时也不会把注意力全抢走。
+            // 安静得多，六个页签并排时也不会把注意力全抢走。
             tabsTrack: {
                 display: "flex",
                 flexWrap: "wrap",
@@ -851,6 +975,34 @@ window.__ModuleLoader__.load({
                 color: M.textTertiary
             },
             footerKey: { color: M.caption, fontFamily: M.mono, fontSize: "10px", letterSpacing: "0.06em" },
+
+            // ── 站点清单编辑器（检索编排组内）──
+            //
+            // 一行 = 启用开关 + 域名 + 显示名 + 说明 + 三个动作按钮。窄屏下整行换行
+            // （flexWrap），不把域名输入框压成看不清的宽度；域名与显示名是短输入框，
+            // 说明给宽一点。组头（类型名 + 一句说明）比行本身低一级。
+            siteList: { display: "flex", flexDirection: "column", gap: "2px", marginTop: "4px" },
+            siteGroupHead: Object.assign({ display: "flex", alignItems: "baseline", gap: "8px", marginTop: "10px" }, T.strong),
+            siteGroupNote: Object.assign({ marginBottom: "2px" }, dim(T.note)),
+            siteRow: {
+                display: "flex",
+                alignItems: "center",
+                gap: "8px",
+                flexWrap: "wrap",
+                padding: "6px 0",
+                borderTop: "1px solid var(--dsw-alias-border-l2, rgba(128,128,128,0.14))"
+            },
+            siteCell: { display: "flex", alignItems: "center", gap: "6px", flex: "0 0 auto" },
+            siteField: Object.assign({
+                padding: "5px 8px",
+                borderRadius: "8px",
+                border: "1px solid var(--dsw-alias-border-l1, rgba(128,128,128,0.3))",
+                background: "var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,0.1))",
+                color: "inherit",
+                textAlign: "left"
+            }, T.label),
+            siteAdd: { display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", marginTop: "10px" },
+            siteHint: Object.assign({ marginTop: "8px" }, dim(T.note)),
         };
 
         // ── 小组件 ────────────────────────────────────────────────────────
@@ -901,9 +1053,13 @@ window.__ModuleLoader__.load({
          * 边打字边提交会把「6」这种中间态也存进去，还会和输入框抢焦点。
          * 所以本地先存草稿，失焦或回车才提交。
          *
-         * 步长分两类：整数步长（条数、毫秒）取整；小数步长（0.05 的阈值）吸附到
-         * 刻度上。第一版一律 Math.trunc，会把 0.25 悄悄变成 0 —— 阈值调到 0 就
-         * 等于把整档过滤关掉，用户却看不出来。
+         * 提交时**一律吸附到步长网格**（第二十四轮 新-3 收口）：
+         *   小数步长（0.05 的阈值）吸附到刻度，否则 0.35 会被 Math.trunc 变成 0 ——
+         *   阈值调到 0 就等于把整档过滤关掉，用户却看不出来。
+         *   整数步长**也**吸附，而不是取整：`min` 不是 0、或 `step` 不是 1 的字段
+         *   （容量上限是 min=512 / step=512、台账条数是 min=10 / step=10）停在网格外时
+         *   会被 schema 拒掉，而界面看着像「改了但没生效」。
+         *   `roundToStep` 对整数步长天然给出整数（step 的小数位数是 0，收敛因子是 1）。
          */
         function NumberField(props) {
             const [draft, setDraft] = React.useState(String(props.value));
@@ -913,9 +1069,7 @@ window.__ModuleLoader__.load({
                 if (!Number.isFinite(n)) { setDraft(String(props.value)); return; }
                 const step = props.step || 1;
                 const bounded = Math.min(props.max, Math.max(props.min, n));
-                const clamped = Number.isInteger(step)
-                    ? Math.trunc(bounded)
-                    : roundToStep(bounded, step, props.min);
+                const clamped = roundToStep(bounded, step, props.min);
                 setDraft(String(clamped));
                 if (clamped !== props.value) props.onChange(clamped);
             };
@@ -1073,7 +1227,7 @@ window.__ModuleLoader__.load({
         const CHANNEL_TABLE = [
             {
                 id: "seam", label: "宿主 web 服务（接缝）", needsKey: false,
-                note: "首选通道：宿主自带公网地址校验、地址钉死、体积与超时上限。没有参数要填（search.providers.seam 是空对象）。",
+                note: "兜底通道（第三十轮起排在免 Key 抓取之后）：宿主自带公网地址校验、地址钉死、体积与超时上限。没有参数要填（search.providers.seam 是空对象）。",
                 fields: [],
             },
             {
@@ -1172,7 +1326,9 @@ window.__ModuleLoader__.load({
          * 是这一页「操作不够简易」的主因。
          */
         function Fold(props) {
-            const open = props.open === true;
+            // searching：定位过滤命中折叠块里的行时由 filterRows 置上 —— 命中却看不见
+            // 等于没定位到，所以定位期间折叠块一律展开（定位条清空后回到用户自己的状态）。
+            const open = props.open === true || props.searching === true;
             return h("div", { style: props.style, "data-fold": props.name },
                 h("button", {
                     type: "button",
@@ -1185,8 +1341,614 @@ window.__ModuleLoader__.load({
                     h("span", { style: S.foldCaret }, open ? "▾" : "▸"),
                     h("span", { style: T.strong }, props.label),
                     props.count === undefined ? null : h("span", { style: S.foldCount }, props.count),
+                    h("span", { style: S.groupHeadHint }, open ? "收起" : "展开"),
                 ),
                 h("div", { style: open ? undefined : { display: "none" }, "data-fold-body": props.name }, props.children),
+            );
+        }
+
+        // ── 分组折叠与「定位」（第三十五轮）───────────────────────────────
+        //
+        // 设置项长到近百条以后，「改某一格」要么记得它在第几屏，要么一屏一屏翻。
+        // 这一层给两个入口：
+        //   - 每个分组可收起。默认**全部收起**，进页面先看到一份分组目录
+        //     （每组写「几项」），点开哪一组才铺哪一组的控件；
+        //   - 顶部一个关键词框。命中的行只留它自己、命中所在的分组自动展开、
+        //     命中数写在框下面 —— 输入「代理」「latex」「阈值」直接落到那一行。
+        //
+        // 过滤在**元素树**上做，不是 DOM 查询：bundle 里没有 DOM（也拿不到宿主
+        // 元素的引用），而「哪一行命中」本来就该由这一行自己的 label / note 决定。
+        // 三条口径：
+        //   1) 比对的是每行的标题与说明。说明里常写着配置路径
+        //      （例如 search.providers.anthropic.baseURL），所以按路径也能定位；
+        //   2) 空格分开的多个词是**与**关系（中英混排都按这种切法，中文单串照样命中）；
+        //   3) 分组标题或说明本身命中时整组保留 —— 搜「音频」要看到那一组全部，
+        //      而不是只留下标题命中的那一行。
+        //
+        // 「命中几项」是**跨分组**的数，只有拿着整页子元素的那一层算得出来，
+        // 所以由 SettingsBody 统一数、统一改造分组的 props；各页的分组元素仍写在
+        // 原地（标签、说明、控件一行都不搬），SettingsBody 只负责数、过滤、发开合状态。
+
+        /** 关键词切词：空格分开、转小写、去空。 */
+        function searchTerms(query) {
+            return String(query === undefined || query === null ? "" : query)
+                .toLowerCase()
+                .split(/\s+/)
+                .filter((part) => part !== "");
+        }
+
+        /** 「与」匹配：每个词都要出现在文本里（terms 为空一律不命中）。 */
+        function matchesTerms(text, terms) {
+            if (terms.length === 0) return false;
+            const hay = String(text === undefined || text === null ? "" : text).toLowerCase();
+            for (const term of terms) {
+                if (hay.indexOf(term) === -1) return false;
+            }
+            return true;
+        }
+
+        /** 一行是否命中：标题 + 说明（说明里常带设置路径）。 */
+        function rowMatches(node, terms) {
+            const props = node.props || {};
+            return matchesTerms(String(props.label || "") + " " + String(props.note || ""), terms);
+        }
+
+        /** 一个分组里有几条可调项（Row 的个数）：折叠头右边写出来，找组时先看规模。 */
+        function countRows(node) {
+            if (node === null || node === undefined || typeof node !== "object") return 0;
+            if (Array.isArray(node)) {
+                let total = 0;
+                for (const item of node) total += countRows(item);
+                return total;
+            }
+            let total = node.type === Row ? 1 : 0;
+            if (node.props && node.props.children !== undefined) total += countRows(node.props.children);
+            return total;
+        }
+
+        /** 命中了几行（口径与 filterRows 完全一致，两处必须同源）。 */
+        function countMatchedRows(node, terms) {
+            if (node === null || node === undefined || typeof node !== "object") return 0;
+            if (Array.isArray(node)) {
+                let total = 0;
+                for (const item of node) total += countMatchedRows(item, terms);
+                return total;
+            }
+            if (node.type === Row) return rowMatches(node, terms) ? 1 : 0;
+            return countMatchedRows(node.props ? node.props.children : undefined, terms);
+        }
+
+        /**
+         * 只留下命中的行。
+         *
+         * 不命中的行换成 null；包着它们的容器跟着去掉，容器里一条都不剩时整个容器
+         * 返回 null（分组据此判断「这一组不用画」）。折在 Fold 里的高级参数命中时
+         * 把 Fold 置成 searching —— 否则「定位到了」却看不见。
+         */
+        function filterRows(node, terms) {
+            if (node === null || node === undefined || typeof node === "boolean") return null;
+            if (Array.isArray(node)) {
+                const kept = [];
+                for (const item of node) {
+                    const next = filterRows(item, terms);
+                    if (next !== null) kept.push(next);
+                }
+                return kept.length === 0 ? null : kept;
+            }
+            if (typeof node !== "object") return null;
+            if (node.type === Row) return rowMatches(node, terms) ? node : null;
+            const children = filterRows(node.props ? node.props.children : undefined, terms);
+            if (children === null) return null;
+            const props = Object.assign({}, node.props, { children: children });
+            if (node.type === Fold) props.searching = true;
+            return Object.assign({}, node, { props: props });
+        }
+
+        /** 一个元素里的可读文本（标题 / 说明 / 字符串子节点）：给「指路说明」做定位比对。 */
+        function collectText(node) {
+            if (node === null || node === undefined) return "";
+            if (Array.isArray(node)) return node.map(collectText).join(" ");
+            if (typeof node === "string" || typeof node === "number") return String(node);
+            if (typeof node !== "object") return "";
+            const props = node.props || {};
+            const own = [props.label, props.note, props.title]
+                .filter((item) => typeof item === "string").join(" ");
+            return (own + " " + collectText(props.children)).trim();
+        }
+
+        /** 复制一个元素并覆盖几个 props（元素不可变，改造只能复制）。 */
+        function withProps(node, patch) {
+            return Object.assign({}, node, { props: Object.assign({}, node.props, patch) });
+        }
+
+        /**
+         * 拆开一个分组的子元素：开头那两个「组名 / 说明」块归头部，其余是要收进组体的行。
+         *
+         * 认的是**样式对象的同一性**（S.groupTitle / S.groupNote 是共享常量），
+         * 所以各页的写法完全不用改 —— 仍然照原来的顺序把标题、说明、行作为子元素写下去。
+         */
+        function splitGroupChildren(children) {
+            const list = Array.isArray(children) ? children.slice()
+                : (children === undefined || children === null ? [] : [children]);
+            const head = [];
+            let at = 0;
+            while (at < list.length) {
+                const item = list[at];
+                if (item === null || item === undefined || item === false) { at += 1; continue; }
+                const style = item !== null && typeof item === "object" && item.props ? item.props.style : undefined;
+                if (style !== S.groupTitle && style !== S.groupNote) break;
+                head.push(item);
+                at += 1;
+            }
+            const titleItem = head.find((item) => item.props.style === S.groupTitle);
+            const noteItem = head.find((item) => item.props.style === S.groupNote);
+            return {
+                head: head,
+                body: list.slice(at),
+                title: titleItem === undefined ? "" : collectText(titleItem.props.children),
+                note: noteItem === undefined ? "" : collectText(noteItem.props.children),
+            };
+        }
+
+        /**
+         * 一个可折叠的设置分组。
+         *
+         * 与 Fold 的分工：Fold 收的是「同一组里的高级参数」；分组收的是整页的骨架。
+         * 两者都走「内容照渲染、只是 display:none」——草稿不丢、切换不重建子树，
+         * 也让「界面覆盖服务端每个参数」的核对不必先展开每一组。
+         */
+        function SettingsGroup(props) {
+            const open = props.open === true;
+            const parts = splitGroupChildren(props.children);
+            return h("div", { style: S.group, "data-group": props.id, "data-group-open": open ? "true" : "false" },
+                h("button", {
+                    type: "button",
+                    className: "om-btn",
+                    style: S.groupHead,
+                    "data-group-toggle": props.id,
+                    "aria-expanded": open,
+                    onClick: () => props.onToggle(!open),
+                },
+                    h("span", { style: S.foldCaret }, open ? "▾" : "▸"),
+                    h("span", { style: S.groupHeadTitle }, parts.title),
+                    props.count === undefined ? null : h("span", { style: S.groupHeadCount }, props.count),
+                    h("span", { style: S.groupHeadHint }, open ? "收起" : "展开"),
+                ),
+                h("div", {
+                    style: open ? undefined : { display: "none" },
+                    "data-group-body": props.id,
+                },
+                    parts.head.map((item) => (item.props.style === S.groupTitle ? null : item)),
+                    parts.body,
+                ),
+            );
+        }
+
+        /**
+         * 分组开合的持久化（键按页分开：办公模式页 / 记忆系统页各记各的）。
+         *
+         * 默认全部收起；用户点过之后按他的选择记住 —— 下次打开设置页仍是那样。
+         * localStorage 拿不到（隐私模式 / 宿主禁掉 / 测试环境）就退回进程内存：
+         * 功能照旧，只是不跨刷新。
+         */
+        const GROUP_STORE_PREFIX = "dsh-office-mode.groups.";
+        const GROUP_STORE_MEMORY = {};
+
+        function groupStorage() {
+            try {
+                const store = typeof window !== "undefined" && window ? window.localStorage : undefined;
+                return store && typeof store.getItem === "function" && typeof store.setItem === "function"
+                    ? store : null;
+            } catch (error) {
+                return null;
+            }
+        }
+
+        function loadGroupState(page) {
+            if (GROUP_STORE_MEMORY[page] === undefined) {
+                let parsed = null;
+                const store = groupStorage();
+                if (store !== null) {
+                    try {
+                        const raw = store.getItem(GROUP_STORE_PREFIX + page);
+                        if (raw !== null && raw !== undefined && raw !== "") parsed = JSON.parse(raw);
+                    } catch (error) {
+                        parsed = null;
+                    }
+                }
+                GROUP_STORE_MEMORY[page] = parsed !== null && typeof parsed === "object" ? parsed : {};
+            }
+            return GROUP_STORE_MEMORY[page];
+        }
+
+        function saveGroupState(page, state) {
+            GROUP_STORE_MEMORY[page] = state;
+            const store = groupStorage();
+            if (store === null) return;
+            try {
+                store.setItem(GROUP_STORE_PREFIX + page, JSON.stringify(state));
+            } catch (error) {
+                // 存不下就算了：内存里那份仍然管这一次会话。
+            }
+        }
+
+        /**
+         * 一页的分组开合 + 定位状态（一个设置页一套）。
+         *
+         * 默认**全部收起**（用户口径：进页面先看到分组目录，找得到再展开）；
+         * 点过之后记进 localStorage，下次打开设置页还是那样。
+         */
+        function useGroupView(page, ids) {
+            const [state, setState] = React.useState(loadGroupState(page));
+            const [query, setQuery] = React.useState("");
+            const terms = searchTerms(query);
+            const persist = (next) => {
+                setState(next);
+                saveGroupState(page, next);
+            };
+            return {
+                page: page,
+                query: query,
+                setQuery: setQuery,
+                terms: terms,
+                searching: terms.length > 0,
+                isOpen: (id) => state[id] === true,
+                toggle: (id, open) => persist(Object.assign({}, state, { [id]: open })),
+                setAll: (open) => {
+                    const next = {};
+                    for (const id of ids) next[id] = open;
+                    persist(next);
+                },
+            };
+        }
+
+        /**
+         * 定位条：关键词框 + 全部展开 / 全部收起 + 一行状态。
+         *
+         * 不写「搜索」两个字：这一页搜的是**功能在哪一格**，不是搜内容 ——
+         * 用「定位」与记忆面板的搜索框（搜记忆内容）区分开。
+         */
+        function LocatorBar(props) {
+            const view = props.view;
+            return h("div", { style: S.locator, "data-locator": view.page },
+                h("div", { style: S.locatorRow },
+                    h("input", {
+                        type: "search",
+                        value: view.query,
+                        placeholder: "定位功能：输入名称或配置项（如「代理」「latex」「阈值」）",
+                        "data-locator-input": view.page,
+                        onChange: (event) => view.setQuery(event.target.value),
+                        style: S.locatorInput,
+                    }),
+                    h("button", {
+                        type: "button", className: "om-btn", style: S.button,
+                        "data-groups-expand": view.page,
+                        onClick: () => view.setAll(true),
+                    }, "全部展开"),
+                    h("button", {
+                        type: "button", className: "om-btn", style: S.button,
+                        "data-groups-collapse": view.page,
+                        onClick: () => view.setAll(false),
+                    }, "全部收起"),
+                ),
+                h("div", { style: S.locatorStats, "data-locator-stats": view.page },
+                    view.searching
+                        ? (props.hits === 0
+                            ? "没有匹配的项。换个说法，或点「全部展开」自己找。"
+                            : "命中 " + props.hits + " 项（共 " + props.total + " 项设置）："
+                                + "只留下命中的行，命中的分组已展开。")
+                        : "共 " + props.total + " 项设置，默认收起；点分组标题展开，或在这里按名称定位。"),
+            );
+        }
+
+        /**
+         * 设置页外壳：定位条 + 各页写好的那一串子元素。
+         *
+         * 对每个 SettingsGroup 做三件事：数「几项」、按定位结果过滤、把开合状态发下去；
+         * 分组以外的子元素原样透传 —— 只有标了 data-locator-note 的「指路说明」
+         * （办公模式页那条「记忆在左侧面板」）会跟着定位一起隐藏。
+         */
+        function SettingsBody(props) {
+            const view = useGroupView(props.page, props.groups);
+            const list = Array.isArray(props.children)
+                ? props.children
+                : (props.children === undefined || props.children === null ? [] : [props.children]);
+            let total = 0;
+            let hits = 0;
+            const prepared = [];
+            for (const node of list) {
+                if (node === null || node === undefined || node === false) continue;
+                const isNote = node.props !== undefined && node.props !== null
+                    && node.props["data-locator-note"] !== undefined;
+                if (node.type !== SettingsGroup) {
+                    if (view.searching && isNote) {
+                        if (!matchesTerms(collectText(node), view.terms)) continue;
+                        hits += 1;
+                    }
+                    prepared.push(node);
+                    continue;
+                }
+                const parts = splitGroupChildren(node.props.children);
+                const count = countRows(parts.body);
+                total += count;
+                if (!view.searching) {
+                    prepared.push(withProps(node, {
+                        open: view.isOpen(node.props.id),
+                        onToggle: (next) => view.toggle(node.props.id, next),
+                        count: count + " 项",
+                    }));
+                    continue;
+                }
+                const titleHit = matchesTerms(parts.title + " " + parts.note, view.terms);
+                const matched = titleHit ? count : countMatchedRows(parts.body, view.terms);
+                hits += matched;
+                if (matched === 0) continue;
+                const filtered = titleHit ? parts.body : filterRows(parts.body, view.terms);
+                prepared.push(withProps(node, {
+                    open: true,
+                    onToggle: (next) => view.toggle(node.props.id, next),
+                    count: matched + " / " + count + " 项",
+                    children: parts.head.concat(filtered === null ? [] : filtered),
+                }));
+            }
+            return h("div", { style: S.section },
+                h(LocatorBar, { view: view, hits: hits, total: total }),
+                prepared,
+            );
+        }
+
+        /** 办公模式页的分组（顺序即页面顺序）：用于「全部展开 / 全部收起」。 */
+        const OFFICE_GROUP_IDS = ["tools", "search", "subagents", "documents", "python", "av"];
+        /** 记忆系统页的分组。 */
+        const MEMORY_GROUP_IDS = ["memory", "layers", "scope", "graph", "capacity", "recall", "quota", "migrate"];
+
+        /**
+         * 站点清单的可视化编辑器。
+         *
+         * 写回一律是**整条数组**：`search.sites.entries` 是一个数组设置，服务端按数组
+         * 整体校验（见 src/site-catalog.js 的 normalizeSiteEntry），没有「只改第 n 条」
+         * 这种协议。所以任何一处改动都经 commit()，免得几个入口各写一份数组。
+         *
+         * 编辑框用受控草稿 + 失焦提交（与「出口代理」「通道 Key」同一写法）：写回是异步的
+         * （要过 revision 栅栏），每键入一次写一次会把「a」「ar」「arx」这些中间态也存进去，
+         * 还会和输入框抢焦点。域名要先规范化再查重 —— 重复或不是 `a.b` 形状时只报错、不写入。
+         *
+         * 两处「空」的语义分开（与服务端 effectiveSiteEntries 一致）：
+         *   - `entries === undefined`（拿不到这一项：schema 还没接线 / 宿主没发默认值）
+         *     按内置目录显示，而不是画一个空清单；
+         *   - `entries === []`（用户把行删光了）就按空清单显示，并且**不**兜回内置目录 ——
+         *     否则「删空」这个动作在界面上等于没生效。
+         */
+        function SiteCatalogEditor(props) {
+            const disabled = props.disabled === true;
+            const entries = Array.isArray(props.entries)
+                ? props.entries
+                : SITE_CATALOG.map((item) => Object.assign({}, item));
+            /** 新增表单的四个草稿（不进设置，点了「添加」才写回）。 */
+            const [draft, setDraft] = React.useState({ type: "custom", domain: "", label: "", note: "" });
+            /** 一行错误提示：非法域名 / 重复域名。写入成功即清掉。 */
+            const [error, setError] = React.useState(null);
+            const patchDraft = (patch) => setDraft((prev) => Object.assign({}, prev, patch));
+
+            /** 内置目录的深拷贝：写回前必须复制，否则会污染常量。 */
+            const builtinCopy = () => SITE_CATALOG.map((item) => Object.assign({}, item));
+
+            /** 整条数组写回。 */
+            const commit = (next) => {
+                setError(null);
+                props.write("search.sites.entries", next);
+            };
+            const replaceAt = (index, patch) => commit(
+                entries.map((item, at) => (at === index ? Object.assign({}, item, patch) : item)),
+            );
+            /** 与数组里相邻的一项交换（跨类型分组时也是整条数组的相邻项）。 */
+            const moveAt = (index, delta) => {
+                const to = index + delta;
+                if (to < 0 || to >= entries.length) return;
+                const next = entries.slice();
+                const held = next[index];
+                next[index] = next[to];
+                next[to] = held;
+                commit(next);
+            };
+            /** 改域名：规范化 → 合法性 → 查重，任一条不过就只报错、不动设置。 */
+            const renameDomain = (index, raw) => {
+                const domain = normalizeSiteDomain(raw);
+                if (domain === normalizeSiteDomain(entries[index].domain)) return;
+                if (!SITE_DOMAIN_PATTERN.test(domain)) {
+                    setError("域名「" + domain + "」不合法：只认 a.b 形状（不带协议、路径与端口）。");
+                    return;
+                }
+                if (entries.some((item, at) => at !== index && normalizeSiteDomain(item.domain) === domain)) {
+                    setError("域名「" + domain + "」已经在清单里。");
+                    return;
+                }
+                replaceAt(index, { domain });
+            };
+            /** 新增：追加到数组末尾（数组顺序就是优先顺序）。 */
+            const addEntry = () => {
+                const domain = normalizeSiteDomain(draft.domain);
+                if (!SITE_DOMAIN_PATTERN.test(domain)) {
+                    setError("域名「" + domain + "」不合法：只认 a.b 形状（不带协议、路径与端口）。");
+                    return;
+                }
+                if (entries.some((item) => normalizeSiteDomain(item.domain) === domain)) {
+                    setError("域名「" + domain + "」已经在清单里。");
+                    return;
+                }
+                const type = SITE_TYPES.some((item) => item.id === draft.type) ? draft.type : "custom";
+                const label = String(draft.label || "").trim();
+                commit(entries.concat([{
+                    type,
+                    domain,
+                    label: label === "" ? domain : label,
+                    note: String(draft.note || "").trim(),
+                    enabled: true,
+                }]));
+                setDraft({ type, domain: "", label: "", note: "" });
+            };
+
+            // 按类型分组，顺序跟着 SITE_TYPES。不认识的类型归到最后一组（自定义）显示：
+            // 既不把行藏起来，也不在写回时动它的 type 字段。
+            const groups = [];
+            for (const type of SITE_TYPES) {
+                const items = [];
+                for (let index = 0; index < entries.length; index += 1) {
+                    const entry = entries[index] || {};
+                    const belong = SITE_TYPES.some((candidate) => candidate.id === entry.type)
+                        ? entry.type
+                        : SITE_TYPES[SITE_TYPES.length - 1].id;
+                    if (belong === type.id) items.push({ entry, index });
+                }
+                if (items.length > 0) groups.push({ type, items });
+            }
+            const enabledCount = entries.filter((item) => (item || {}).enabled !== false).length;
+
+            const rowFor = (entry, index) => h("div", {
+                key: String(entry.domain) + "#" + index,
+                style: S.siteRow,
+                "data-site-row": entry.domain,
+            },
+                h("span", { style: S.siteCell, "data-site-toggle": entry.domain },
+                    h(Toggle, {
+                        checked: entry.enabled !== false,
+                        disabled: disabled,
+                        onChange: (next) => replaceAt(index, { enabled: next }),
+                    }),
+                ),
+                h("input", {
+                    type: "text",
+                    defaultValue: String(entry.domain === undefined ? "" : entry.domain),
+                    disabled: disabled,
+                    "data-site-domain": entry.domain,
+                    "aria-label": "域名",
+                    onBlur: (event) => renameDomain(index, event.target.value),
+                    onKeyDown: (event) => { if (event.key === "Enter") event.target.blur(); },
+                    style: Object.assign({}, S.siteField, { width: "150px" }),
+                }),
+                h("input", {
+                    type: "text",
+                    defaultValue: String(entry.label === undefined ? "" : entry.label),
+                    disabled: disabled,
+                    placeholder: "显示名",
+                    "data-site-label": entry.domain,
+                    onBlur: (event) => {
+                        const next = String(event.target.value || "").trim();
+                        if (next !== String(entry.label === undefined ? "" : entry.label)) replaceAt(index, { label: next });
+                    },
+                    onKeyDown: (event) => { if (event.key === "Enter") event.target.blur(); },
+                    style: Object.assign({}, S.siteField, { width: "130px" }),
+                }),
+                h("input", {
+                    type: "text",
+                    defaultValue: String(entry.note === undefined ? "" : entry.note),
+                    disabled: disabled,
+                    placeholder: "一句话说明（为什么收它 / 要注意什么）",
+                    "data-site-note": entry.domain,
+                    onBlur: (event) => {
+                        const next = String(event.target.value || "").trim();
+                        if (next !== String(entry.note === undefined ? "" : entry.note)) replaceAt(index, { note: next });
+                    },
+                    onKeyDown: (event) => { if (event.key === "Enter") event.target.blur(); },
+                    style: Object.assign({}, S.siteField, { width: "260px" }),
+                }),
+                h("span", { style: S.siteCell },
+                    h("button", {
+                        type: "button", className: "om-btn", style: S.button,
+                        "data-site-up": entry.domain,
+                        disabled: disabled || index === 0,
+                        onClick: () => moveAt(index, -1),
+                    }, "上移"),
+                    h("button", {
+                        type: "button", className: "om-btn", style: S.button,
+                        "data-site-down": entry.domain,
+                        disabled: disabled || index === entries.length - 1,
+                        onClick: () => moveAt(index, 1),
+                    }, "下移"),
+                    h("button", {
+                        type: "button", className: "om-btn", style: S.button,
+                        "data-site-remove": entry.domain,
+                        disabled: disabled,
+                        onClick: () => commit(entries.filter((item, at) => at !== index)),
+                    }, "删除"),
+                ),
+            );
+
+            return h("div", { style: S.siteList, "data-site-editor": "true" },
+                h("div", { style: S.quickBar },
+                    h("button", {
+                        type: "button", className: "om-btn", style: S.button,
+                        "data-site-reset": "true",
+                        disabled: disabled,
+                        onClick: () => commit(builtinCopy()),
+                    }, "恢复内置默认"),
+                    h("span", { style: S.status }, "清单 " + entries.length + " 条，启用 " + enabledCount + " 条"),
+                ),
+                error === null ? null : h("div", { style: S.error, "data-site-error": "true" }, error),
+                entries.length === 0
+                    ? h("div", { style: S.quickBar, "data-site-empty": "true" },
+                        h("span", { style: S.rowNote }, "当前清单为空：这次不限定任何站点。"),
+                        h("button", {
+                            type: "button", className: "om-btn", style: S.button,
+                            "data-site-load": "true",
+                            disabled: disabled,
+                            onClick: () => commit(builtinCopy()),
+                        }, "载入内置目录"),
+                    )
+                    : null,
+                groups.map((group) => h("div", { key: group.type.id, "data-site-group": group.type.id },
+                    h("div", { style: S.siteGroupHead }, group.type.name),
+                    h("div", { style: S.siteGroupNote }, group.type.note),
+                    h("div", { style: S.siteList }, group.items.map((item) => rowFor(item.entry, item.index))),
+                )),
+                h("div", { style: S.siteAdd, "data-site-add-form": "true" },
+                    h("span", { style: S.siteCell, "data-site-add-type": "true" },
+                        h(Select, {
+                            value: draft.type,
+                            disabled: disabled,
+                            options: SITE_TYPES.map((type) => ({ value: type.id, label: type.name })),
+                            onChange: (next) => patchDraft({ type: next }),
+                        }),
+                    ),
+                    h("input", {
+                        type: "text",
+                        value: draft.domain,
+                        disabled: disabled,
+                        placeholder: "域名（例 example.com）",
+                        "data-site-add-domain": "true",
+                        onChange: (event) => patchDraft({ domain: event.target.value }),
+                        onKeyDown: (event) => { if (event.key === "Enter") addEntry(); },
+                        style: Object.assign({}, S.siteField, { width: "180px" }),
+                    }),
+                    h("input", {
+                        type: "text",
+                        value: draft.label,
+                        disabled: disabled,
+                        placeholder: "显示名（留空用域名）",
+                        "data-site-add-label": "true",
+                        onChange: (event) => patchDraft({ label: event.target.value }),
+                        onKeyDown: (event) => { if (event.key === "Enter") addEntry(); },
+                        style: Object.assign({}, S.siteField, { width: "160px" }),
+                    }),
+                    h("input", {
+                        type: "text",
+                        value: draft.note,
+                        disabled: disabled,
+                        placeholder: "一句话说明",
+                        "data-site-add-note": "true",
+                        onChange: (event) => patchDraft({ note: event.target.value }),
+                        onKeyDown: (event) => { if (event.key === "Enter") addEntry(); },
+                        style: Object.assign({}, S.siteField, { width: "220px" }),
+                    }),
+                    h("button", {
+                        type: "button", className: "om-btn", style: S.button,
+                        "data-site-add": "true",
+                        disabled: disabled,
+                        onClick: addEntry,
+                    }, "添加"),
+                ),
+                h("div", { style: S.siteHint },
+                    "列表顺序就是优先顺序。域名只按域名限定（site:域名）；说明只在这里显示，不进检索请求。"),
             );
         }
 
@@ -1200,7 +1962,11 @@ window.__ModuleLoader__.load({
             const builtin = search.builtin || {};
             const providers = search.providers || {};
             const preprocess = search.preprocess || {};
+            // 站点清单：`entries` 只在真的拿到数组时才算「有值」（undefined → 内置目录，
+            // [] → 空清单），这个区分在 SiteCatalogEditor 里处理。
+            const sites = search.sites || {};
             const documents = value.documents || {};
+            const python = value.python || {};
             const av = value.av || {};
             const subagentModel = value.subagentModel || {};
             const subagentTools = Array.isArray(search.subagentTools) ? search.subagentTools : [];
@@ -1221,14 +1987,14 @@ window.__ModuleLoader__.load({
                 return String(entry.apiKey || "") !== "" || String(entry.apiKeyEnv || "") !== "";
             });
 
-            return h("div", { style: S.section },
-                writeError !== null ? h("div", { style: S.error }, writeError) : null,
+            return h(SettingsBody, { page: "office", groups: OFFICE_GROUP_IDS },
+                writeError !== null ? h("div", { key: "error", style: S.error }, writeError) : null,
                 disabled
-                    ? h("div", { style: S.status }, "当前连接以只读方式同步设置（memory 模式），改动不会持久化。")
+                    ? h("div", { key: "readonly", style: S.status }, "当前连接以只读方式同步设置（memory 模式），改动不会持久化。")
                     : null,
 
                 // ── 工具开关 ──
-                h("div", { style: S.group },
+                h(SettingsGroup, { key: "tools", id: "tools" },
                     h("div", { style: S.groupTitle }, "工具开关"),
                     h("div", { style: S.groupNote },
                         "关掉的工具不出现在模型面前，也不占每次请求的 schema 开销。改动即时生效，不用重启。"),
@@ -1267,17 +2033,18 @@ window.__ModuleLoader__.load({
                 //
                 // 记忆有自己的面板（「记忆系统」），这里只留一句指路：
                 // 同一个命名空间在两处渲染同一份设置容易让人以为改的是两个东西。
-                h("div", { style: S.group },
+                h("div", { key: "memory", "data-locator-note": "memory", style: S.group },
                     h("div", { style: S.groupTitle }, "记忆"),
                     h("div", { style: S.groupNote },
                         "三层记忆（热记忆 / 台账 / 归档）的开关、容量与迁移说明在左侧「记忆系统」面板里。"),
                 ),
                 // ── 检索编排 ──
-                h("div", { style: S.group },
+                h(SettingsGroup, { key: "search", id: "search" },
                     h("div", { style: S.groupTitle }, "检索编排"),
                     h("div", { style: S.groupNote },
                         "控制检索子代理能做什么、一次铺开多少。渠道多时不要一次全开，容易被限流。"
-                        + "办公 preset 里没有 web_search 这类工具，引擎保持 auto 就会自动改用内置检索。"),
+                        + "第三十轮起资料搜索走插件的网页抓取通道（office_web_search / office_web_fetch，免 Key）；"
+                        + "三方检索 API 不在默认通道顺序里，要显式加回。"),
                     h(Row, { label: "执行引擎", note: "auto = 先派子代理，跑不了自动改用内置检索；builtin = 只用内置检索；subagent = 只用子代理", first: true },
                         h(Select, {
                             value: search.engine === undefined ? "auto" : search.engine,
@@ -1308,6 +2075,25 @@ window.__ModuleLoader__.load({
                             search.provider === undefined || search.provider === "auto"
                                 ? "按顺序试；已配置的通道：" + enabledChannels.map((item) => item.label).join("、")
                                 : "只用这一条。"),
+                    ),
+                    h(Row, {
+                        label: "出口代理",
+                        note: "留空 = 联网按本进程原有出口直连。填了（形如 http://127.0.0.1:7897，只认 http / https）"
+                            + "让本插件自己发起的请求走它：装了私有分派器时改值当场生效；拿不到 undici 的部署会退回"
+                            + "「整个进程」的环境变量那条路，那种情况下清空要重启 DSH 才回直连。",
+                    },
+                        h("input", {
+                            type: "text",
+                            defaultValue: search.proxy === undefined ? "" : search.proxy,
+                            disabled: disabled,
+                            placeholder: "http://127.0.0.1:7897",
+                            onBlur: (event) => {
+                                const next = String(event.target.value || "").trim();
+                                if (next !== search.proxy) write("search.proxy", next);
+                            },
+                            onKeyDown: (event) => { if (event.key === "Enter") event.target.blur(); },
+                            style: Object.assign({}, S.input, { width: "260px", textAlign: "left" }),
+                        }),
                     ),
                     h(Row, { label: "填哪条通道的参数", note: "下面那一组参数只针对选中的通道（改这里不影响「联网通道」的选择）" },
                         h(Select, {
@@ -1479,6 +2265,60 @@ window.__ModuleLoader__.load({
                             onChange: (next) => write("search.preprocess.keepTitle", next),
                         }),
                     ),
+                    // ── 站点清单（第三十四轮：优先检索的可视化编辑）──
+                    //
+                    // 三段开关 + 一张清单。清单本体在 SiteCatalogEditor 里，写回一律是
+                    // 整条数组（search.sites.entries），没有逐条改的协议。
+                    h("div", { style: Object.assign({}, S.groupTitle, { marginTop: "18px" }) }, "站点清单"),
+                    h("div", { style: S.groupNote },
+                        "先把查询限定到清单里的站点（site:域名）去问：命中的来源排在前面，并按类型汇总。"
+                        + "清单顺序就是优先顺序；一条都没有时这一次不做限定。"
+                        + "限定轮一无所获时按下面的开关决定退不退回泛搜 —— 不因为清单查不到就当成「没有资料」。"),
+                    h(Row, {
+                        label: "站点优先检索",
+                        note: "把查询限定到清单里的站点去问，命中的来源排前面并按类型汇总。关掉则所有检索都不限定来源。",
+                        first: true,
+                    },
+                        h(Toggle, {
+                            checked: sites.enabled !== false,
+                            disabled: disabled,
+                            onChange: (next) => write("search.sites.enabled", next),
+                        }),
+                    ),
+                    h(Row, {
+                        label: "退回泛搜",
+                        note: "这些站点被墙、没收录或站点改版时，退回不限定来源的泛搜，并把哪些站点空手照实写出来。"
+                            + "关掉则限定轮没有结果就是没有结果（清单被墙时容易误判成「查不到」）。",
+                    },
+                        h(Toggle, {
+                            checked: sites.fallback !== false,
+                            disabled: disabled,
+                            onChange: (next) => write("search.sites.fallback", next),
+                        }),
+                    ),
+                    h(Row, {
+                        label: "单次最多限定",
+                        note: "一次检索最多限定几个站点，按清单顺序自上而下取（1-8）。限定越多越慢，也越容易被目标站限流。",
+                    },
+                        h(NumberField, {
+                            value: Number.isFinite(sites.maxPerCall) ? sites.maxPerCall : SITE_MAX_PER_CALL[0],
+                            min: SITE_MAX_PER_CALL[0], max: SITE_MAX_PER_CALL[1], step: 1, disabled: disabled,
+                            onChange: (next) => write("search.sites.maxPerCall", next),
+                        }),
+                        h("span", { style: S.unit }, "个"),
+                    ),
+                    h(Row, {
+                        label: "清单内容",
+                        note: "按类型分组；行上可以直接改域名、显示名与说明（失焦或回车才写回）。"
+                            + "域名只按域名限定，说明只在这里显示、不进检索请求。",
+                        stacked: true,
+                    },
+                        h(SiteCatalogEditor, {
+                            entries: sites.entries,
+                            disabled: disabled,
+                            write: write,
+                        }),
+                    ),
                     h(Row, { label: "子代理可用工具", note: "加得越多，子代理越容易跑偏去干检索以外的事", stacked: true },
                         h("div", { style: S.chips }, SUBAGENT_TOOLS.map((tool) => h(Chip, {
                             key: tool.id,
@@ -1553,7 +2393,7 @@ window.__ModuleLoader__.load({
                 //
                 // 本插件的后台任务只有一处：检索三步走的派工子代理。这一组只影响
                 // 它们，不动主对话 —— 两件事混在一个下拉里会让人以为改了主模型。
-                h("div", { style: S.group },
+                h(SettingsGroup, { key: "subagents", id: "subagents" },
                     h("div", { style: S.groupTitle }, "子代理模型"),
                     h("div", { style: S.groupNote },
                         "检索子代理用哪个模型。只影响后台派工，不影响主对话。"),
@@ -1596,7 +2436,7 @@ window.__ModuleLoader__.load({
                 ),
 
                 // ── 文档与缓存 ──
-                h("div", { style: S.group },
+                h(SettingsGroup, { key: "documents", id: "documents" },
                     h("div", { style: S.groupTitle }, "文档与缓存"),
                     h("div", { style: S.groupNote },
                         "默认视觉主题、批处理的资源上限，以及中间产物与 PDF 渲染的规则。"),
@@ -1722,12 +2562,72 @@ window.__ModuleLoader__.load({
                     ),
                 ),
 
+                // ── Python 计算与绘图 ──
+                //
+                // 服务端 `python` 组（src/settings.js）从第十一轮起就存在，但界面一直没有
+                // 这一组 —— 四个参数只能改配置文件。第三十八轮补上：模式与其它组一致
+                // （Row + 控件 + 失焦写回），四项全部走 `python.*` 点号路径。
+                //
+                // 三项留空的语义都要说清（与 src/python.js 的探测一致）：
+                //   解释器留空 = 自动探测 PATH 里的 python / python3 / py；
+                //   产物目录留空 = 缓存目录下的 python/out；
+                //   单项超时不设「留空」，因为它有确定默认值（120 秒）。
+                h(SettingsGroup, { key: "python", id: "python" },
+                    h("div", { style: S.groupTitle }, "Python 计算与绘图"),
+                    h("div", { style: S.groupNote },
+                        "办公模式里唯一的编程出口：脚本里用 office.python.run / file / check 做科学计算与绘图，"
+                        + "产物落缓存目录。命令行仍然是关掉的，插件也不替用户装包。"),
+                    h(Row, { label: "启用", note: "关掉后 office.python 不可用（报错说明在设置里关了），其余能力不受影响", first: true },
+                        h(Toggle, {
+                            checked: python.enabled !== false,
+                            disabled: disabled,
+                            onChange: (next) => write("python.enabled", next),
+                        }),
+                    ),
+                    h(Row, { label: "解释器路径", note: "留空自动探测 PATH 里的 python / python3 / py；也可以填绝对路径。应用商店的占位程序不算可用" },
+                        h("input", {
+                            type: "text",
+                            defaultValue: python.bin || "",
+                            disabled: disabled,
+                            placeholder: "留空 = 自动探测",
+                            onBlur: (event) => {
+                                const next = String(event.target.value || "").trim();
+                                if (next !== python.bin) write("python.bin", next);
+                            },
+                            onKeyDown: (event) => { if (event.key === "Enter") event.target.blur(); },
+                            style: Object.assign({}, S.input, { width: "300px", textAlign: "left" }),
+                        }),
+                    ),
+                    h(Row, { label: "运行超时", note: "单次 Python 运行的超时（毫秒）。跑长计算或大批量绘图时调大；office_run 的脚本超时管不到 await，Python 的有效上限就是这一项" },
+                        h(NumberField, {
+                            value: python.timeoutMs === undefined ? 120000 : python.timeoutMs,
+                            min: 5000, max: 900000, step: 5000, disabled: disabled,
+                            onChange: (next) => write("python.timeoutMs", next),
+                        }),
+                        h("span", { style: S.unit }, "毫秒"),
+                    ),
+                    h(Row, { label: "产物目录", note: "Python 产物（图 / 表 / 数据）的目录，相对缓存目录；脚本里拿 OUT_DIR 就是它的绝对路径。留空 = python/out" },
+                        h("input", {
+                            type: "text",
+                            defaultValue: python.outDir || "",
+                            disabled: disabled,
+                            placeholder: "留空 = python/out",
+                            onBlur: (event) => {
+                                const next = String(event.target.value || "").trim();
+                                if (next !== python.outDir) write("python.outDir", next);
+                            },
+                            onKeyDown: (event) => { if (event.key === "Enter") event.target.blur(); },
+                            style: Object.assign({}, S.input, { width: "200px", textAlign: "left" }),
+                        }),
+                    ),
+                ),
+
                 // ── 音频与视频 ──
                 //
                 // 四样能力（ffmpeg / ffprobe / SenseVoice 模型 / sherpa-onnx 运行时）
                 // 都由插件按这里的路径自动探测；缺任何一样时 office.av 会明确报错，
                 // 报错文案与 office.av.check() 的 hint 是同一份。
-                h("div", { style: S.group },
+                h(SettingsGroup, { key: "av", id: "av" },
                     h("div", { style: S.groupTitle }, "音频与视频"),
                     h("div", { style: S.groupNote },
                         "录音 / 视频转文字（本机 SenseVoice 离线识别，带逐句时间戳），视频按时间点抽帧交给读图。"
@@ -1794,6 +2694,14 @@ window.__ModuleLoader__.load({
                             value: av.chunkSeconds === undefined ? 120 : av.chunkSeconds,
                             min: 10, max: 600, step: 10, disabled: disabled,
                             onChange: (next) => write("av.chunkSeconds", next),
+                        }),
+                        h("span", { style: S.unit }, "秒"),
+                    ),
+                    h(Row, { label: "块间重叠", note: "相邻两块的重叠秒数（默认 0.5）。块不再完全切开：跨在切点上的短音在同一块里解完；跨得更深的长句由边界回退兜住，不丢字也不重复。上限是半块" },
+                        h(NumberField, {
+                            value: av.overlapSeconds === undefined ? 0.5 : av.overlapSeconds,
+                            min: 0, max: 30, step: 0.5, disabled: disabled,
+                            onChange: (next) => write("av.overlapSeconds", next),
                         }),
                         h("span", { style: S.unit }, "秒"),
                     ),
@@ -1869,7 +2777,7 @@ window.__ModuleLoader__.load({
                     ),
                 ),
 
-                h("div", { style: S.groupNote },
+                h("div", { key: "tail", style: S.groupNote },
                     "数值超出范围会被宿主拒绝并自动回读；改动即时生效。"),
             );
             } });
@@ -1893,13 +2801,13 @@ window.__ModuleLoader__.load({
             const quota = memory.quota || {};
             const layerNote = "三层各管一段时间尺度：热记忆常驻（用户偏好与项目约定），台账按次登记（每份交付物一条），归档只读（下沉的旧条目与滚动的旧台账）。记忆不是缓存，不会被 TTL 清掉。";
 
-            return h("div", { style: S.section },
-                writeError !== null ? h("div", { style: S.error }, writeError) : null,
+            return h(SettingsBody, { page: "memory", groups: MEMORY_GROUP_IDS },
+                writeError !== null ? h("div", { key: "error", style: S.error }, writeError) : null,
                 disabled
-                    ? h("div", { style: S.status }, "当前连接以只读方式同步设置（memory 模式），改动不会持久化。")
+                    ? h("div", { key: "readonly", style: S.status }, "当前连接以只读方式同步设置（memory 模式），改动不会持久化。")
                     : null,
 
-                h("div", { style: S.group },
+                h(SettingsGroup, { key: "memory", id: "memory" },
                     h("div", { style: S.groupTitle }, "记忆系统"),
                     h("div", { style: S.groupNote }, layerNote),
                     h(Row, { label: "开启记忆", note: "关掉后 office_memory 工具、记忆提示段与 office_run 的自动台账一起停", first: true },
@@ -1942,7 +2850,7 @@ window.__ModuleLoader__.load({
                 //
                 // 每层一个独立开关：关掉只是不再读 / 不再写，数据留在盘上。
                 // 这是「先别用」而不是「删掉」，所以不给一个总开关一了百了。
-                h("div", { style: S.group },
+                h(SettingsGroup, { key: "layers", id: "layers" },
                     h("div", { style: S.groupTitle }, "记忆层拓扑"),
                     h("div", { style: S.groupNote },
                         "每层独立开关。关掉只是不再读 / 不再写，已有数据不会被删除，重新打开就回来。"),
@@ -1959,7 +2867,7 @@ window.__ModuleLoader__.load({
                 ),
 
                 // ── 记忆范围（跨项目层） ──
-                h("div", { style: S.group },
+                h(SettingsGroup, { key: "scope", id: "scope" },
                     h("div", { style: S.groupTitle }, "记忆范围"),
                     h("div", { style: S.groupNote },
                         "决定记忆是「一个项目一份」还是「所有项目共用一份」。跨项目层解决的是换工作目录就要重记一遍偏好这件事。"),
@@ -1996,7 +2904,7 @@ window.__ModuleLoader__.load({
                 ),
 
                 // ── 图关系与主动记录 ──
-                h("div", { style: S.group },
+                h(SettingsGroup, { key: "graph", id: "graph" },
                     h("div", { style: S.groupTitle }, "图关系与主动记录"),
                     h("div", { style: S.groupNote },
                         "两个可选的记忆增强，对应 mnemon 的 link / auto-capture。都只改行为，不动已有数据。"),
@@ -2016,7 +2924,7 @@ window.__ModuleLoader__.load({
                     ),
                 ),
 
-                h("div", { style: S.group },
+                h(SettingsGroup, { key: "capacity", id: "capacity" },
                     h("div", { style: S.groupTitle }, "容量与归档"),
                     h("div", { style: S.groupNote },
                         "容量满了向下沉，不静默丢：热记忆装不下时最旧、最不重要的条目进归档，并在 MEMORY.md 留一条指路条目；台账超出条数上限时最旧的滚成月度归档摘要。"),
@@ -2033,6 +2941,30 @@ window.__ModuleLoader__.load({
                             value: memory.projectLimitBytes === undefined ? 10240 : memory.projectLimitBytes,
                             min: 1024, max: 262144, step: 1024, disabled: disabled,
                             onChange: (next) => write("memory.projectLimitBytes", next),
+                        }),
+                        h("span", { style: S.unit }, "字节"),
+                    ),
+                    h(Row, { label: "投影预算", note: "一次投影里热记忆条目正文的字节上限（0 = 不限），默认 4096。超出的条目不丢：折叠行报条数与读取入口" },
+                        h(NumberField, {
+                            value: memory.projectionBudgetBytes === undefined ? 4096 : memory.projectionBudgetBytes,
+                            min: 0, max: 131072, step: 1024, disabled: disabled,
+                            onChange: (next) => write("memory.projectionBudgetBytes", next),
+                        }),
+                        h("span", { style: S.unit }, "字节"),
+                    ),
+                    h(Row, { label: "单条上限", note: "一条热记忆最多多少字节（0 = 不限），默认 2800。超过就拒绝写入并提示压缩：热记忆是动笔前照办的清单，不是文档仓库" },
+                        h(NumberField, {
+                            value: memory.entryLimitBytes === undefined ? 2800 : memory.entryLimitBytes,
+                            min: 0, max: 131072, step: 100, disabled: disabled,
+                            onChange: (next) => write("memory.entryLimitBytes", next),
+                        }),
+                        h("span", { style: S.unit }, "字节"),
+                    ),
+                    h(Row, { label: "单条建议线", note: "超过这个字节数只在写入回执里提醒（不拒绝），默认 1200；0 = 关掉提醒" },
+                        h(NumberField, {
+                            value: memory.entryHintBytes === undefined ? 1200 : memory.entryHintBytes,
+                            min: 0, max: 131072, step: 100, disabled: disabled,
+                            onChange: (next) => write("memory.entryHintBytes", next),
                         }),
                         h("span", { style: S.unit }, "字节"),
                     ),
@@ -2059,7 +2991,7 @@ window.__ModuleLoader__.load({
                 // 管的是「一次检索返回什么」。注意这里的分档分数是「命中了查询里
                 // 几成的词」，不是向量余弦相似度 —— 不写清楚，用户会按向量检索的
                 // 直觉把阈值调到 0.8，然后一条都查不出来。
-                h("div", { style: S.group },
+                h(SettingsGroup, { key: "recall", id: "recall" },
                     h("div", { style: S.groupTitle }, "召回质量"),
                     h("div", { style: S.groupNote },
                         "一次检索返回什么：按相关度分档、低相关的丢掉。分数是「命中了查询里几成的词」，不是向量相似度。"),
@@ -2087,7 +3019,7 @@ window.__ModuleLoader__.load({
                     ),
                     h(Row, { label: "候选倍数", note: "先取「条数上限 × 这个倍数」个候选再分档，防止低分结果把高分结果挤出候选池" },
                         h(NumberField, {
-                            value: recallQuality.candidateMultiplier === undefined ? 3 : recallQuality.candidateMultiplier,
+                            value: recallQuality.candidateMultiplier === undefined ? 5 : recallQuality.candidateMultiplier,
                             min: 1, max: 10, step: 1, disabled: disabled,
                             onChange: (next) => write("memory.recallQuality.candidateMultiplier", next),
                         }),
@@ -2095,7 +3027,7 @@ window.__ModuleLoader__.load({
                     ),
                     h(Row, { label: "中档最多几条", note: "「中档」最多采纳几条（0-40）" },
                         h(NumberField, {
-                            value: recallQuality.maxMediumResults === undefined ? 4 : recallQuality.maxMediumResults,
+                            value: recallQuality.maxMediumResults === undefined ? 6 : recallQuality.maxMediumResults,
                             min: 0, max: 40, step: 1, disabled: disabled,
                             onChange: (next) => write("memory.recallQuality.maxMediumResults", next),
                         }),
@@ -2103,7 +3035,7 @@ window.__ModuleLoader__.load({
                     ),
                     h(Row, { label: "未知档最多几条", note: "「未知档」最多采纳几条（0 = 一条都不要）" },
                         h(NumberField, {
-                            value: recallQuality.maxUnknownResults === undefined ? 2 : recallQuality.maxUnknownResults,
+                            value: recallQuality.maxUnknownResults === undefined ? 4 : recallQuality.maxUnknownResults,
                             min: 0, max: 40, step: 1, disabled: disabled,
                             onChange: (next) => write("memory.recallQuality.maxUnknownResults", next),
                         }),
@@ -2115,7 +3047,7 @@ window.__ModuleLoader__.load({
                 //
                 // 管的是「一个回合能查几次」。与上一组的分工必须写在说明里：两组
                 // 都调「检索」，不写清楚会被当成同一个东西。
-                h("div", { style: S.group },
+                h(SettingsGroup, { key: "quota", id: "quota" },
                     h("div", { style: S.groupTitle }, "每回合配额"),
                     h("div", { style: S.groupNote },
                         "防止「没查到就换个词再查」把上下文填满。0 = 该类不限制。回合号从会话日志的 turn/start 读出来。"),
@@ -2135,6 +3067,14 @@ window.__ModuleLoader__.load({
                         }),
                         h("span", { style: S.unit }, "次"),
                     ),
+                    h(Row, { label: "知识块检索", note: "一个回合里的 kb（来源原文）检索次数。与记忆检索分开算：语料与代价都不同" },
+                        h(NumberField, {
+                            value: quota.kbSearchPerTurn === undefined ? 2 : quota.kbSearchPerTurn,
+                            min: 0, max: 50, step: 1, disabled: disabled,
+                            onChange: (next) => write("memory.quota.kbSearchPerTurn", next),
+                        }),
+                        h("span", { style: S.unit }, "次"),
+                    ),
                     h(Row, { label: "图关系遍历", note: "一个回合里沿关系跳转的次数" },
                         h(NumberField, {
                             value: quota.relatedPerTurn === undefined ? 1 : quota.relatedPerTurn,
@@ -2145,7 +3085,7 @@ window.__ModuleLoader__.load({
                     ),
                 ),
 
-                h("div", { style: S.group },
+                h(SettingsGroup, { key: "migrate", id: "migrate" },
                     h("div", { style: S.groupTitle }, "从 mnemon 迁移"),
                     h("div", { style: S.groupNote },
                         "把 mnemon 的 runtime 热记忆（含全局 USER.md）迁进本目录的热记忆，长期记忆（insights）连同类别、重要度、标签、实体与关系边数迁进归档。幂等、只增不改，重复跑不会产生第二份。"),
@@ -2160,7 +3100,7 @@ window.__ModuleLoader__.load({
                     ),
                 ),
 
-                h("div", { style: S.groupNote },
+                h("div", { key: "tail", style: S.groupNote },
                     "本面板只读写设置；记忆内容本身由助手用 office_memory 读取与检索（三层记忆的完整说明见 office_help({ topic: 'memory' })）。"),
             );
             } });
@@ -2465,6 +3405,17 @@ window.__ModuleLoader__.load({
                 return lines.filter((line) => line !== "").join("\n");
             }
             if (tab === "archive") return String(entry.text || "");
+            if (tab === "kb") {
+                // 文档级字段都摆出来：档位决定它能不能被当成依据（写入期质量门按它判），
+                // 块数与文档 id 是会话侧 kb-read 要用的两个入口。
+                const lines = [String(entry.path || "")];
+                if (entry.title) lines.push("标题：" + entry.title);
+                lines.push("知识块：" + String(entry.chunks || 0) + " 块 ｜ " + String(entry.chars || 0) + " 字 ｜ " + String(entry.bytes || 0) + " 字节");
+                if (entry.tier) lines.push("来源档：" + entry.tier);
+                if (entry.at) lines.push("入库：" + String(entry.at).slice(0, 19).replace("T", " "));
+                lines.push("文档 id：" + String(entry.id || ""));
+                return lines.join("\n");
+            }
             if (tab === "links") {
                 return String(entry.sourceId || "") + " —[" + String(entry.kind || "related") + "]→ " + String(entry.targetId || "")
                     + (entry.note ? "\n" + entry.note : "");
@@ -2586,6 +3537,19 @@ window.__ModuleLoader__.load({
                     actionRow,
                 ]);
             }
+            if (tab === "kb") {
+                // 一条文档：档位与块数是「能不能拿它当依据」的两个关键字段
+                // （单源未核实的档位会被写入期质量门拦下），所以放在徽标里。
+                const size = humanBytes(item.bytes);
+                return shell(card, [
+                    h(Badges, { key: "badges", items: [
+                        originLabel(item.origin), item.tier,
+                        String(item.chunks || 0) + " 块", size, String(item.at || "").slice(0, 10),
+                    ] }),
+                    body(String(item.path || "") + (item.title ? " —— " + item.title : "")),
+                    actionRow,
+                ]);
+            }
             if (tab === "links") {
                 return shell(card, [
                     h(Badges, { key: "badges", items: [originLabel(item.origin), String(item.at || "").slice(0, 10)] }),
@@ -2681,6 +3645,7 @@ window.__ModuleLoader__.load({
             { key: "hot", label: "热记忆", color: "#5a8cff", note: "常驻的偏好与约定" },
             { key: "ledger", label: "台账", color: "#22a879", note: "交付物自动登记" },
             { key: "archive", label: "归档", color: "#c08a2e", note: "下沉的旧条目" },
+            { key: "kb", label: "知识库", color: "#3d9bbf", note: "入库的文档与知识块" },
             { key: "links", label: "关系", color: "#708199", note: "类型化的关系边" },
             { key: "entities", label: "实体", color: "#a06bd6", note: "被声明的实体" },
         ];
@@ -3588,7 +4553,7 @@ window.__ModuleLoader__.load({
             );
         }
 
-        /** 标题下的五枚指标卡（mnemon 健康条那一路的读法：点 + 名称 + 数字）。 */
+        /** 标题下的六枚指标卡（mnemon 健康条那一路的读法：点 + 名称 + 数字）。 */
         function MetricTiles(props) {
             const counts = props.counts || {};
             return h("div", { style: S.tiles, "data-metrics": "memory" }, METRIC_TILES.map((tile) => {
@@ -3669,6 +4634,13 @@ window.__ModuleLoader__.load({
                     const archiveFiles = finite(entry.archiveFiles);
                     if (archiveFiles !== null && archiveFiles > 0) {
                         chips.push(chip("archiveFiles", "摘要 " + countText(archiveFiles) + " 个", null));
+                    }
+                    // 知识库：文档数与块数一起给 —— 只有文档数看不出「一份文档切了多少块」，
+                    // 而块数才是占用与检索面的那个量。
+                    const kb = entry.kb && typeof entry.kb === "object" ? entry.kb : null;
+                    const kbDocs = kb === null ? null : finite(kb.docs);
+                    if (kbDocs !== null && kbDocs > 0) {
+                        chips.push(chip("kb", "知识库 " + countText(kbDocs) + " 篇 / " + countText(kb.chunks) + " 块", null));
                     }
                     if (bytes !== null) chips.push(chip("bytes", bytes, null));
                     if (files !== null) chips.push(chip("files", files + " 个文件", null));
@@ -4013,7 +4985,9 @@ window.__ModuleLoader__.load({
                         // 选中的页签那颗点带一圈光晕：不靠加粗文字也能看出「我在这一格」。
                         boxShadow: on ? "0 0 0 3px color-mix(in srgb, " + tone + " 16%, transparent)" : "none",
                     }) }),
-                    tab.label + "（" + (Number.isFinite(counts[tab.key]) ? counts[tab.key] : 0) + "）",
+                    // 缺字段时页签与指标块用**同一个口径**：破折号，而不是 0。
+                    // 「这一层是空的」与「这个端点没告诉我」是两件事（复核 P3-1）。
+                    tab.label + "（" + (finite(counts[tab.key]) === null ? "—" : counts[tab.key]) + "）",
                 );
             }));
 
@@ -4115,8 +5089,40 @@ window.__ModuleLoader__.load({
                 h("div", { style: S.itemDetailHint }, "完整内容。卡片上的「展开」可以就地铺开 —— 列表项不再用原生 title 提示。"),
             );
 
+            // 归档页签的一条实证：把**真实总数**（counts.archiveItems，未过滤、未截断）
+            // 与「这一页拿回来多少」摆在一起。端点上归档上限是 200 条，条目超过它时
+            // 列表里那 200 条看起来像全部 —— 说清楚差多少，用户才知道该不该去会话里检索。
+            // 面板有意**不做远端翻页**：那要给端点加 offset 参数，多一条要守的信任边界，
+            // 而归档的全文检索本来就有 office_memory 的 read（带 since/until）。
+            const archiveTotal = finite(counts.archiveItems);
+            const archiveTruncated = archiveTotal !== null && archiveTotal > total;
             const archiveNote = state.tab === "archive" && total > 0
-                ? h("div", { style: S.pendingHint, "data-archive-note": "true" }, ARCHIVE_READONLY_NOTE)
+                ? h("div", { style: S.pendingHint, "data-archive-note": "true" },
+                    ARCHIVE_READONLY_NOTE
+                    + (archiveTotal === null ? "" : " 归档共 " + archiveTotal + " 条。")
+                    + (archiveTruncated
+                        ? "这一页只给了 " + total + " 条（浏览入口的单次上限），要看更旧的用 office_memory 的 read 检索。"
+                        : ""))
+                : null;
+
+            // 知识库页签的同一件事：清单上限是 20 篇，文档再多也只列到 20 —— 把真实总数与
+            // 块数摆出来，别让 20 看起来像全部。块正文不在这一页：要读哪一块，用会话里的
+            // kb-read（面板只给文档 id 与块数）。
+            //
+            // 措辞不写「最新的 N 篇」：`at` 撞在同一毫秒时排序是稳定排序的产物，说「最新」
+            // 会是一句撑不住的承诺（复核 P2-4）。说「这一页列了 N 篇」，并把总数放在旁边。
+            const kbTotal = finite(counts.kbTotal);
+            const kbTruncated = counts.kbTruncated === true || (kbTotal !== null && kbTotal > total);
+            const kbNote = state.tab === "kb" && total > 0
+                ? h("div", { style: S.pendingHint, "data-kb-note": "true" },
+                    "知识库是只读页：入库、检索与读取都由会话里的 office_memory 执行"
+                    + "（kb-ingest / kb-search / kb-read）。"
+                    + (kbTotal === null ? "" : " 库里共 " + kbTotal + " 篇、"
+                        + countText(counts.kbChunks) + " 块、"
+                        + (humanBytes(counts.kbBytes) === null ? "—" : humanBytes(counts.kbBytes)) + "。")
+                    + (kbTruncated
+                        ? "这一页列了 " + total + " 篇（清单接口的单次上限），要看全部用 kb-list。"
+                        : ""))
                 : null;
 
             const body = state.loading
@@ -4128,7 +5134,7 @@ window.__ModuleLoader__.load({
                         h("div", { style: S.emptyGlyph }, "◌"),
                         h("div", { style: S.emptyTitle }, "这一层还没有内容。"),
                         h("div", { style: S.emptyHint }, "用 office_memory({ action: 'add' }) 记一条偏好或约定；台账会在 office_run 写出第一份交付物时自动登记。"))
-                    : h("div", null, archiveNote, list, moreBar, detailBar);
+                    : h("div", null, archiveNote, kbNote, list, moreBar, detailBar);
 
             // ── 可视化块 ──
             //

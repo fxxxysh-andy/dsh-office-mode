@@ -3,26 +3,36 @@
  *
  * ## 为什么要有这个模块
  *
- * 「办公模式」是一个完整的组合（preset 的 plugins 列表就是那个会话的全部插件行），
- * 里面**没有** @deepseek-ai/dsh-tool-web。于是办公会话的工具面里根本没有
+ * 「办公模式」曾经是一份**没有** @deepseek-ai/dsh-tool-web 的组合（preset 的
+ * plugins 列表就是那个会话的全部插件行），办公会话的工具面里因此没有
  * web_search / advanced_search / platform_search / web_fetch：
  * office_search_dispatch 把渠道派给子代理时会用工具白名单圈那几个名字，
  * 子代理一启动就报
  *   tools.restrict() names unknown global tools "web_search", …
  * 整条检索链 0/N 全部失败（2026-09-25 的真实会话 session6 就是这样）。
  *
- * ## 三层结构（第二十轮）
+ * 第二十九轮起办公 preset 曾声明 tool-web（第三十轮起又收掉了）；本模块**继续存在**，
+ * 因为「按渠道覆盖检索、材料落盘再读」和「一个模型工具一把梭」是两件事：
  *
- *   1. **接缝（seam）**：ctx.get('web') 在就用它。它带着宿主的取正文策略
- *      （公网地址校验与地址钉死、同源跳转、体积与超时上限、代理路由），首选。
- *   2. **多路通道（src/web-providers.js）**：Anthropic 兼容 + 原生 web_search、
- *      OpenAI 兼容、Tavily、Brave、博查、Exa、Serper、自建 SearXNG、
- *      DuckDuckGo（免 Key）。每条通道自己发 HTTP、自己解析，返回统一形状。
- *      单条通道是**可选的**：`search.provider` 指定一条就只用那一条；
- *      `auto`（默认）按 `search.providerOrder` 依次尝试，第一条成功的就用它。
- *      这样「只有 DeepSeek 一条路」不再是硬约束：换通道不用改代码，
- *      零配置的通路（DuckDuckGo）保证「刚装好就能查」。
- *   3. **取正文**：接缝优先，其次自带的安全抓取；两者拿到的页面都要过
+ *   - office_web_search / office_web_fetch 适合查一个事实点、打开一个页面
+ *     （第三十轮新增的两个插件工具，走的正是本模块的免 Key 抓取通道）；
+ *   - office_search_brief / dispatch / run / parse_findings 负责渠道覆盖与取证落盘，
+ *     而且在没有子代理工具的部署（别的 product、精简组合）里仍然要能单独跑通。
+ *
+ * 另外 web_search 的检索由宿主定策略，本模块的多通道能按机器情况换出口（含代理），
+ * 两者互为备份 —— 一条路被挡时不至于整件事做不下去。
+ *
+ * ## 三层结构（第二十轮起，第三十轮调整主次）
+ *
+ *   1. **多路通道（src/web-providers.js）**：DuckDuckGo（免 Key 抓取）、自建
+ *      SearXNG、接缝（宿主 ctx.web）、Anthropic 兼容 + 原生 web_search、
+ *      OpenAI 兼容、Tavily、Brave、博查、Exa、Serper。每条通道自己发 HTTP、
+ *      自己解析，返回统一形状。**默认顺序（第三十轮）是 duckduckgo → searxng →
+ *      seam**：办公模式的资料搜索走自己的网页抓取通道；三方检索 API
+ *      （tavily / bocha / serper …）不进默认顺序，只有显式点名（provider 参数
+ *      或设置页固定）才用。`search.provider` 指定一条就只用那一条。
+ *   2. **取正文**：自带的安全抓取优先（公网地址校验、只跟同源跳转、限长限时、
+ *      PDF 交给 office.pdf 抽文本），宿主接缝兜底；两者拿到的页面都要过
  *      **成败哨兵**与**脚本式预处理**（见下）。
  *
  * 三层都不可用时给出可执行的说明（缺哪个 Key、怎么配），而不是沉默失败。
@@ -50,12 +60,29 @@
  *   - 返回给调用方的是**清洗后**的正文，附一份 `preprocess.stats`
  *     （去掉多少行、去重几行、留下多少字符），判错时看得见、也能退回 `off`。
  *
+ * ## 出口代理与 PDF（第二十九轮补）
+ *
+ *   - **代理**：`search.proxy` 填了就装（见 src/web-proxy.js）。优先用宿主那份
+ *     undici 建**插件私有**的分派器（只有本插件的联网走它，改设置当场生效）；
+ *     拿不到 undici 才退回 Node 的 `http.setGlobalProxyFromEnv()`（进程级、
+ *     只能装不能清）。本模块的 `defaultNetwork.fetch` 只负责把私有分派器挂到
+ *     这一次请求上。
+ *   - **PDF**：取正文撞上 `application/pdf` 时不再报「不支持的内容类型」——
+ *     下载到临时文件后交给 office.pdf 的 `pdfText` 抽文本，正文进 `content`、
+ *     页数与引擎进 `pdf`，并明确标注「没做网页预处理」。体积上限是**放弃线**
+ *     （截断的 PDF 抽不出文本），抽不出文本（扫描件）按「没拿到结果」报。
+ *
  * @module dsh-office-mode/web
  */
 import { lookup as dnsLookup } from 'node:dns/promises';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { isIP } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
 
 import { DEFAULT_BUILTIN_WEB } from './config.js';
+import { pdfText } from './pdf.js';
+import { activeDispatcher, shouldBypassProxy } from './web-proxy.js';
 import {
     asText,
     describeWebFailure,
@@ -78,6 +105,7 @@ import {
     resolveProviderOptions,
     resolveProviderOrder,
     searchProvider,
+    settingsCellOf,
 } from './web-providers.js';
 import { preprocessPage, resolvePreprocessOptions } from './web-preprocess.js';
 
@@ -99,6 +127,8 @@ export {
     WEB_FAILURE_KINDS,
     PROVIDER_IDS,
     providerOf,
+    settingsCellOf,
+    probeProvider,
     resolveApiKey,
     resolveProviderOptions,
     resolveProviderOrder,
@@ -184,6 +214,8 @@ export function resolveBuiltinOptions(raw) {
         maxBytes: num('maxBytes', DEFAULT_BUILTIN_WEB.maxBytes, 32_768, 32 * 1024 * 1024),
         maxChars: num('maxChars', DEFAULT_BUILTIN_WEB.maxChars, 1_000, 400_000),
         maxRedirects: num('maxRedirects', DEFAULT_BUILTIN_WEB.maxRedirects, 0, 10),
+        pdfMaxBytes: num('pdfMaxBytes', DEFAULT_BUILTIN_WEB.pdfMaxBytes, 1024 * 1024, 128 * 1024 * 1024),
+        pdfMaxPages: num('pdfMaxPages', DEFAULT_BUILTIN_WEB.pdfMaxPages, 1, 500),
         userAgent: pick('userAgent', DEFAULT_BUILTIN_WEB.userAgent),
         provider: isSearchConfig && asText(source.provider) !== '' ? asText(source.provider) : 'auto',
         providerOrder: isSearchConfig
@@ -220,8 +252,42 @@ export function engineDescription(engine, provider) {
 /** 允许抓取的协议与 URL 上限（与宿主 web-fetch-http 的策略同一口径）。 */
 const MAX_URL_LENGTH = 2048;
 
-/** 只在测试里替换：DNS 解析与 fetch。 */
-const defaultNetwork = { lookup: dnsLookup, fetch: (...args) => globalThis.fetch(...args) };
+/**
+ * 把下载下来的 PDF 交给 office.pdf 抽文本（第二十九轮）。
+ *
+ * 为什么落在临时目录而不是缓存目录：PDF 只是「取正文」的中间物，抽完就删，
+ * 缓存那套（键、淘汰、体积统计）对它没有价值，而临时目录天然是进程私有的。
+ * 抽不出文本（扫描件）时把 pdfText 自己的提示带出去 —— 它会指向
+ * office.pdf.pages() 渲染成图再看。
+ */
+export const defaultPdfReader = {
+    async text(absolutePath, options) {
+        // pdfText 只用到 env.resolve / env.root（后者给 displayPath 用）：路径本身是绝对的，
+        // 原样返回即可；root 取文件所在目录，报错信息里就只出现文件名而不是整条临时路径。
+        const env = { resolve: (path) => path, root: dirname(absolutePath) };
+        const result = await pdfText(absolutePath, { from: 1, to: options.maxPages }, env);
+        return { text: result.text, pages: result.pages, extractor: result.engine, hint: result.hint };
+    },
+};
+
+/**
+ * 只在测试里替换：DNS 解析、fetch 与 PDF 抽取。
+ *
+ * fetch 这两条路都从 `links` 出去：
+ *   - 走进程级代理时，环境变量装的全局 dispatcher 自己生效，这里不必传东西；
+ *   - 走私有分派器时（第二十九轮 `search.proxy`），把 agent 通过 `dispatcher`
+ *     选项挂到这一次请求上 —— 只有本插件自己的联网受影响。
+ */
+const defaultNetwork = {
+    lookup: dnsLookup,
+    fetch: (url, init) => {
+        // 本地地址（自建 SearXNG 默认端点在 127.0.0.1）一律不过代理：私有分派器不吃
+        // NO_PROXY，这一步得自己做，才能与兜底那条路的行为一致。
+        const dispatcher = shouldBypassProxy(url) ? undefined : activeDispatcher();
+        return globalThis.fetch(url, dispatcher === undefined ? init : { ...init, dispatcher });
+    },
+    pdf: defaultPdfReader,
+};
 
 /**
  * 判断一个 IP 字面量是不是公网可路由地址。
@@ -357,6 +423,24 @@ export function charsetOf(contentType) {
     return /;\s*charset\s*=\s*"?([^";]+)"?/i.exec(asText(contentType))?.[1]?.trim().toLowerCase();
 }
 
+/**
+ * 这份响应是不是 PDF（第二十九轮）。
+ *
+ * Content-Type 说了算；它缺席或只有 `application/octet-stream` 这种含糊值时看 URL
+ * 后缀 —— 学生题库、期刊与机构站点上这两种情况都常见。反过来，站点明确说了
+ * text/html 就按 HTML 处理，不去猜后缀（有些下载页把 .pdf 挂在查询参数上）。
+ */
+export function looksLikePdf(contentType, url) {
+    const mime = asText(contentType).replace(/;.*$/s, '').trim().toLowerCase();
+    if (mime === 'application/pdf' || mime === 'application/x-pdf') return true;
+    if (mime !== '' && mime !== 'application/octet-stream' && mime !== 'binary/octet-stream') return false;
+    try {
+        return new URL(String(url)).pathname.toLowerCase().endsWith('.pdf');
+    } catch {
+        return false;
+    }
+}
+
 /** 按声明的编码解码；编码不认识时报错而不是给出乱码。 */
 function decodeBytes(bytes, contentType) {
     const charset = charsetOf(contentType);
@@ -399,6 +483,159 @@ async function readCapped(response, maxBytes, signal) {
         offset += chunk.byteLength;
     }
     return { bytes, truncated };
+}
+
+/** 读响应体并套上取正文的错误分类（超时 / 取消 / 网络中断分得开）。 */
+async function readBodyCapped(response, maxBytes, requestSignal, signal, options) {
+    return readCapped(response, maxBytes, requestSignal).catch((error) => {
+        if (error instanceof WebAccessError) throw error;
+        // 读流中断：超时、调用方取消与网络断开在这里都会冒出来，按信号归类。
+        const timedOut = signal?.aborted !== true && requestSignal?.aborted === true;
+        throw new WebAccessError(
+            timedOut ? `取正文超过 ${options.fetchTimeoutMs} 毫秒。` : `读取响应体失败：${messageOf(error)}`,
+            timedOut ? 'OFFICE_WEB_TIMEOUT' : 'OFFICE_WEB_NETWORK',
+            { cause: error },
+        );
+    });
+}
+
+/**
+ * 取**字节**（不当作正文解码）—— 图片这类资源走它（历史遗留 `11-1`）。
+ *
+ * 为什么另开一条而不是扩 httpFetch：httpFetch 的产出是「可读正文」，一路上有
+ * 内容类型白名单、哨兵、预处理与编码解码，全是文本语义；二进制走那条路只会
+ * 在半途被判成「不支持的内容类型」。这里只做同一套**安全与限长**：地址校验
+ * （SSRF 防线）、只跟同源跳转、按上限读、超时与取消分类 —— 复用同一批私有函数，
+ * 所以策略只有一份实现。
+ *
+ * @param {string} input URL
+ * @param {{maxBytes?: number, fetchTimeoutMs?: number, maxRedirects?: number, userAgent?: string, accept?: string}} [options]
+ * @param {AbortSignal} [signal]
+ * @returns {Promise<{url: string, statusCode: number, contentType: string, bytes: Uint8Array}>}
+ */
+export async function httpFetchBytes(input, options = {}, signal, network = defaultNetwork) {
+    const url = validateUrl(input);
+    const fetchTimeoutMs = Number(options.fetchTimeoutMs) > 0 ? Number(options.fetchTimeoutMs) : 30_000;
+    const maxRedirects = Number.isFinite(Number(options.maxRedirects)) ? Math.max(0, Math.trunc(Number(options.maxRedirects))) : 3;
+    const maxBytes = Number(options.maxBytes) > 0 ? Math.trunc(Number(options.maxBytes)) : 8 * 1024 * 1024;
+    const requestSignal = withTimeout(signal, fetchTimeoutMs);
+    let current = url;
+    let hop = 0;
+    for (;;) {
+        await assertPublicHost(current.hostname, network);
+        let response;
+        try {
+            response = await network.fetch(current.toString(), {
+                method: 'GET',
+                redirect: 'manual',
+                headers: {
+                    'user-agent': asText(options.userAgent) || 'dsh-office-mode',
+                    accept: asText(options.accept) || 'image/*,*/*;q=0.8',
+                },
+                signal: requestSignal,
+            });
+        } catch (error) {
+            if (signal?.aborted === true) throw new WebAccessError('取资源被取消。', 'OFFICE_WEB_ABORTED', { cause: error });
+            throw new WebAccessError(`取资源失败：${messageOf(error)}`, 'OFFICE_WEB_NETWORK', { cause: error });
+        }
+        if (REDIRECT_STATUS.has(response.status)) {
+            const location = response.headers.get('location');
+            await response.body?.cancel?.().catch(() => {});
+            if (location === null || location === undefined) {
+                throw new WebAccessError(`HTTP ${response.status} 跳转但没有 Location 头。`, 'OFFICE_WEB_NETWORK');
+            }
+            if (hop >= maxRedirects) {
+                throw new WebAccessError(`跳转超过 ${maxRedirects} 次上限。`, 'OFFICE_WEB_REDIRECT');
+            }
+            const next = validateUrl(new URL(location, current).toString());
+            if (next.origin !== current.origin) {
+                throw new WebAccessError(`跨站跳转到 ${next.origin} 不自动跟随，请直接用那个地址。`, 'OFFICE_WEB_REDIRECT');
+            }
+            current = next;
+            hop += 1;
+            continue;
+        }
+        if (response.status >= 400) {
+            await response.body?.cancel?.().catch(() => {});
+            throw new WebAccessError(`HTTP ${response.status}：${current.toString()}`, 'OFFICE_WEB_HTTP_ERROR');
+        }
+        const contentType = asText(response.headers.get('content-type')).replace(/;.*$/s, '').trim().toLowerCase();
+        const { bytes, truncated } = await readBodyCapped(response, maxBytes, requestSignal, signal, { fetchTimeoutMs });
+        if (truncated) {
+            throw new WebAccessError(
+                `这份资源超过 ${Math.round(maxBytes / 1024)} KB 上限（截断的图片没法用）：换一个小一点的尺寸，或先下载到本地。`,
+                'OFFICE_WEB_UNSUPPORTED_TYPE',
+            );
+        }
+        if (bytes.byteLength === 0) throw new WebAccessError(`响应体是空的：${current.toString()}`, 'OFFICE_WEB_EMPTY');
+        return { url: current.toString(), statusCode: response.status, contentType, bytes };
+    }
+}
+
+/**
+ * 把下载下来的 PDF 写进临时文件，交给 office.pdf 抽文本（第二十九轮）。
+ *
+ * 无论成败都清掉临时文件。抽不出文本（扫描件 / 没有引擎）时抛 WebAccessError，
+ * 分类分别是「没拿到结果」与「配置缺失」—— 两者的修法不同（换来源 vs 装引擎），
+ * 压成一句会让人配错东西。
+ */
+async function pdfToText(bytes, options, requestSignal, reader, url) {
+    if (bytes === undefined || bytes.byteLength === 0) {
+        // 空响应体：不是引擎问题，也不是「抽不出文本」，而是这一页什么都没给。
+        throw new WebAccessError(`响应体是空的，没有可抽文本的 PDF：${url}`, 'OFFICE_WEB_EMPTY');
+    }
+    // 魔数嗅探：Content-Type 说 PDF、后缀是 .pdf，内容却可能是一个 HTML 错误页。
+    // 不先判这一下，它会被当成「抽不出来」报成「去装 pdftotext」—— 修法指错（审查 P2-5）。
+    if (Buffer.from(bytes.subarray(0, 5)).toString('latin1') !== '%PDF-') {
+        throw new WebAccessError(
+            `这份响应标着 PDF（或链接以 .pdf 结尾），内容却不是 PDF（多半是一个 HTML 错误页）：${url}`,
+            'OFFICE_WEB_UNSUPPORTED_TYPE',
+        );
+    }
+    if (reader === undefined || reader === null || typeof reader.text !== 'function') {
+        throw new WebAccessError(
+            '这份来源是 PDF，但当前没有可用的抽取通道：装 poppler（pdftotext）或 Python 的 PyMuPDF 后重试，'
+            + '或换一个 HTML 来源。',
+            'OFFICE_WEB_PDF_ENGINE',
+        );
+    }
+    const dir = join(tmpdir(), 'dsh-office-web');
+    const file = join(dir, `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}.pdf`);
+    try {
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(file, bytes);
+        if (requestSignal?.aborted === true) throw new WebAccessError('取正文被取消。', 'OFFICE_WEB_ABORTED');
+        const extracted = await reader.text(file, {
+            maxPages: options.pdfMaxPages,
+            maxBytes: options.pdfMaxBytes,
+            sourceUrl: url,
+        });
+        const text = asText(extracted?.text);
+        if (text === '') {
+            throw new WebAccessError(
+                asText(extracted?.hint) || `PDF 里没有抽到文本（可能是扫描件）：${url}`,
+                'OFFICE_WEB_EMPTY',
+            );
+        }
+        return {
+            text,
+            pages: Number.isFinite(extracted?.pages) ? extracted.pages : 0,
+            extractor: asText(extracted?.extractor),
+            bytes: bytes.byteLength,
+        };
+    } catch (error) {
+        if (error instanceof WebAccessError) throw error;
+        throw new WebAccessError(
+            `PDF 抽文本失败：${messageOf(error)}（缺抽取引擎时：装 poppler 的 pdftotext，或 Python 的 PyMuPDF）`,
+            'OFFICE_WEB_PDF_ENGINE',
+        );
+    } finally {
+        try {
+            rmSync(file, { force: true });
+        } catch {
+            // 清不掉临时文件不影响这次取正文的结果。
+        }
+    }
 }
 
 // ── 内容级成败哨兵（P0-8）──────────────────────────────────────────────────
@@ -569,20 +806,46 @@ export async function httpFetch(input, options, signal, network = defaultNetwork
         }
         const contentType = response.headers.get('content-type');
         const kind = classifyContentType(contentType);
-        if (kind === undefined) {
+        const pdf = kind === undefined && looksLikePdf(contentType, current.toString());
+        if (kind === undefined && !pdf) {
             await response.body?.cancel?.().catch(() => {});
             throw new WebAccessError(`不支持的内容类型：${asText(contentType) || '未知'}`, 'OFFICE_WEB_UNSUPPORTED_TYPE');
         }
-        const { bytes, truncated } = await readCapped(response, options.maxBytes, requestSignal).catch((error) => {
-            if (error instanceof WebAccessError) throw error;
-            // 读流中断：超时、调用方取消与网络断开在这里都会冒出来，按信号归类。
-            const timedOut = signal?.aborted !== true && requestSignal?.aborted === true;
-            throw new WebAccessError(
-                timedOut ? `取正文超过 ${options.fetchTimeoutMs} 毫秒。` : `读取响应体失败：${messageOf(error)}`,
-                timedOut ? 'OFFICE_WEB_TIMEOUT' : 'OFFICE_WEB_NETWORK',
-                { cause: error },
-            );
-        });
+        // PDF 走单独一条路：截断的 PDF 抽不出文本，所以体积上限是**放弃线**而不是截断线。
+        if (pdf) {
+            const { bytes, truncated } = await readBodyCapped(response, options.pdfMaxBytes, requestSignal, signal, options);
+            if (truncated) {
+                const limitMb = Math.round(options.pdfMaxBytes / 1024 / 1024);
+                throw new WebAccessError(
+                    `这份 PDF 超过 ${limitMb} MB 上限（截断的 PDF 抽不出文本）：换一个来源，或先下载到本地再用 office.pdf 读。`,
+                    'OFFICE_WEB_PDF_TOO_BIG',
+                );
+            }
+            const extracted = await pdfToText(bytes, options, requestSignal, network.pdf, current.toString());
+            const clippedPdf = extracted.text.length > options.maxChars;
+            // 短文本只提醒不判失败：PDF 的封面页、单题练习都很正常，但拿它当来源前该看一眼
+            // （与 HTML 那条路的 SHORT_NOTICE_CHARS 同一取向，阈值相同）。
+            const shortPdf = extracted.text.length < SHORT_NOTICE_CHARS
+                ? `；文本很短（${extracted.text.length} 字符），当来源用之前先核对`
+                : '';
+            return {
+                engine: WEB_ENGINE_BUILTIN,
+                url: current.toString(),
+                statusCode: response.status,
+                kind: 'pdf',
+                content: clippedPdf ? extracted.text.slice(0, options.maxChars) : extracted.text,
+                pdf: {
+                    pages: extracted.pages,
+                    chars: extracted.text.length,
+                    bytes: extracted.bytes,
+                    extractor: extracted.extractor,
+                },
+                truncated: clippedPdf,
+                notice: `这份来源是 PDF（${extracted.pages} 页${extracted.extractor === '' ? '' : '，抽取引擎 ' + extracted.extractor}）：`
+                    + `正文由 office.pdf 抽文本，没做网页预处理${shortPdf}。`,
+            };
+        }
+        const { bytes, truncated } = await readBodyCapped(response, options.maxBytes, requestSignal, signal, options);
         const decoded = decodeBytes(bytes, contentType);
         const clipped = decoded.length > options.maxChars;
         const raw = clipped ? decoded.slice(0, options.maxChars) : decoded;
@@ -690,11 +953,20 @@ export function createWebAccess(ctx, rawOptions, hooks = {}) {
     const network = {
         lookup: hooks.lookup ?? defaultNetwork.lookup,
         fetch: hooks.fetch ?? defaultNetwork.fetch,
+        // PDF 抽取（第二十九轮）：单测可以塞一个假的，省掉真的起 pdftotext。
+        pdf: hooks.pdf ?? defaultNetwork.pdf,
     };
     // hooks.web 给单测直接塞一个假接缝；没给才去 ctx 里取（undefined 表示「没有」）。
     const seam = 'web' in hooks ? hooks.web : webSeamOf(ctx);
 
-    /** 这一次调用里已经明确失败的通道：记住原因，不再重复试（`auto` 下很常见）。 */
+    /**
+     * 这一次调用里已经明确失败的通道：记住**原因与错误码**，不再重复试（`auto` 下很常见）。
+     *
+     * 为什么连错误码一起记：只记 message 的话，后续查询命中这条缓存时只能重新包一个
+     * 通用错误 —— 失败分类从「网络出口不可达」退化成「其它」（第三十三轮实测：同一次
+     * 调用里第 1 条查询报 network、第 2 条报 other，而分类正是告诉调用方「该换出口还是
+     * 该换来源」的那句话）。
+     */
     const failed = new Map();
     /** 每条通道解析后的参数（同一通道重复检索不必重算）。 */
     const optionCache = new Map();
@@ -702,6 +974,23 @@ export function createWebAccess(ctx, rawOptions, hooks = {}) {
     function optionsOf(id) {
         if (!optionCache.has(id)) optionCache.set(id, resolveProviderOptions(id, providerSourceOf(options, id)));
         return optionCache.get(id);
+    }
+
+    /** 记下一条通道的失败：原因与错误码一起留，别让后续查询把分类丢了。 */
+    function rememberFailure(id, error) {
+        const entry = {
+            message: messageOf(error),
+            code: typeof error?.code === 'string' && error.code !== '' ? error.code : 'OFFICE_WEB_ERROR',
+        };
+        failed.set(id, entry);
+        return entry;
+    }
+
+    /** 读回一条通道的失败记录（没有就当场建一条，调用点不必再判 undefined）。 */
+    function failureEntryOf(id) {
+        const entry = failed.get(id);
+        if (entry !== undefined) return entry;
+        return { message: '这条通道还没试过。', code: 'OFFICE_WEB_ERROR' };
     }
 
     /** 一次接缝检索。 */
@@ -752,11 +1041,11 @@ export function createWebAccess(ctx, rawOptions, hooks = {}) {
         const list = [];
         for (const id of PROVIDER_IDS) {
             if (failed.has(id)) {
-                list.push({ id, label: providerLabelOf(id), ok: false, reason: failed.get(id) });
+                list.push({ id, label: providerLabelOf(id), ok: false, verified: false, reason: failureEntryOf(id).message });
                 continue;
             }
             const verdict = await probeProvider(id, optionsOf(id), ctx, seam !== undefined);
-            list.push({ id, label: providerLabelOf(id), ok: verdict.ok, reason: verdict.reason });
+            list.push({ id, label: providerLabelOf(id), ok: verdict.ok, verified: verdict.verified === true, reason: verdict.reason });
         }
         return list;
     };
@@ -784,20 +1073,32 @@ export function createWebAccess(ctx, rawOptions, hooks = {}) {
             ok: true,
             engine: first.id === 'seam' ? WEB_ENGINE_SEAM : WEB_ENGINE_BUILTIN,
             provider: first.id,
+            // verified 只对「真的问过运行时」的通道为真（接缝看服务在不在）；免 Key 抓取
+            // 通道只看配置齐不齐 —— 出口通不通要等真发请求才知道，别把它说成「可用」。
+            verified: first.verified === true,
             channels,
-            reason: first.reason + (usable.length > 1 ? `；另有 ${usable.length - 1} 条可用（可在设置页换）` : ''),
+            reason: first.reason + (usable.length > 1 ? `；另有 ${usable.length - 1} 条已配置（可在设置页换）` : ''),
         };
     };
 
-    /** 把所有通道的失败原因压成一句可执行的话。 */
+    /**
+     * 把所有通道的失败原因压成一句可执行的话。
+     *
+     * `18-10` 的后半：P0-9 只做到「配置缺失」单独成类，这一版把**去设置页哪一格**
+     * 算出来 —— 每条 config 类失败的通道各自给一行 `settingsCellOf(id)`，
+     * 而不是让用户/模型在一组七八行里自己找。blocked 类仍是「换来源不重试」。
+     */
     function failureSummary(errors) {
         const parts = errors.map((item) => `${item.label}：${describeWebFailure(item.error)}`);
-        const kinds = [...new Set(errors.map((item) => webFailureKind(item.error)))];
-        const advice = kinds.includes('config')
-            ? '缺 Key 或端点的通道去设置页「办公模式 → 检索编排」配；'
+        const configCells = [...new Set(errors
+            .filter((item) => webFailureKind(item.error) === 'config')
+            .map((item) => settingsCellOf(item.id))
+            .filter((cell) => cell !== ''))];
+        const advice = configCells.length > 0
+            ? '缺 Key 或端点的通道按这里逐格配：' + configCells.join('；') + '。'
             : '';
         return `检索不到结果（${summarizeWebFailures(errors.map((item) => item.error))}）—— ${parts.join('；')}。${advice}`
-            + '也可以直接用一条免 Key 的通道（duckduckgo / searxng），或在设置页把 provider 固定成某一条。';
+            + '也可以直接用一条免 Key 的通道（duckduckgo / searxng），或在设置页「检索编排 → 联网通道」把 provider 固定成某一条。';
     }
 
     return {
@@ -827,7 +1128,8 @@ export function createWebAccess(ctx, rawOptions, hooks = {}) {
             const errors = [];
             for (const id of order) {
                 if (failed.has(id)) {
-                    errors.push({ id, label: providerLabelOf(id), error: new WebAccessError(failed.get(id), 'OFFICE_WEB_ERROR') });
+                    const entry = failureEntryOf(id);
+                    errors.push({ id, label: providerLabelOf(id), error: new WebAccessError(entry.message, entry.code) });
                     continue;
                 }
                 try {
@@ -838,8 +1140,7 @@ export function createWebAccess(ctx, rawOptions, hooks = {}) {
                         : await channelSearch(id, text, request, maxResults);
                     return result;
                 } catch (error) {
-                    const message = messageOf(error);
-                    failed.set(id, message);
+                    rememberFailure(id, error);
                     errors.push({ id, label: providerLabelOf(id), error });
                 }
             }
@@ -847,7 +1148,12 @@ export function createWebAccess(ctx, rawOptions, hooks = {}) {
         },
 
         /**
-         * 取一个 URL 的正文：接缝优先，失败就退到自带实现。
+         * 取一个 URL 的正文：自带抓取优先，失败退到宿主接缝（第三十轮起调换）。
+         *
+         * 为什么抓取优先：办公 preset 已不声明 tool-web，「网页抓取」是办公模式
+         * 取正文的主路 —— 自带实现支持 PDF（office.pdf 抽文本）、有内容级哨兵
+         * 与脚本式预处理，代理设置也直接管到它。宿主接缝（seam.fetch）降为兜底：
+         * 自带抓取失败时再试它（两条路的出口本来就不同），失败原因都写进报错。
          *
          * `request.preprocess` 可以按次覆盖预处理模式（'article' / 'plain' / 'off'），
          * 用来给「这次要原始一点」的调用留出口。
@@ -857,6 +1163,13 @@ export function createWebAccess(ctx, rawOptions, hooks = {}) {
                 ? options.preprocess
                 : resolvePreprocessOptions({ ...options.preprocess, mode: request.preprocess });
             const errors = [];
+            let lastError;
+            try {
+                return await httpFetch(url, { ...options, preprocess: preprocessOptions }, request.signal, network);
+            } catch (error) {
+                lastError = error;
+                errors.push('自带取正文：' + messageOf(error));
+            }
             if (seam !== undefined && !failed.has('seam')) {
                 try {
                     const result = await seam.fetch({ url }, request.signal);
@@ -867,7 +1180,7 @@ export function createWebAccess(ctx, rawOptions, hooks = {}) {
                     const kind = body.kind === 'html' ? 'html' : 'text';
                     const text = kind === 'html' ? htmlToText(content, options.maxChars) : content.slice(0, options.maxChars);
                     // 接缝也可能把拦截页当正文回来（它直接回响应体），所以这里同样过哨兵；
-                    // 判定失败就落进 catch → 换自带实现再试一次（两条路的出口本来就不同）。
+                    // 判定失败就按失败处理 —— 不再把拦截页当正文返回。
                     const verdict = inspectFetchedPage({ statusCode, url: finalUrl, content: text });
                     if (verdict.ok !== true) throw new WebAccessError(verdict.reason, verdict.code);
                     const processed = withPreprocess({ raw: content, content: text, kind, url: finalUrl, options: preprocessOptions });
@@ -883,22 +1196,20 @@ export function createWebAccess(ctx, rawOptions, hooks = {}) {
                         ...(verdict.notice === undefined ? {} : { notice: verdict.notice }),
                     };
                 } catch (error) {
-                    failed.set('seam', messageOf(error));
+                    rememberFailure('seam', error);
+                    lastError = error;
                     errors.push('宿主 web 服务：' + messageOf(error));
                 }
             } else if (failed.has('seam')) {
-                errors.push('宿主 web 服务：' + failed.get('seam'));
+                errors.push('宿主 web 服务：' + failureEntryOf('seam').message);
             }
-            try {
-                return await httpFetch(url, { ...options, preprocess: preprocessOptions }, request.signal, network);
-            } catch (error) {
-                errors.push('自带取正文：' + messageOf(error));
-                throw new WebAccessError(
-                    `取不到正文（${webFailureLabel(error)}）—— ${errors.join('；')}`,
-                    error?.code ?? 'OFFICE_WEB_ERROR',
-                    { cause: error },
-                );
-            }
+            // 沿用最后一次失败自己的错误码：取正文失败的四类（配置缺失 / 网络不可达 /
+            // 目标站拒绝 / 没拿到结果）修法完全不同，包成一句通用错误会丢掉分类（P0-9）。
+            throw new WebAccessError(
+                `取不到正文 —— ${errors.join('；')}`,
+                lastError?.code ?? 'OFFICE_WEB_ERROR',
+                { cause: lastError },
+            );
         },
 
         /** 供反馈与 office_help 用的一句话状态。 */

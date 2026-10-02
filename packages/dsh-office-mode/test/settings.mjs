@@ -88,10 +88,10 @@ if (z === undefined) {
 
 // ── 工具开关（不依赖 schemastery） ────────────────────────────────────────
 
-await check('默认全开：空配置下七个工具都在', () => {
+await check('默认全开：空配置下九个工具都在', () => {
     const tools = buildTools(resolveConfig({}));
     assert.deepEqual(tools.map((t) => t.name), [
-        'office_help', 'office_run', 'office_memory', 'office_search_run', 'office_search_brief', 'office_search_dispatch', 'office_parse_findings',
+        'office_help', 'office_run', 'office_memory', 'office_web_search', 'office_web_fetch', 'office_search_run', 'office_search_brief', 'office_search_dispatch', 'office_parse_findings',
     ]);
 });
 
@@ -111,7 +111,7 @@ await check('全部关掉时工具面为空，但不报错', () => {
 await check('未知的工具键被忽略，不会让配置失效', () => {
     const tools = buildTools(resolveConfig({ tools: { 未来才有的工具: false, office_run: false } }));
     assert.ok(!tools.some((t) => t.name === 'office_run'));
-    assert.equal(tools.length, 6);
+    assert.equal(tools.length, 8);
 });
 
 await check('非布尔值不会把开关误判成关闭', () => {
@@ -184,7 +184,7 @@ await check('记忆参数可调，且在安全区间内收敛', () => {
 await check('关掉记忆后 office_memory 工具不再注册', () => {
     const tools = buildTools(resolveConfig({ tools: { office_memory: false } }));
     assert.ok(!tools.some((t) => t.name === 'office_memory'));
-    assert.equal(tools.length, 6);
+    assert.equal(tools.length, 8);
 });
 
 await check('文档参数沿用既有默认，不被设置层改坏', () => {
@@ -288,11 +288,11 @@ await check('越界数值被 schema 拒绝（设置页调不坏插件）', async
     assert.throws(() => S({ python: { timeoutMs: 10 } }), /timeoutMs/);
 });
 
-await check('子代理工具白名单默认就是极简七项', async () => {
+await check('子代理工具白名单默认就是极简五项', async () => {
     if (z === undefined) return;
     const value = plain(createOfficeSettings(z)({}));
     assert.deepEqual(value.search.subagentTools, [...CHANNEL_TOOLS]);
-    assert.equal(value.search.subagentTools.length, 7);
+    assert.equal(value.search.subagentTools.length, 5);
 });
 
 await check('设置页目录里的工具与实际白名单一一对应', () => {

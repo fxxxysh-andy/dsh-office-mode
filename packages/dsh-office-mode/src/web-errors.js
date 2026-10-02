@@ -61,6 +61,10 @@ const KIND_BY_CODE = Object.freeze({
     OFFICE_WEB_EMPTY: 'empty',
     OFFICE_WEB_NO_RESULTS: 'empty',
     OFFICE_WEB_UNSUPPORTED_TYPE: 'other',
+    // 第二十九轮：来源是 PDF。没引擎 / 抽不出文本属于**两类修法**，所以分成两个码：
+    // 「装 poppler 或 PyMuPDF」是配置问题，「扫描件没有文本层」是换来源。
+    OFFICE_WEB_PDF_ENGINE: 'config',
+    OFFICE_WEB_PDF_TOO_BIG: 'other',
     OFFICE_WEB_INVALID_QUERY: 'other',
     OFFICE_WEB_INVALID_URL: 'other',
     OFFICE_WEB_ABORTED: 'other',

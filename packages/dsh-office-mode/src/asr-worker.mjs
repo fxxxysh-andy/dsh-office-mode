@@ -12,13 +12,18 @@
  *   - **失败也要写结果文件**：父进程据此报出可执行的错，而不是「进程挂了」。
  *   - **VAD 切句**：整段直接喂给模型在长音频上会退化，所以按块跑 Silero VAD，
  *     逐句解码并给出绝对时间戳 —— 逐字稿要能被引用回听点。
+ *   - **块之间有重叠、切点会回退**（第三十一轮）：块不再是完全切开的两段，见
+ *     av.js 的 planChunks / resolveChunkBoundary —— 窗口比自有区间多出
+ *     overlapSeconds，被窗口末尾切断的句子交给下一块从话头重新解，保证一句话
+ *     不会在切点处被切成两半、也不会重复出稿。
  *
  * 跑法（父进程自动完成，手跑用于排查）：
  *   node src/asr-worker.mjs '{"wav":"…","outPath":"…","runtimePath":"…","model":"…","tokens":"…","vad":"…"}'
  */
 import { createRequire } from 'node:module';
 import { writeFileSync } from 'node:fs';
-import { joinTranscript } from './av.js';
+import { wordsOf } from './asr-words.js';
+import { joinTranscript, planChunks, resolveChunkBoundary } from './av.js';
 
 /** 把结果（含失败）写到父进程指定的文件；写完就退出。 */
 function finish(outPath, payload) {
@@ -69,6 +74,12 @@ try {
     }
     const samples = wave.samples;
     const language = typeof config.language === 'string' && config.language !== '' ? config.language : 'auto';
+    const chunkSeconds = Math.max(1, Number(config.chunkSeconds) || 120);
+    const overlapSeconds = Math.max(0, Math.min(Number(config.overlapSeconds) || 0, chunkSeconds / 2));
+    // 单句上限夹到不超过单块秒数：一句话必须能被某个窗口完整装下，边界回退才有
+    // 地方可退。不夹的话（例如单块 10 秒、单句上限 30 秒），一句连续的 30 秒话
+    // 会横跨整块窗口，回退点落在块首 —— 循环原地打转。
+    const maxSegmentSeconds = Math.max(1, Math.min(Number(config.maxSegmentSeconds) || 30, chunkSeconds));
     const recognizer = new sherpa.OfflineRecognizer({
         featConfig: { sampleRate: 16_000, featureDim: 80 },
         modelConfig: {
@@ -85,94 +96,146 @@ try {
             threshold: config.vadThreshold,
             minSilenceDuration: config.minSilenceSeconds,
             minSpeechDuration: config.minSpeechSeconds,
-            maxSpeechDuration: config.maxSegmentSeconds,
+            maxSpeechDuration: maxSegmentSeconds,
             windowSize: 512,
         },
         sampleRate: 16_000,
         numThreads: config.threads,
         provider: 'cpu',
         debug: 0,
-    }, Math.ceil(config.maxSegmentSeconds + config.minSilenceSeconds + 1));
+    }, Math.ceil(maxSegmentSeconds + config.minSilenceSeconds + 1));
     const decode = makeDecoder(recognizer, language);
 
-    const chunkSeconds = Math.max(1, Number(config.chunkSeconds) || 120);
     const samplesPerChunk = Math.round(chunkSeconds * 16_000);
+    const overlapSamples = Math.round(overlapSeconds * 16_000);
     const segments = [];
     const detected = new Set();
     let inferenceSeconds = 0;
     let speechSamples = 0;
     let chunkCount = 0;
+    let rolls = 0;
 
-    /** 抽干 VAD 里已完成的句子：`fed` 是当前已喂进去的样本数（用于算绝对时间）。 */
-    const drain = (fed, base) => {
-        while (!detector.isEmpty()) {
-            const segment = detector.front(false);
-            const length = segment?.samples?.length ?? 0;
-            const endSample = base + fed;
-            const startSample = Math.max(base, endSample - length);
-            if (length > 0) {
-                const started = performance.now();
-                const result = decode(segment.samples);
-                inferenceSeconds += (performance.now() - started) / 1000;
-                speechSamples += length;
-                const text = String(result?.text ?? '').trim();
-                if (text !== '') {
-                    const lang = String(result?.lang ?? '');
-                    if (lang !== '') detected.add(lang.replace(/[<>|]/g, ''));
-                    segments.push({
-                        index: segments.length,
-                        start: Math.round((startSample / 16_000) * 1000) / 1000,
-                        end: Math.round((endSample / 16_000) * 1000) / 1000,
-                        text,
-                        lang: lang || null,
-                        emotion: result?.emotion === undefined ? null : String(result.emotion),
-                        event: result?.event === undefined ? null : String(result.event),
-                        ...(config.words === true ? { words: normalizeWords(result?.words) } : {}),
-                    });
-                }
-            }
-            detector.pop();
-        }
+    const totalSamples = samples.length;
+    const totalSeconds = totalSamples / 16_000;
+    const toSeconds = (sampleCount) => Math.round((sampleCount / 16_000) * 1000) / 1000;
+
+    /**
+     * 解一段样本，返回一条结果（没识别出文字就返回 null）。
+     *
+     * 只解码不登记：登记（出稿 / 计数）由调用方决定 —— 被边界回退交给下一块的
+     * 句子同样要解码，但不能进逐字稿，否则就重复了。
+     */
+    const decodeSlice = (slice, startSample, endSample) => {
+        const started = performance.now();
+        const result = decode(slice);
+        inferenceSeconds += (performance.now() - started) / 1000;
+        const text = String(result?.text ?? '').trim();
+        if (text === '') return null;
+        const lang = String(result?.lang ?? '');
+        if (lang !== '') detected.add(lang.replace(/[<>|]/g, ''));
+        // 词级时间（`words`）要自己算：sherpa-onnx 的 SenseVoice 通道**不返回**
+        // words（1.13.8 实测恒为 `[]`，绑定里也没有开词级时间的参数），
+        // 真正可用的是逐 token 的起始秒（tokens[] + timestamps[]）。算法见 asr-words.js。
+        // 第三个参数是**基址**：timestamps 相对这一段的开头，不加基址就对不回听点。
+        // 算不出来时**不写这个字段**，而不是写一个空数组假装有。
+        const words = config.words === true
+            ? wordsOf(result, (endSample - startSample) / 16_000, toSeconds(startSample))
+            : undefined;
+        return {
+            start: toSeconds(startSample),
+            end: toSeconds(endSample),
+            length: endSample - startSample,
+            text,
+            lang: lang || null,
+            emotion: result?.emotion === undefined ? null : String(result.emotion),
+            event: result?.event === undefined ? null : String(result.event),
+            ...(words === undefined ? {} : { words }),
+        };
     };
 
-    for (let base = 0; base < samples.length; base += samplesPerChunk) {
-        const slice = samples.subarray(base, Math.min(samples.length, base + samplesPerChunk));
+    /** 把一条解码结果收进逐字稿。 */
+    const emit = (item) => {
+        speechSamples += item.length;
+        segments.push({
+            index: segments.length,
+            start: item.start,
+            end: item.end,
+            text: item.text,
+            lang: item.lang,
+            emotion: item.emotion,
+            event: item.event,
+            ...(item.words === undefined ? {} : { words: item.words }),
+        });
+    };
+
+    // 逐块跑，但块起点不再固定按 chunkSeconds 前进：窗口末尾切在句子中间时，
+    // 下一块的起点会回退到那句话的话头（见 resolveChunkBoundary）。
+    // `emittedUntil` 是**已出稿到的时刻**：重叠让相邻两块都看得见同一段音频，
+    // 没有这条水位线，上一块刚解出来的完整句子会在下一块里再报一次。
+    let baseSample = 0;
+    let emittedUntil = 0;
+    while (baseSample < totalSamples) {
+        const base = baseSample / 16_000;
+        const ownedEndSample = Math.min(totalSamples, baseSample + samplesPerChunk);
+        const winEndSample = Math.min(totalSamples, ownedEndSample + overlapSamples);
+        const ownedEnd = ownedEndSample / 16_000;
+        const winEnd = winEndSample / 16_000;
         chunkCount += 1;
+
         detector.reset();
+        const raw = [];
+        // 抽干 VAD 里已完成的句子：`fed` 是当前已喂进去的样本数（用于算绝对时间）。
+        const drain = (fed) => {
+            while (!detector.isEmpty()) {
+                const segment = detector.front(false);
+                const length = segment?.samples?.length ?? 0;
+                const endSample = baseSample + fed;
+                const startSample = Math.max(baseSample, endSample - length);
+                if (length > 0) {
+                    const item = decodeSlice(segment.samples, startSample, endSample);
+                    if (item !== null) raw.push(item);
+                }
+                detector.pop();
+            }
+        };
+
+        const window = samples.subarray(baseSample, winEndSample);
         let fed = 0;
-        for (let offset = 0; offset < slice.length; offset += 512) {
-            const part = slice.subarray(offset, Math.min(slice.length, offset + 512));
+        for (let offset = 0; offset < window.length; offset += 512) {
+            const part = window.subarray(offset, Math.min(window.length, offset + 512));
             detector.acceptWaveform(part);
             fed = offset + part.length;
-            drain(fed, base);
+            drain(fed);
         }
         detector.flush();
-        fed = slice.length;
-        drain(fed, base);
+        fed = window.length;
+        drain(fed);
+
+        const decision = resolveChunkBoundary({ base, ownedEnd, winEnd, total: totalSeconds, raw, emittedUntil });
+        for (const index of decision.keep) {
+            const item = raw[index];
+            emit(item);
+            emittedUntil = Math.max(emittedUntil, item.end);
+        }
+        if (decision.rolledBack) rolls += 1;
+
         // VAD 判断「整块都不是语音」（纯音乐、纯静音、或信号太弱）时一句话都不会出，
-        // 这时退回整块解码 —— 否则一段人是能听清的录音会静默变成空稿。
-        const produced = segments.filter((item) => item.end > base / 16_000 && item.start < (base + slice.length) / 16_000);
-        if (produced.length === 0 && slice.length > 0) {
-            const started = performance.now();
-            const result = decode(slice);
-            inferenceSeconds += (performance.now() - started) / 1000;
-            speechSamples += slice.length;
-            const text = String(result?.text ?? '').trim();
-            if (text !== '') {
-                const lang = String(result?.lang ?? '');
-                if (lang !== '') detected.add(lang.replace(/[<>|]/g, ''));
-                segments.push({
-                    index: segments.length,
-                    start: Math.round((base / 16_000) * 1000) / 1000,
-                    end: Math.round((Math.min(samples.length, base + slice.length) / 16_000) * 1000) / 1000,
-                    text,
-                    lang: lang || null,
-                    emotion: result?.emotion === undefined ? null : String(result.emotion),
-                    event: result?.event === undefined ? null : String(result.event),
-                    ...(config.words === true ? { words: normalizeWords(result?.words) } : {}),
-                });
+        // 这时退回整段解码 —— 否则一段人是能听清的录音会静默变成空稿。
+        // **只解自有区间里还没出过稿的那一段**：重叠区属于下一块，已出稿的前半截
+        // 也不能再解一遍，否则同一段文字会出现两次。
+        const fallbackFrom = Math.max(baseSample, Math.round(emittedUntil * 16_000));
+        if (raw.length === 0 && fallbackFrom < ownedEndSample) {
+            const item = decodeSlice(samples.subarray(fallbackFrom, ownedEndSample), fallbackFrom, ownedEndSample);
+            if (item !== null) {
+                emit(item);
+                emittedUntil = Math.max(emittedUntil, item.end);
             }
         }
+
+        // 回退点换算回样本；resolveChunkBoundary 已保证前进，这里再钉一次 ——
+        // 浮点四舍五入到同一采样点时最坏的情况是原地打转，那是死循环，不能留。
+        const nextSample = Math.round(decision.nextBase * 16_000);
+        baseSample = nextSample > baseSample ? nextSample : baseSample + 1;
     }
 
     // 时间戳补齐成 `mm:ss-mm:ss`，逐字稿与报告都能直接用。
@@ -189,26 +252,14 @@ try {
         speechSeconds: Math.round((speechSamples / 16_000) * 1000) / 1000,
         inferenceSeconds: Math.round(inferenceSeconds * 1000) / 1000,
         chunkSeconds,
+        overlapSeconds,
         chunks: chunkCount,
+        rolls,
         segments,
         text: joinTranscript(segments.map((item) => item.text)),
     });
 } catch (error) {
     finish(config.outPath, { ok: false, error: `${error?.name ?? 'Error'}: ${error?.message ?? String(error)}` });
-}
-
-/** 词级时间戳：上游可能给数组，也可能给 JSON 字符串。 */
-function normalizeWords(raw) {
-    if (Array.isArray(raw)) return raw;
-    if (typeof raw === 'string' && raw.trim() !== '') {
-        try {
-            const parsed = JSON.parse(raw);
-            return Array.isArray(parsed) ? parsed : undefined;
-        } catch {
-            return undefined;
-        }
-    }
-    return undefined;
 }
 
 /** 秒 → `mm:ss` / `h:mm:ss`（与 av.js 的 formatClock 同一口径）。 */

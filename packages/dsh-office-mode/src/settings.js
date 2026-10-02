@@ -43,20 +43,19 @@ import {
 import { AV_LANGUAGES } from './av.js';
 import { DEFAULT_LAYERS, DEFAULT_RECALL_QUALITY, DEFAULT_QUOTA, MEMORY_SCOPES, USER_SCOPES } from './memory.js';
 import { PROVIDER_IDS } from './web-providers.js';
+import { SITE_PRIORITY_LIMITS, SITE_TYPE_IDS, siteCatalog } from './site-catalog.js';
 import { DEFAULT_THEME_ID, THEMES } from './engine/theme.js';
 
 /** 设置命名空间。必须是小写字母开头、只含小写字母/数字/连字符。 */
 export const OFFICE_SETTINGS_NS = 'dsh-office-mode';
 
-/** 七个工具的名字，供开关与提示词共用。 */
-export const TOOL_NAMES = ['office_help', 'office_run', 'office_memory', 'office_search_run', 'office_search_brief', 'office_search_dispatch', 'office_parse_findings'];
+/** 九个工具的名字，供开关与提示词共用。 */
+export const TOOL_NAMES = ['office_help', 'office_run', 'office_memory', 'office_web_search', 'office_web_fetch', 'office_search_run', 'office_search_brief', 'office_search_dispatch', 'office_parse_findings'];
 
 /** 检索子代理可选工具的目录（设置页按这个列表渲染多选）。 */
 export const SUBAGENT_TOOL_CATALOG = [
-    { id: 'web_search', label: '网页搜索 web_search', note: '泛搜与兜底检索，渠道分流的基础' },
-    { id: 'advanced_search', label: '带时间窗检索 advanced_search', note: '热点事件锁定近期事实用' },
-    { id: 'platform_search', label: '平台检索 platform_search', note: '百科 / 仓库 / 问答 / 视频等按平台搜' },
-    { id: 'web_fetch', label: '取回正文 web_fetch', note: '打开具体页面拿原文，不只靠摘要' },
+    { id: 'office_web_search', label: '抓取搜索 office_web_search', note: '插件的免 Key 网页搜索（抓 DuckDuckGo HTML 解析），渠道分流的基础' },
+    { id: 'office_web_fetch', label: '抓取正文 office_web_fetch', note: '打开具体页面拿原文（PDF 由 office.pdf 抽文本），不只靠摘要' },
     { id: 'read', label: '读文本 read', note: '读结果文件与已抓取内容' },
     { id: 'read_image', label: '读图片 read_image', note: '图表 / 截图 / 扫描件；需宿主挂载附件服务' },
     { id: 'write', label: '写文件 write', note: '子代理唯一的交付方式，建议保持开启' },
@@ -73,6 +72,7 @@ export const LIMITS = {
     pythonTimeoutMs: { min: 5_000, max: 900_000, step: 5_000 },
     avThreads: { min: 1, max: 16, step: 1 },
     avChunkSeconds: { min: 10, max: 600, step: 10 },
+    avOverlapSeconds: { min: 0, max: 30, step: 0.5 },
     avMaxSeconds: { min: 10, max: 21_600, step: 10 },
     avTimeoutMs: { min: 5_000, max: 1_800_000, step: 5_000 },
     avMaxFrames: { min: 1, max: 60, step: 1 },
@@ -90,8 +90,14 @@ export const LIMITS = {
     searchBuiltinMaxBytes: { min: 32_768, max: 33_554_432, step: 32_768 },
     searchBuiltinMaxChars: { min: 1_000, max: 400_000, step: 1_000 },
     searchBuiltinMaxRedirects: { min: 0, max: 10, step: 1 },
+    // 第二十九轮：取正文撞上 PDF 时的体积上限（放弃线，不是截断线）。
+    searchBuiltinPdfMaxBytes: { min: 1_048_576, max: 134_217_728, step: 1_048_576 },
     memoryUserBytes: { min: 512, max: 65_536, step: 512 },
     memoryProjectBytes: { min: 1_024, max: 262_144, step: 1_024 },
+    // 投影预算：0 = 不限（第四十八轮 P0-2）
+    memoryProjectionBytes: { min: 0, max: 131_072, step: 1_024 },
+    // 单条上限与建议线：0 = 关掉（第四十八轮 新-11）
+    memoryEntryBytes: { min: 0, max: 131_072, step: 100 },
     memoryLedgerLimit: { min: 10, max: 10_000, step: 10 },
     memoryArchiveKeep: { min: 1, max: 1_000, step: 1 },
     recallLowScore: { min: 0, max: 1, step: 0.05 },
@@ -171,6 +177,12 @@ export function createOfficeSettings(z) {
         office_memory: z.boolean()
             .description('办公记忆：读写热记忆（偏好与约定）、检索台账与归档；office_run 的自动台账也归它管')
             .default(true),
+        office_web_search: z.boolean()
+            .description('查一个事实点（网页抓取通道，免 Key）：给几条查询，抓 DuckDuckGo HTML 解析，来源直接回到对话')
+            .default(true),
+        office_web_fetch: z.boolean()
+            .description('打开一个页面取正文（网页抓取通道）：自带安全抓取，来源是 PDF 时交给 office.pdf 抽文本')
+            .default(true),
         office_search_run: z.boolean()
             .description('直接查一轮（内置检索）：给几条查询，插件自己的联网通道去找来源并落盘。不起子代理、不需要提纲')
             .default(true),
@@ -190,7 +202,7 @@ export function createOfficeSettings(z) {
     // ── 检索编排 ──────────────────────────────────────────────────────────
     search: z.object({
         subagentTools: z.array(z.string())
-            .description('检索子代理能用的工具白名单。默认七个：检索三件套 + 取正文 + 读写。加得越多，子代理越容易跑偏')
+            .description('检索子代理能用的工具白名单。默认五个：抓取搜索 + 抓取正文 + 读写。加得越多，子代理越容易跑偏')
             .default([...CHANNEL_TOOLS]),
         maxParallel: z.number()
             .description('同时铺开几个检索子代理。渠道多时不要一次全开，容易被限流')
@@ -215,15 +227,48 @@ export function createOfficeSettings(z) {
             .default(true),
         engine: z.union(SEARCH_ENGINES.map((id) => z.const(id)))
             .description('检索的执行引擎：auto = 先派子代理、跑不了就用插件内置检索；subagent = 只用子代理；builtin = 只用内置检索。'
-                + '办公 preset 里没有 web_search 这类工具，默认的 auto 会自动走内置检索')
+                + '子代理用插件的抓取工具（office_web_search / office_web_fetch），auto 在派工跑不了时自动走内置检索')
             .default(DEFAULT_SEARCH.engine),
         provider: z.union(['auto', ...PROVIDER_IDS].map((id) => z.const(id)))
             .description('用哪条联网通道。auto = 按下面的顺序依次试（第一条成功的就用它）；'
-                + '固定成某一条时只走那一条 —— 免 Key 的 duckduckgo / searxng 适合没配任何 Key 的机器')
+                + '固定成某一条时只走那一条 —— 默认顺序只含免 Key 的通道，三方检索 API（tavily / bocha / serper …）要显式点名或加回顺序')
             .default(DEFAULT_SEARCH.provider),
         providerOrder: z.array(z.union(PROVIDER_IDS.map((id) => z.const(id))))
-            .description('auto 的尝试顺序。接缝在最前、零配置通道放在最后：没配 Key 的通道会当场失败（不联网发请求），所以长顺序不拖时间')
+            .description('auto 的尝试顺序。默认免 Key 的网页抓取在前（duckduckgo → searxng）、宿主 web 服务兜底；'
+                + '三方检索 API（anthropic / openai / tavily / brave / bocha / exa / serper）不进默认顺序，加回来才会被自动尝试')
             .default([...DEFAULT_SEARCH.providerOrder]),
+        proxy: z.string()
+            .description('出口代理（第二十九轮新增），形如 http://127.0.0.1:7897；留空 = 用本进程原有出口直连。'
+                + '优先只影响本插件（宿主装了 undici 时建私有分派器，改值当场生效）；拿不到 undici 才退回 Node 的 '
+                + 'http.setGlobalProxyFromEnv()，那条是**进程级**且**只能装不能清**（清空后要重启 DSH 才回直连）。'
+                + '本地地址（127.0.0.1 / localhost）两条路都不经代理；只认 http / https 代理')
+            .default(DEFAULT_SEARCH.proxy),
+        sites: z.object({
+            enabled: z.boolean()
+                .description('站点优先检索（第三十四轮新增）：开启后先把查询限定到清单里的站点（site:<域名>），'
+                    + '命中的来源排在前面并按类型汇总；关掉就完全按原来的路子走')
+                .default(DEFAULT_SEARCH.sites.enabled),
+            fallback: z.boolean()
+                .description('限定站点一无所获时退回不限定来源的泛搜，并在反馈里点名哪些站点空手 —— '
+                    + '站点被墙或没收录时不至于把「清单查不到」当成「没有资料」')
+                .default(DEFAULT_SEARCH.sites.fallback),
+            maxPerCall: z.number()
+                .description('单次检索最多把几条查询限定到站点上（限定会多花请求，默认只 4 条）')
+                .min(SITE_PRIORITY_LIMITS.maxPerCall[0]).max(SITE_PRIORITY_LIMITS.maxPerCall[1])
+                .step(1).default(DEFAULT_SEARCH.sites.maxPerCall),
+            entries: z.array(z.object({
+                type: z.union(SITE_TYPE_IDS.map((id) => z.const(id)))
+                    .description('类型：academic 学术 / book 图书 / code 代码 / custom 自定义').default('custom'),
+                domain: z.string().description('域名，不带协议与路径（限定查询拼成 site:<域名>）').default(''),
+                label: z.string().description('显示名（设置页与反馈里用它）').default(''),
+                note: z.string().description('一句话说明').default(''),
+                enabled: z.boolean().description('是否参与优先检索').default(true),
+            }))
+                .description('站点清单本体（第三十四轮新增）。默认值就是内置目录；把行删空 = 这次不限定任何站点。'
+                    + '影子图书馆类（sci-hub / z-lib / Anna\'s Archive）只进目录、默认关闭')
+                .default(siteCatalog()),
+        }).description('站点清单与站点优先检索（第三十四轮新增）')
+            .default({}),
         providers: z.object(Object.fromEntries(PROVIDER_IDS.map((id) => [id, z.object(Object.fromEntries(
             Object.entries(DEFAULT_SEARCH.providers[id] ?? {}).map(([key, value]) => [key, key === 'timeoutMs'
                 ? z.number().description('这条通道单次检索的超时（毫秒）')
@@ -302,8 +347,18 @@ export function createOfficeSettings(z) {
                 .description('取正文最多跟随几次同源跳转（跨站跳转一律不跟）')
                 .min(LIMITS.searchBuiltinMaxRedirects.min).max(LIMITS.searchBuiltinMaxRedirects.max).step(LIMITS.searchBuiltinMaxRedirects.step)
                 .default(DEFAULT_BUILTIN_WEB.maxRedirects),
+            pdfMaxBytes: z.number()
+                .description('取正文撞上 PDF 时的体积上限（字节）。截断的 PDF 抽不出文本，所以超上限是**放弃**而不是截断：'
+                    + '换来源，或先下载到本地再用 office.pdf 读')
+                .min(LIMITS.searchBuiltinPdfMaxBytes.min).max(LIMITS.searchBuiltinPdfMaxBytes.max).step(LIMITS.searchBuiltinPdfMaxBytes.step)
+                .default(DEFAULT_BUILTIN_WEB.pdfMaxBytes),
+            pdfMaxPages: z.number()
+                .description('PDF 抽文本最多抽前几页，用来圈住抽取耗时')
+                .min(LIMITS.pdfMaxPages.min).max(LIMITS.pdfMaxPages.max).step(LIMITS.pdfMaxPages.step)
+                .default(DEFAULT_BUILTIN_WEB.pdfMaxPages),
         })
-            .description('内置检索（office 自己的联网通道）：宿主 web 服务不可用时，用它自己发 HTTP 查资料')
+            .description('内置检索（office 自己的联网通道）：免 Key 抓取通道之外的后备（Anthropic 兼容端点要 Key）。'
+                + '取正文撞上 PDF 时交给 office.pdf 抽文本')
             .default({}),
     })
         .description('检索三步走的编排参数')
@@ -331,12 +386,24 @@ export function createOfficeSettings(z) {
             .description('热记忆里「项目与环境」的容量上限（字节）。同上，超出下沉到归档并在 MEMORY.md 里留一条指路条目')
             .min(LIMITS.memoryProjectBytes.min).max(LIMITS.memoryProjectBytes.max).step(LIMITS.memoryProjectBytes.step)
             .default(DEFAULT_MEMORY.projectLimitBytes),
+        projectionBudgetBytes: z.number()
+            .description('一次投影里热记忆条目正文的字节上限（0 = 不限）。超出预算的条目不丢：折叠行报条数与读取入口。它管的是「一次反馈贴多少」，不是「库里能放多少」')
+            .min(LIMITS.memoryProjectionBytes.min).max(LIMITS.memoryProjectionBytes.max).step(LIMITS.memoryProjectionBytes.step)
+            .default(DEFAULT_MEMORY.projectionBudgetBytes),
+        entryLimitBytes: z.number()
+            .description('单条记忆的字节上限（0 = 不限）。超过就拒绝写入并给出压缩提示：热记忆是每次动笔前照办的清单，不是文档仓库')
+            .min(LIMITS.memoryEntryBytes.min).max(LIMITS.memoryEntryBytes.max).step(LIMITS.memoryEntryBytes.step)
+            .default(DEFAULT_MEMORY.entryLimitBytes),
+        entryHintBytes: z.number()
+            .description('单条记忆的建议字数线（字节，0 = 关掉）。超过只在写入回执里提醒，不拒绝 —— 用来给「写成长段落」一个可见的反馈')
+            .min(LIMITS.memoryEntryBytes.min).max(LIMITS.memoryEntryBytes.max).step(LIMITS.memoryEntryBytes.step)
+            .default(DEFAULT_MEMORY.entryHintBytes),
         ledgerLimit: z.number()
             .description('台账最多保留多少条，超出的最旧记录滚成月度归档摘要')
             .min(LIMITS.memoryLedgerLimit.min).max(LIMITS.memoryLedgerLimit.max).step(LIMITS.memoryLedgerLimit.step)
             .default(DEFAULT_MEMORY.ledgerLimit),
         archiveKeep: z.number()
-            .description('归档最多保留多少个摘要文件。归档也是有界的：超出的最旧摘要会被删掉（它已经是压缩过的老内容）')
+            .description('归档最多保留多少卷摘要（一个月一卷，超 200 条的月份开下一卷）。归档也是有界的：超出的最旧卷会被删掉（它已经是压缩过的老内容）')
             .min(LIMITS.memoryArchiveKeep.min).max(LIMITS.memoryArchiveKeep.max).step(LIMITS.memoryArchiveKeep.step)
             .default(DEFAULT_MEMORY.archiveKeep),
 
@@ -413,6 +480,10 @@ export function createOfficeSettings(z) {
                 .description('同一回合里后续的换词细化次数。用完就拒绝，并说明原因')
                 .min(LIMITS.quotaPerTurn.min).max(LIMITS.quotaPerTurn.max).step(LIMITS.quotaPerTurn.step)
                 .default(DEFAULT_QUOTA.recallRefinePerTurn),
+            kbSearchPerTurn: z.number()
+                .description('一个回合里的知识库（kb）检索次数。kb 检索是词法检索（bigram + BM25），换词重查容易一直查下去，所以与记忆检索分开算')
+                .min(LIMITS.quotaPerTurn.min).max(LIMITS.quotaPerTurn.max).step(LIMITS.quotaPerTurn.step)
+                .default(DEFAULT_QUOTA.kbSearchPerTurn),
             relatedPerTurn: z.number()
                 .description('一个回合里的图关系遍历次数')
                 .min(LIMITS.quotaPerTurn.min).max(LIMITS.quotaPerTurn.max).step(LIMITS.quotaPerTurn.step)
@@ -527,6 +598,11 @@ export function createOfficeSettings(z) {
             .description('单块秒数。模型一次吃的音频越长内存越高，120 秒是官方那条链 131 秒上限留了余量的取值')
             .min(LIMITS.avChunkSeconds.min).max(LIMITS.avChunkSeconds.max).step(LIMITS.avChunkSeconds.step)
             .default(DEFAULT_AV.chunkSeconds),
+        overlapSeconds: z.number()
+            .description('相邻两块的重叠秒数（默认 0.5）。块不再是完全切开的两段：跨在切点上的短音能在同一块里解完；'
+                + '跨得更深的长句由边界回退兜住（不丢字也不重复），所以不必靠调大它来换效果。上限是半块')
+            .min(LIMITS.avOverlapSeconds.min).max(LIMITS.avOverlapSeconds.max).step(LIMITS.avOverlapSeconds.step)
+            .default(DEFAULT_AV.overlapSeconds),
         maxSeconds: z.number()
             .description('单次处理的音频时长上限（秒）。超过就报错并要求先切段 —— 这是内存保护，切块只解决单块大小，不改变这条上限')
             .min(LIMITS.avMaxSeconds.min).max(LIMITS.avMaxSeconds.max).step(LIMITS.avMaxSeconds.step)

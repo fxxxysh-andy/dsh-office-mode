@@ -21,6 +21,11 @@ import {
 } from '../engine/kit.js';
 import { isAbsolute, relative, sep } from 'node:path';
 import { DEFAULT_THEME_ID, resolveTheme, shadeOf, toHex } from '../engine/theme.js';
+import {
+    CHART_CONTENT_TYPE, DRAWING_CONTENT_TYPE as CHART_DRAWING_CONTENT_TYPE,
+    REL_TYPE_CHART as CHART_REL_CHART, REL_TYPE_DRAWING as CHART_REL_DRAWING,
+    chartSpaceXml, describeChartSpace, normalizeChartSpec, spreadsheetDrawingXml,
+} from './chart.js';
 
 // ───────────────────────────────────────────────────────────────────────────
 // 常量：OOXML 里写死的固定部分
@@ -629,6 +634,9 @@ class Sheet {
         };
         this.columnCount = 0;
         this.headerCount = 0;
+        // 这张表上的原生图表（历史遗留 11-6）：每项 { spec, at }，序列化时变成
+        // xl/charts/chartN.xml + xl/drawings/drawingN.xml + 两个 rels。
+        this.charts = [];
     }
 
     rowIndex(index) {
@@ -1321,6 +1329,34 @@ class Sheet {
         return this;
     }
 
+    /**
+     * 在这张表上放一个**原生图表**（历史遗留 `11-6`）。
+     *
+     * 与「Python 画一张图再嵌进来」的区别：这是真正的 DrawingML 图表部件
+     * （`xl/charts/chartN.xml`），在 Excel 里是图表对象 —— 能选中、能改标题、
+     * 能改图表类型。数据以 `c:numLit` / `c:strLit` 内联在图表里（不引用单元格、
+     * 也不嵌工作簿），所以打开即画；要改数据得走 Office 的「编辑数据」。
+     *
+     * @param {{type?: 'bar'|'column'|'line'|'pie'|'area'|'scatter', title?: string,
+     *   categories?: Array<string|number>, series: Array<{name?: string, values: number[], x?: number[]}>,
+     *   legend?: 'bottom'|'right'|'left'|'top'|'none'|false, labels?: boolean, stacked?: boolean,
+     *   gapWidth?: number, colors?: string[],
+     *   at?: {col?: number, row?: number, toCol?: number, toRow?: number}}} spec
+     */
+    chart(spec) {
+        // 立刻校验：图表参数错了要在这一行报出来（带着系列序号与长度差），
+        // 而不是等到 save() 之后才在 warnings 里出现一句「图表没生成」。
+        const normalized = normalizeChartSpec(spec ?? {});
+        const at = (spec ?? {}).at ?? {};
+        const from = { col: Math.max(0, Math.trunc(Number(at.col) || 0)), row: Math.max(0, Math.trunc(Number(at.row) || 0)) };
+        const to = {
+            col: Math.max(from.col + 3, Math.trunc(Number(at.toCol) || (from.col + 8))),
+            row: Math.max(from.row + 6, Math.trunc(Number(at.toRow) || (from.row + 15))),
+        };
+        this.charts.push({ spec: normalized, from, to });
+        return this;
+    }
+
     // ── 排版计算 ──────────────────────────────────────────────────────────
 
     maxRow() {
@@ -1443,6 +1479,9 @@ class Sheet {
         if (this.merges.length > 0) {
             parts.push(`<mergeCells count="${this.merges.length}">${this.merges.map((ref) => `<mergeCell ref="${ref}"/>`).join('')}</mergeCells>`);
         }
+        // 图表锚在这张表上：`<drawing>` 在 CT_Worksheet 的顺序里紧跟 mergeCells 之后，
+        // r:id 指向本表自己的 rels（`xl/worksheets/_rels/sheetN.xml.rels` 里的 rId1）。
+        if (this.charts.length > 0) parts.push('<drawing r:id="rId1"/>');
         parts.push('</worksheet>');
         return parts.join('');
     }
@@ -1629,9 +1668,14 @@ function xfXml(xf) {
     return `<xf ${attrs.join(' ')}/>`;
 }
 
-function contentTypesXml(sheetCount) {
+function contentTypesXml(sheetCount, chartParts = {}) {
     const overrides = ['/xl/workbook.xml', '/xl/styles.xml'];
     for (let i = 1; i <= sheetCount; i += 1) overrides.push(`/xl/worksheets/sheet${i}.xml`);
+    // 图表与绘图部件（历史遗留 11-6）：每个都要有 Override，否则真实 Excel 判「不可读取的内容」。
+    const drawings = Math.max(0, Math.trunc(Number(chartParts.drawings) || 0));
+    const charts = Math.max(0, Math.trunc(Number(chartParts.charts) || 0));
+    for (let i = 1; i <= drawings; i += 1) overrides.push(`/xl/drawings/drawing${i}.xml`);
+    for (let i = 1; i <= charts; i += 1) overrides.push(`/xl/charts/chart${i}.xml`);
     overrides.push('/docProps/core.xml', '/docProps/app.xml', '/docProps/custom.xml');
     const body = overrides.map((part) => {
         const type = part === '/xl/workbook.xml'
@@ -1640,17 +1684,36 @@ function contentTypesXml(sheetCount) {
                 ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml'
                 : part.startsWith('/xl/worksheets/')
                     ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml'
-                    : part.endsWith('custom.xml')
-                        ? 'application/vnd.openxmlformats-officedocument.custom-properties+xml'
-                        : part.endsWith('core.xml')
-                            ? 'application/vnd.openxmlformats-package.core-properties+xml'
-                            : 'application/vnd.openxmlformats-officedocument.extended-properties+xml';
+                    : part.startsWith('/xl/drawings/')
+                        ? CHART_DRAWING_CONTENT_TYPE
+                        : part.startsWith('/xl/charts/')
+                            ? CHART_CONTENT_TYPE
+                            : part.endsWith('custom.xml')
+                                ? 'application/vnd.openxmlformats-officedocument.custom-properties+xml'
+                                : part.endsWith('core.xml')
+                                    ? 'application/vnd.openxmlformats-package.core-properties+xml'
+                                    : 'application/vnd.openxmlformats-officedocument.extended-properties+xml';
         return `<Override PartName="${part}" ContentType="${type}"/>`;
     }).join('');
     return `${XML_HEAD}<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">`
         + '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
         + '<Default Extension="xml" ContentType="application/xml"/>'
         + `${body}</Types>`;
+}
+
+/** 一张工作表自己的 rels（只放绘图）：`xl/worksheets/_rels/sheetN.xml.rels`。 */
+function sheetRelsXml(drawingTarget) {
+    return `${XML_HEAD}<Relationships xmlns="${NS_PKG_REL}">`
+        + `<Relationship Id="rId1" Type="${CHART_REL_DRAWING}" Target="${drawingTarget}"/>`
+        + '</Relationships>';
+}
+
+/** 一张绘图的 rels：`xl/drawings/_rels/drawingN.xml.rels`（每个图表一条关系）。 */
+function drawingRelsXml(chartTargets) {
+    const rels = chartTargets.map((target, index) => (
+        `<Relationship Id="rId${index + 1}" Type="${CHART_REL_CHART}" Target="${target}"/>`
+    )).join('');
+    return `${XML_HEAD}<Relationships xmlns="${NS_PKG_REL}">${rels}</Relationships>`;
 }
 
 function rootRelsXml() {
@@ -1863,16 +1926,48 @@ class Workbook {
     }
 
     buildEntries(stats) {
+        // 图表部件先编号：一张表最多一张 drawing，drawing 里按顺序挂它自己的图表。
+        // 编号从 1 起、全局连续（xl/charts/chart1..N、xl/drawings/drawing1..M），
+        // [Content_Types].xml 的 Override 与 rels 的 Target 都用同一套编号。
+        const sheetCharts = this.sheets.map((sheet) => sheet.charts ?? []);
+        const drawingCount = sheetCharts.filter((list) => list.length > 0).length;
+        const chartCount = sheetCharts.reduce((sum, list) => sum + list.length, 0);
         const entries = [
             // [Content_Types].xml 必须排在包首：某些解析器按顺序判断包类型
-            { name: '[Content_Types].xml', data: contentTypesXml(this.sheets.length) },
+            { name: '[Content_Types].xml', data: contentTypesXml(this.sheets.length, { drawings: drawingCount, charts: chartCount }) },
             { name: '_rels/.rels', data: rootRelsXml() },
             { name: 'xl/workbook.xml', data: workbookXml(this.sheets) },
             { name: 'xl/_rels/workbook.xml.rels', data: workbookRelsXml(this.sheets.length) },
             { name: 'xl/styles.xml', data: buildStylesXml(this.styles) },
         ];
+        let drawingIndex = 0;
+        let chartIndex = 0;
         this.sheets.forEach((sheet, index) => {
             entries.push({ name: `xl/worksheets/sheet${index + 1}.xml`, data: sheet.toXml() });
+            const charts = sheet.charts ?? [];
+            if (charts.length === 0) return;
+            drawingIndex += 1;
+            const chartTargets = [];
+            const frames = [];
+            for (const chart of charts) {
+                chartIndex += 1;
+                entries.push({ name: `xl/charts/chart${chartIndex}.xml`, data: chartSpaceXml(chart.spec) });
+                chartTargets.push(`../charts/chart${chartIndex}.xml`);
+                frames.push({
+                    chartRelId: `rId${frames.length + 1}`,
+                    name: `图表 ${chartIndex}`,
+                    id: frames.length + 2,
+                    from: chart.from,
+                    to: chart.to,
+                });
+            }
+            entries.push({
+                name: `xl/drawings/drawing${drawingIndex}.xml`,
+                // 一张表上有几个图表就有几个锚点（只锚第一个时 Excel 只显示那一个）
+                data: spreadsheetDrawingXml({ frames }),
+            });
+            entries.push({ name: `xl/drawings/_rels/drawing${drawingIndex}.xml.rels`, data: drawingRelsXml(chartTargets) });
+            entries.push({ name: `xl/worksheets/_rels/sheet${index + 1}.xml.rels`, data: sheetRelsXml(`../drawings/drawing${drawingIndex}.xml`) });
         });
         entries.push({ name: 'docProps/core.xml', data: coreXml({ title: this.title, author: this.author }) });
         entries.push({ name: 'docProps/app.xml', data: appXml(this.sheets, this.layoutPayload(stats)) });
@@ -2284,6 +2379,9 @@ function loadPackage(bytes) {
         sheets.push({
             name, part, xml,
             ...(xml ? parseSheet(xml, styleIndex, sharedStrings) : emptySheet()),
+            // 这张表上有没有绘图（图表）：就地编辑时要把 <drawing r:id> 原样带回去，
+            // 否则图表部件还在包里、却没有任何东西引用它 —— 打开看不到图。
+            drawing: drawingRefOf(xml),
             layout: layoutPayload?.sheets?.[index],
         });
     });
@@ -2292,10 +2390,23 @@ function loadPackage(bytes) {
         [...files.keys()].filter((key) => /^xl\/worksheets\/sheet\d+\.xml$/.test(key)).sort()
             .forEach((part, index) => {
                 const xml = readPart(part);
-                sheets.push({ name: `Sheet${index + 1}`, part, xml, ...parseSheet(xml, styleIndex, sharedStrings) });
+                sheets.push({ name: `Sheet${index + 1}`, part, xml, ...parseSheet(xml, styleIndex, sharedStrings), drawing: drawingRefOf(xml) });
             });
     }
     return { files, sheets, styleIndex, sharedStrings, layoutPayload, themeId };
+}
+
+/** 工作表根节点上的 `<drawing r:id>`（没有就 undefined）。 */
+function drawingRefOf(xml) {
+    if (typeof xml !== 'string' || xml === '') return undefined;
+    try {
+        const root = parseXml(xml).children[0];
+        const node = descendants(root, 'drawing')[0];
+        const id = node?.attrs?.['r:id'];
+        return typeof id === 'string' && id !== '' ? id : undefined;
+    } catch {
+        return undefined;
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -2322,6 +2433,8 @@ export const meta = {
             '    funcs: count/counta/sum/average/median/max/min/stdev/var/product',
             '  sheet.summary({key, value, at, funcs, label, total, format})      分组汇总',
             '  sheet.merge(range) / widths({A:12}) / freeze(row, col) / autofilter(range?) / numberFormat(range, fmt)',
+            '  sheet.chart({type, title, categories, series:[{name, values}]})  原生图表',
+            '    type: bar / column（默认）/ line / pie / area / scatter；数据内联在图表部件里',
             '  wb.render() → Uint8Array / wb.save(path?) → report',
         ],
         read: ['read(path, env) → report（perSheet: name/range/rows 前 5 行/formulas）'],
@@ -2351,6 +2464,12 @@ export const meta = {
             '    key/value 可用列字母、1 基列号或表头标题；数据区缺省取最近一次 table()；total: true 补合计行',
             '  sheet.merge(range) / sheet.widths({A:12, B:24}) / sheet.freeze(row, col) / sheet.autofilter(range?)',
             '  sheet.numberFormat(range, "#,##0.00")',
+            '  sheet.chart({type, title, categories, series, legend, labels, stacked, gapWidth, colors, at}) → 原生图表',
+            '    type: bar / column（默认）/ line / pie / area / scatter；series: [{name, values, x?}]（散点图用 x）',
+            '    categories 与每个系列的 values 必须等长（不等长当场报错，不会画一半）',
+            '    legend: bottom（默认）/ right / left / top / none；labels: true 显示数据标签；stacked: true 堆叠',
+            '    at: {col, row, toCol, toRow} 锚在哪块单元格上（默认 A1 起，8 列 × 15 行）',
+            '    数据以 numLit / strLit **内联**在图表部件里：打开即画；改数据要在 Excel 里「编辑数据」',
             '  wb.render() → Uint8Array / wb.save(path?) → report',
         ],
         read: ['read(path, env) → report（perSheet: name/range/rows 前 5 行/formulas）'],
@@ -2498,6 +2617,13 @@ export function read(path, env) {
     }
 
     const theme = loaded.themeId && resolveTheme(loaded.themeId).theme.id === loaded.themeId ? loaded.themeId : DEFAULT_THEME_ID;
+    // 原生图表（历史遗留 11-6）：读的时候要把它们认出来 —— 以前图表部件在包里，
+    // 但 read 只看 worksheet / styles / strings，报告里一个字都没有，模型会以为没图表。
+    const chartParts = [...loaded.files.keys()].filter((name) => /^xl\/charts\/chart\d+\.xml$/.test(name)).sort();
+    const charts = chartParts.map((name) => {
+        const text = loaded.files.get(name) ? new TextDecoder('utf-8').decode(loaded.files.get(name)) : '';
+        return { part: name, ...describeChartSpace(text) };
+    });
     const outline = perSheet.map((sheet) => {
         const layout = sheet.layout ?? {};
         const bits = [];
@@ -2513,6 +2639,9 @@ export function read(path, env) {
         if (sheet.cells === 0) bits.push('空表');
         return `【${sheet.name}】${sheet.range} ${sheet.rows} 行 × ${sheet.columns} 列${bits.length ? '：' + bits.join('，') : ''}`;
     });
+    for (const chart of charts) {
+        outline.push(`【图表】${chart.part}：${chart.type}${chart.title === '' ? '' : `「${chart.title}」`}，${chart.series} 个系列`);
+    }
 
     const unique = [...new Set(warnings)];
     for (const message of unique) context.warn(message);
@@ -2530,6 +2659,7 @@ export function read(path, env) {
             formulas: totalFormulas,
             merges: perSheet.reduce((sum, sheet) => sum + sheet.merges, 0),
             bytes: bytes.length,
+            charts: charts.length,
             statsBlocks: perSheet.reduce((n, sheet) => n + (sheet.layout?.statsBlocks?.length ?? 0), 0),
             summaryBlocks: perSheet.reduce((n, sheet) => n + (sheet.layout?.summaryBlocks?.length ?? 0), 0),
             perSheet: perSheet.map((sheet) => ({
@@ -2540,6 +2670,7 @@ export function read(path, env) {
         perSheet,
         outline,
         warnings: unique,
+        ...(charts.length > 0 ? { charts } : {}),
     };
 }
 
@@ -2740,8 +2871,13 @@ export function edit(path, ops, env) {
         if (name === 'docProps/custom.xml') continue;
         carried.push({ name, data });
     }
+    // 图表与绘图部件原样搬运（上面的循环没跳过它们），所以重新生成的 [Content_Types].xml
+    // 必须照样声明它们 —— 少一条 Override，真实 Excel 会判「发现不可读取的内容」。
+    const carriedNames = [...loaded.files.keys()];
+    const chartPartCount = carriedNames.filter((name) => /^xl\/charts\/chart\d+\.xml$/.test(name)).length;
+    const drawingPartCount = carriedNames.filter((name) => /^xl\/drawings\/drawing\d+\.xml$/.test(name)).length;
     const outBytes = zip([
-        { name: '[Content_Types].xml', data: contentTypesXml(loaded.sheets.length) },
+        { name: '[Content_Types].xml', data: contentTypesXml(loaded.sheets.length, { drawings: drawingPartCount, charts: chartPartCount }) },
         ...carried,
         { name: 'xl/workbook.xml', data: workbookXml(loaded.sheets) },
         { name: 'xl/_rels/workbook.xml.rels', data: workbookRelsXml(loaded.sheets.length) },
@@ -2751,6 +2887,11 @@ export function edit(path, ops, env) {
     ]);
     const written = context.writeFile(path, outBytes);
     const report = read(reportPath(context, path), context);
+    const chartNotes = [];
+    if (chartPartCount > 0) {
+        chartNotes.push(`工作簿里有 ${chartPartCount} 个原生图表：就地编辑原样保留它们（部件与锚点都不动），`
+            + '但不会重算图表里的数据 —— 改了数据区之后要在 Excel 里「编辑数据」或重新生成图表。');
+    }
     return {
         ok: true,
         format: 'xlsx',
@@ -2762,7 +2903,7 @@ export function edit(path, ops, env) {
         changes,
         stats: report.stats,
         outline: report.outline,
-        warnings: report.warnings,
+        warnings: [...report.warnings, ...chartNotes],
     };
 }
 
@@ -2807,6 +2948,8 @@ function serializeEditedSheet(sheet) {
     if (sheet.merges.length > 0) {
         parts.push(`<mergeCells count="${sheet.merges.length}">${sheet.merges.map((ref) => `<mergeCell ref="${ref}"/>`).join('')}</mergeCells>`);
     }
+    // 原表锚过绘图（图表）就把引用带回去：部件本来就原样搬运，少了这一行图表就不显示。
+    if (typeof sheet.drawing === 'string' && sheet.drawing !== '') parts.push(`<drawing r:id="${sheet.drawing}"/>`);
     parts.push('</worksheet>');
     return parts.join('');
 }

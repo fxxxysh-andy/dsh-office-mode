@@ -129,6 +129,32 @@ export function providerOf(id) {
 }
 
 /**
+ * 「这条通道缺的配置去设置页哪一格」（第十八轮 P0-9 的后半 / `18-10`）。
+ *
+ * P0-9 做到了把「配置缺失」单独报一类，但只说到「去设置页「办公模式 → 检索编排」配」
+ * —— 那一组里有七八行，模型据此只能让用户自己找。这里把**格子名**给全，与浏览器
+ * 半侧 `lib/client.js` 的界面文案逐字对齐（改界面文案时这里要一起改）：
+ *
+ *   · 要 Key 的通道 → 「填哪条通道的参数」（选这条）→ 通道 Key / 高级参数 → Key 环境变量名
+ *   · 要实例地址的通道 → 同一行的「高级参数 → 端点」
+ *   · 免 Key 通道 → 只可能缺出口，指向「出口代理」
+ *
+ * @param {string} id 通道 id
+ * @returns {string} 可直接写进反馈的指路句；不认识的 id 返回空串
+ */
+export function settingsCellOf(id) {
+    const meta = PROVIDERS[id];
+    if (meta === undefined) return '';
+    const where = '设置页「办公模式 → 检索编排 → 填哪条通道的参数」（选「' + meta.label + '」）';
+    if (meta.needsBase === true) return where + '→ 高级参数 → 端点';
+    if (meta.needsKey === true) {
+        return where + '→ 通道 Key（或同一行的「高级参数 → Key 环境变量名」，默认 '
+            + (meta.keyEnv || '（未指定）') + '）';
+    }
+    return '设置页「办公模式 → 检索编排 → 出口代理」';
+}
+
+/**
  * 解析「一次检索该用哪些通道」。
  *
  *   provider 给具体 id（含 'seam'）→ 只用那一条；
@@ -574,12 +600,15 @@ export async function searchProvider(id, request) {
     };
 
     if (meta.needsBase === true && base === '') {
-        throw new WebAccessError(`「${meta.label}」需要实例地址（baseURL），现在没配。`, 'OFFICE_WEB_NO_BASE');
+        throw new WebAccessError(
+            `「${meta.label}」需要实例地址（baseURL），现在没配 —— ${settingsCellOf(meta.id)}`,
+            'OFFICE_WEB_NO_BASE',
+        );
     }
     if (meta.needsKey === true && asText(request.apiKey) === '') {
         throw new WebAccessError(
             `「${meta.label}」需要一个 API Key：没有 ${options.apiKeyEnv || '（未指定环境变量名）'}`
-            + '（凭据服务、环境变量、$DSH_HOME/.credentials.yaml 都没有）。',
+            + '（凭据服务、环境变量、$DSH_HOME/.credentials.yaml 都没有）—— ' + settingsCellOf(meta.id),
             'OFFICE_WEB_NO_KEY',
         );
     }
@@ -737,29 +766,40 @@ export async function searchProvider(id, request) {
 }
 
 /**
- * 一条通道现在能不能用（不联网）。
+ * 一条通道现在能不能用（**不联网**，只判配置齐不齐）。
  *
  * `seam` 自己由 web.js 判（它要先问 ctx.web 在不在），这里只处理需要
  * Key / 端点的通路：缺什么就照实说缺什么 —— 设置页要靠这句话告诉用户
  * 「还差哪一步」。
+ *
+ * 第三十三轮起措辞分两档：**只有真的问过运行时的那条（seam）才说「可用」**，
+ * 免 Key 抓取通道（duckduckgo / searxng）与配好 Key 的通道一律说「已配置
+ * （未联网确认）」并带 `verified: false` —— 它们能不能连通要等真发请求才知道，
+ * 说成「可用」会让调用方在通道全灭时以为「搜了但没资料」（第三十三轮的根因之一）。
  */
 export async function probeProvider(id, options, ctx, seamAvailable = false) {
     const meta = PROVIDERS[id];
-    if (meta === undefined) return { id, ok: false, reason: `不认识的检索通道「${id}」` };
+    if (meta === undefined) return { id, ok: false, verified: false, reason: `不认识的检索通道「${id}」` };
     if (meta.family === 'seam') {
         return seamAvailable
-            ? { id, ok: true, reason: '宿主 web 服务可用' }
-            : { id, ok: false, reason: '组合里没有 web 服务（ctx.web）' };
+            ? { id, ok: true, verified: true, reason: '宿主 web 服务可用' }
+            : { id, ok: false, verified: false, reason: '组合里没有 web 服务（ctx.web）' };
     }
     if (meta.needsBase === true && asText(options?.baseURL) === '') {
-        return { id, ok: false, reason: `「${meta.label}」还没填实例地址（baseURL）` };
+        return {
+            id, ok: false, verified: false,
+            reason: `「${meta.label}」还没填实例地址（baseURL）—— ${settingsCellOf(id)}`,
+        };
     }
     if (meta.needsKey === true) {
         const apiKey = await resolveApiKey(ctx, options);
         if (apiKey === '') {
-            return { id, ok: false, reason: `「${meta.label}」没配 ${options?.apiKeyEnv || 'API Key'}` };
+            return {
+                id, ok: false, verified: false,
+                reason: `「${meta.label}」没配 ${options?.apiKeyEnv || 'API Key'} —— ${settingsCellOf(id)}`,
+            };
         }
     }
-    const where = meta.family === 'seam' ? '' : (asText(options?.baseURL) === '' ? '' : ` @ ${options.baseURL}`);
-    return { id, ok: true, reason: `「${meta.label}」可用${where}` };
+    const where = asText(options?.baseURL) === '' ? '' : ` @ ${options.baseURL}`;
+    return { id, ok: true, verified: false, reason: `「${meta.label}」已配置${where}（未联网确认）` };
 }

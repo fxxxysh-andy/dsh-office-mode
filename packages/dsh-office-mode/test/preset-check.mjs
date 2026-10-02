@@ -15,6 +15,75 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { dshPackageDir, resolveShippedBundle } from './host-modules.mjs';
+import {
+    bytes,
+    personaBranchQuotes,
+    personaSections,
+    personaToolBullets,
+    personaToolSection,
+    personaVariables,
+    renderPersona,
+} from './persona-shape.mjs';
+import { CAPABILITY_MAP_BUDGET_BYTES, CAPABILITY_VARIABLE, renderCapabilityMap } from '../src/capabilities.js';
+import { NO_SUBAGENTS_HINT } from '../src/search.js';
+import { WEB_FAILURE_KINDS } from '../src/web.js';
+
+/**
+ * persona 的字节预算（第十八轮 P2-5 / `18-21` 的减法审计守门）。
+ *
+ * 第四十三轮审计前是 **17,262 B**（200+ 行），审到 **15,934 B**。预算取实测 + 余量，
+ * 与工具面预算同一条纪律：**新增能力不靠加宽预算落地** —— 想加一句先删一句，
+ * 或者显式调高并写清理由。
+ *
+ * 第四十七轮补了一条同口径的断言：**渲染后**的 persona（把 `{{office_capabilities}}`
+ * 换成最坏情况的能力地图）也在这个预算内 —— 只看 preset 文件里的字节会漏掉注入文本，
+ * 而注入文本同样进每一次请求。
+ */
+const PERSONA_BUDGET_BYTES = 16300;
+
+/**
+ * persona 的分节清单（每一节都要能回答「删掉它会重现哪个失败模式」）。
+ *
+ * 这张表是**有意识决定的登记**：新增一节必须同时改这里，等于逼一次「它守的是
+ * 哪个实测失败模式」的自问 —— 第三十九轮那句「只并进、没删过一句」不会再无声发生。
+ */
+const PERSONA_SECTIONS = [
+    '说话',
+    '做事',
+    '探能力只探一次',
+    '失败与收尾',
+    '失败分支',
+    '读 PDF',
+    '做文档',
+    '算与画',
+    '音频与视频',
+    '内容',
+    '检索',
+    '演示文稿要多走一步',
+    '记忆',
+    '协作',
+    '工具',
+];
+
+/** 「工具」一节的字节上界：一句路由 + 一个变量引用（实测 453 B，留一点余量）。 */
+const TOOL_MAP_SECTION_BUDGET_BYTES = 620;
+
+/**
+ * 最坏情况的能力地图：每类引擎都满、且派工走长的那一支（没有 subagents）。
+ *
+ * 渲染后的 persona 是**每一次请求**都要重发的那一份，所以预算要按最坏情况钉，
+ * 而不是按「本机这台恰好探到什么」钉。三处都是实测出来的最长分支：
+ *   - 音视频故意**只给一部分**（缺 VAD）：「部分缺件」那句比「三样齐」那句长；
+ *   - 解释器给一个**超长**文件名（地图里会被截到 16 字符，否则最坏情况没有上界）；
+ *   - 派工走「没有 subagents」那一支（那句话更长）。
+ */
+const WORST_CAPABILITY_MAP = renderCapabilityMap({
+    pdf: { render: ['pdftoppm', 'pdftocairo', 'mutool', 'gs'], text: ['pdftotext'] },
+    tex: ['latexmk', 'xelatex', 'lualatex'],
+    preview: true,
+    python: 'C:/somewhere/aaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe',
+    av: { enabled: true, available: false, ffmpeg: true, ffprobe: true, model: true, vad: false, runtime: true },
+}, { subagents: false });
 
 const here = dirname(fileURLToPath(import.meta.url));
 // 默认检查仓库里的 preset bundle；用 --dir 可以检查别处的副本。
@@ -283,13 +352,27 @@ if (existsSync(compositionPath)) {
                         personaPrefix.includes('office.av') && personaPrefix.includes('SenseVoice'),
                         'office.av 的用法（check / transcribe / frames / extract）与缺件报错要写进 persona',
                     );
-                    // 办公 preset 是一份完整的组合，里面没有 web_search 这类工具：
-                    // persona 必须写清「查资料走插件自带的联网通道」，否则模型会以为
-                    // 环境不支持检索而放弃（2026-09-25 的真实会话就是这样停住的）。
+                    // 办公 preset 的检索口子（第三十轮）：资料搜索只走插件自己的抓取通道，
+                    // persona 必须写清两个抓取工具的适用场合（查一个事实点 / 打开一个页面）
+                    // 与「渠道覆盖与落盘」的三步走，否则模型会在两套路子之间反复试探。
                     record(
-                        'persona 里写了内置检索（没有 web_search 也能查）',
+                        'persona 里写了内置检索（渠道覆盖与落盘）',
                         personaPrefix.includes('office_search_run') && personaPrefix.includes('内置检索'),
-                        '办公 preset 里没有 web_search：要写清 office_search_run 与派工的内置回退',
+                        '要写清 office_search_run 与派工的内置回退',
+                    );
+                    record(
+                        'persona 里写了两个抓取工具（office_web_search / office_web_fetch）',
+                        personaPrefix.includes('office_web_search') && personaPrefix.includes('office_web_fetch'),
+                        'preset 不声明 tool-web：persona 要说清这两个插件工具的适用场合',
+                    );
+                    // 宿主的 tool-web 行必须**不在** preset 的 plugins 列表里（第三十轮收掉）：
+                    // 声明了它，宿主的 web_search / web_fetch 就会回到办公会话 —— 那正是
+                    // 用户点名不要的「走宿主的路」。
+                    const toolWeb = rows.find((row) => row?.id === 'tool-web');
+                    record(
+                        'preset 不声明宿主的 tool-web（检索只走插件的抓取通道）',
+                        toolWeb === undefined,
+                        'plugins 列表里不该再有 - id: tool-web / name: @deepseek-ai/dsh-tool-web',
                     );
                     // 通道真不可用时必须照实说，不能假装查过 —— 这是检索这件事的诚实底线。
                     record(
@@ -306,8 +389,178 @@ if (existsSync(compositionPath)) {
                         personaPrefix.includes('不一致时两种都写出来') && personaPrefix.includes('不要替用户选一种'),
                         '两个来源说法冲突时要并列写出，不要替用户选一种：这条要在唯一系统提示里，不能只在提纲里',
                     );
+                    // ── 第十八轮 P0-2～P0-6（第三十八轮补进 persona）──────────────────
+                    //
+                    // 这五条各有一次实测反证，逐条钉住。放在 persona 里的理由都一样：
+                    // 唯一的系统提示是唯一「每次请求都在」的位置，写进 office_help 只有查过的人看得到。
+                    //
+                    // P0-2：读 PDF 那一节的例子原先只有 dpi，本身就会撞上 20 页上限
+                    // （V5；session4 因此造出 pages:[…] 这种不存在的写法）。
+                    record(
+                        'persona 的读 PDF 一节写了 from/to 与单次页数上限（P0-2）',
+                        personaPrefix.includes('一次最多 20 页')
+                        && personaPrefix.includes('from / to')
+                        && personaPrefix.includes('from: 1, to: 20'),
+                        'PDF 读取要写明「先 info 拿页数，再按 20 页一批传 from/to」，否则长文档一次渲染就被上限拒绝',
+                    );
+                    // P0-3：session1 里同一步连做 5 次探测调用（thinking 里自己引了「不要试探」又违例）。
+                    record(
+                        'persona 里写了「探能力只探一次、优先 office_help」（P0-3）',
+                        personaPrefix.includes('只允许一次')
+                        && personaPrefix.includes('office_help({ topic })'),
+                        '把「自由权衡」改成有上限的规则：一次探测不够就交付，不要连着换工具试',
+                    );
+                    // P0-4：V9 —— 一次工具失败被写成 [critical] 的「环境事实」，污染了后续会话。
+                    record(
+                        'persona 里写了「一次失败 ≠ 能力不存在，环境级结论要两轮复现」（P0-4）',
+                        personaPrefix.includes('两轮复现')
+                        && personaPrefix.includes('环境级结论'),
+                        '记忆污染比一次失败贵得多：环境级结论必须两轮复现才成立',
+                    );
+                    // P0-5：session3 三十次调用 0 交付、两次被用户打断。
+                    record(
+                        'persona 里写了「做不到就当场交付结论与缺口」（P0-5）',
+                        personaPrefix.includes('做不到就当场用一段话交付')
+                        && personaPrefix.includes('为什么缺'),
+                        '失败时先说结论与缺口，不要为了把工具跑通继续试',
+                    );
+                    // P0-6：V10 —— 11 条折行警告改到剩 1 条（差一个字）还再跑一轮，且收尾没提它。
+                    record(
+                        'persona 里写了「收尾必须列未消解警告」（P0-6）',
+                        personaPrefix.includes('未消解的警告')
+                        && personaPrefix.includes('已达标'),
+                        '收尾不列未消解警告 = 静默带过；达标时给一句正面回执，省掉为 1 个字再跑的一轮',
+                    );
+                    // 3-1：第三轮定下的「版式与内容量匹配」在 persona 里长期只有近似表述
+                    // （「要点超过 7 条」「卡片正文只有一行却占了半页」），没有可照办的
+                    // 行数与条数阈值。这一条把三处判据钉住 —— 判据写不清，模型就只能凭感觉
+                    // 排页，「一句话拆四页」与「半页一句话」两种极端都会回来。
+                    record(
+                        'persona 里写了版式与内容量匹配的判据（3-1）',
+                        personaPrefix.includes('卡片正文不足两行')
+                        && personaPrefix.includes('要点超过 6 条')
+                        && personaPrefix.includes('少于 3 条'),
+                        '判据要写成行数与条数：卡片正文不足两行改要点页、要点 >6 拆页、<3 并页或补足',
+                    );
+                    // 18-17：P1-8 —— session4 里同一步对同一份 main.tex 连发了可合并的
+                    // 多次 edit。规则要写成「合并成一次调用」并点名 ops 数组（word / excel
+                    // 的 edit 与 office.files.edit 都吃它），否则模型只会看到「一次做完」这种
+                    // 泛泛表述，仍旧一步十次小改。
+                    record(
+                        'persona 里写了「同一步多处修改合并成一次调用」（18-17）',
+                        personaPrefix.includes('合并成一次调用') && personaPrefix.includes('ops 数组'),
+                        '要点名 ops 数组：不写它，模型不知道 edit 能一次吃多条改动（`office.ppt.revise` 里的 ops 不算）',
+                    );
+                    // 18-15 / 18-22：persona 的**分支条件**必须与插件真实文案对齐。
+                    //
+                    // V8 的根因就是「persona 的分支条件写了一串从未出现过的错误文本」：
+                    // 旧版写「如果它报『当前组合里没有 subagents 服务』…」，而当时真实
+                    // 报错是 `tools.restrict() names unknown global tools …`，模型照旧规则
+                    // 去派了子代理。这一条把「失败分支」一节里每行第一个「」的词逐个与
+                    // 插件常量做**机器核对**（两向：persona 不许编词；四类失败一类不许漏）。
+                    const branchQuotes = personaBranchQuotes(personaPrefix);
+                    const branchSources = [
+                        ...Object.values(WEB_FAILURE_KINDS),
+                        NO_SUBAGENTS_HINT,
+                    ];
+                    const invented = branchQuotes.filter(
+                        (quoted) => !branchSources.some((source) => source.includes(quoted)),
+                    );
+                    record(
+                        `persona 的失败分支词都能在插件文案里找到（核对 ${branchQuotes.length} 个）`,
+                        branchQuotes.length > 0 && invented.length === 0,
+                        invented.length === 0
+                            ? ''
+                            : `这些词插件从来不会报出来（V8 同类）：${invented.join('、')}`,
+                    );
+                    const missingKinds = ['配置缺失', '网络出口不可达', '目标站拒绝', '没拿到结果']
+                        .filter((kind) => !branchQuotes.includes(kind));
+                    record(
+                        'persona 的失败分支覆盖了四类失败（18-15）',
+                        missingKinds.length === 0,
+                        missingKinds.length === 0 ? '' : `漏了：${missingKinds.join('、')}`,
+                    );
+                    // 18-21：IFScale 思路的减法审计要有**守门**，否则下一轮又会「只并进、
+                    // 没删过一句」（第三十九轮自述 persona 增重 2.5 KB 就是这么来的）。
+                    // 两条：① 总字节预算；② 分节清单 —— 每一节都是「删掉它会重现哪个失败
+                    // 模式」的答案，新增一节必须同时改这张清单（=一次有意识的决定）。
+                    record(
+                        `persona 总字节在预算内（${bytes(personaPrefix)} / ${PERSONA_BUDGET_BYTES}）`,
+                        bytes(personaPrefix) <= PERSONA_BUDGET_BYTES,
+                        '减法审计的守门：要加一句就得先删一句（或显式调高预算并写清理由）',
+                    );
+                    const sections = personaSections(personaPrefix);
+                    const missingSections = PERSONA_SECTIONS.filter((title) => !sections.includes(title));
+                    const extraSections = sections.filter((title) => !PERSONA_SECTIONS.includes(title));
+                    record(
+                        `persona 的分节与清单一致（${sections.length} 节）`,
+                        missingSections.length === 0 && extraSections.length === 0,
+                        missingSections.length === 0 && extraSections.length === 0
+                            ? ''
+                            : `缺：${missingSections.join('、') || '无'}；多：${extraSections.join('、') || '无'}`,
+                    );
+
+                    // ── 18-20 / 23-2：能力地图一句话 + 实际能力由插件注入 ──────────────
+                    //
+                    // 第十八轮 P2-4：persona 里放一句「哪件事找谁」，不列工具的完整参数；
+                    // 第二十三轮 23-2：写死的能力清单会与运行期错配，改成插件注入实际能力。
+                    // 两件事落在同一节里，所以守门也放在一起：
+                    //   ① 那一节是一句路由（只许一条 `- `），字节有上界；
+                    //   ② 引用的变量必须由插件注册（两边改名会同时被这条抓住）；
+                    //   ③ 渲染后的 persona（最坏能力地图）仍在 persona 预算内 —— 这是
+                    //      「先减后加」真正要守的量，光看 preset 文件里的字节会漏掉注入文本。
+                    const toolSection = personaToolSection(personaPrefix);
+                    record(
+                        `persona 的「工具」一节只留一句能力地图（${bytes(toolSection)} / ${TOOL_MAP_SECTION_BUDGET_BYTES} B，${personaToolBullets(toolSection)} 条）`,
+                        toolSection !== undefined
+                        && bytes(toolSection) <= TOOL_MAP_SECTION_BUDGET_BYTES
+                        && personaToolBullets(toolSection) === 1,
+                        'P2-4：把「哪件事找谁」压成一句；工具的参数与清单由工具面和插件注入承担',
+                    );
+                    const personaVars = personaVariables(personaPrefix);
+                    const knownVars = ['cwd', CAPABILITY_VARIABLE];
+                    const unknownVars = personaVars.filter((name) => !knownVars.includes(name));
+                    record(
+                        `persona 引用的变量都是宿主或插件注册过的（${personaVars.join(' / ')}）`,
+                        unknownVars.length === 0,
+                        unknownVars.length === 0
+                            ? ''
+                            : `这些变量没人注册，装配时会抛 unknown prompt variable：${unknownVars.join('、')}`,
+                    );
+                    record(
+                        `persona 引用了插件的能力地图变量 {{${CAPABILITY_VARIABLE}}}（23-2）`,
+                        personaVars.includes(CAPABILITY_VARIABLE),
+                        'persona 是 complete 段：插件注册的 section 进不来，实际能力只能走 {{变量}} 注入',
+                    );
+                    record(
+                        `能力地图在最坏情况下不超预算（${bytes(WORST_CAPABILITY_MAP)} / ${CAPABILITY_MAP_BUDGET_BYTES}）`,
+                        bytes(WORST_CAPABILITY_MAP) <= CAPABILITY_MAP_BUDGET_BYTES,
+                        '地图跟着 persona 进每一次请求：引擎清单封顶，超出就要先减再改预算',
+                    );
+                    const renderedPersona = renderPersona(personaPrefix, WORST_CAPABILITY_MAP);
+                    record(
+                        `渲染后的 persona 在预算内（${bytes(renderedPersona)} / ${PERSONA_BUDGET_BYTES}）`,
+                        bytes(renderedPersona) <= PERSONA_BUDGET_BYTES,
+                        '注入文本也算常驻成本：按最坏能力地图钉，别只看 preset 文件里的字节',
+                    );
                 }
                 record('没有误关 present', !rows.some((row) => row?.id === 'present' && row?.disabled === true), '');
+
+                // 办公插件那一行必须是**启用的**（第四十七轮复核 F13）：preset 的 persona 引用
+                // 了插件注册的 `{{office_capabilities}}`，插件停用而 preset 还装着的话，
+                // 办公会话**每一轮**都会在 preStep 抛 unknown prompt variable ——
+                // 停用插件不是「少几个工具」，是整个模式起不来。
+                const pluginRows = collectProfileRows().filter((row) => row.id === 'dsh-office-mode');
+                if (pluginRows.length === 0) {
+                    console.log('注意：profile 里找不到 dsh-office-mode 行（插件未装？），跳过启用态核对。');
+                } else {
+                    const enabledPlugin = pluginRows.some((row) => !row.disabled && row.bundleEnabled !== false);
+                    record(
+                        `办公插件在 profile 里是启用的（找到 ${pluginRows.length} 行）`,
+                        enabledPlugin,
+                        'persona 引用了插件注册的 {{office_capabilities}}：插件停用而 preset 还在，办公会话每轮装配都会失败',
+                    );
+                }
 
                 const rowIds = collectProfileRowIds();
                 if (rowIds.size === 0) {
@@ -328,14 +581,16 @@ if (existsSync(compositionPath)) {
                 //   1) 整套 mnemon 组件挂在一个 group 行 mnemon-bundle 下，
                 //      只关组行时组内每个组件行仍会被 loader 逐条解析；
                 //   2) 组内组件又各自是独立的行 id，漏一个就漏一片。
-                // 所以这里核对「profile 里真实存在的 mnemon 行」是否都被关掉了。
+                // 第三十轮起 preset **不再写** mnemon 的禁用行（bundle 已在 profile 停用，
+                // 平时拦一个没挂载的东西是死配置）；这套核对因此变成「守门」：只要
+                // bundle 保持停用，办公会话里就不会出现 mnemon；谁把 bundle 重新启用
+                // 而没有在 preset 里补禁用行，这里会当场红。
                 const mnemonRows = collectProfileRows().filter((row) => row.id.startsWith('mnemon'));
                 if (mnemonRows.length === 0) {
                     console.log('注意：profile 里找不到 mnemon 行（bundle 已卸载？），跳过 mnemon 核对。');
                 } else {
-                    // 2026-09-23 起整个 dsh-mnemon bundle 已在 profile 里停用（不再出现在
-                    // dsh.profile.bundles 里），所以「生效的 mnemon 行」= 既没被 preset 关掉、
-                    // bundle 也还启用着的那些。停用的 bundle 贡献的行本来就不在组合里。
+                    // 「生效的 mnemon 行」= 既没被 preset 关掉、bundle 也还启用着的那些。
+                    // 停用的 bundle 贡献的行本来就不在组合里。
                     const bundleOff = mnemonRows.every((row) => row.bundleEnabled === false);
                     const open = mnemonRows
                         .filter((row) => !row.disabled && row.bundleEnabled !== false)
@@ -347,7 +602,34 @@ if (existsSync(compositionPath)) {
                     record(
                         `mnemon 在办公模式下已全部关闭（profile 里有 ${mnemonRows.length} 个 mnemon 行${bundleOff ? '，整个 bundle 已停用' : ''}）`,
                         leaking.length === 0,
-                        leaking.length === 0 ? '' : `这些 mnemon 行没被关掉，会出现在办公会话里：${leaking.join('、')}`,
+                        leaking.length === 0 ? '' : `这些 mnemon 行没被关掉，会出现在办公会话里：${leaking.join('、')}`
+                            + '（preset 已不再写 mnemon 禁用行 —— 要么保持 bundle 停用，要么在 preset 里补禁用行）',
+                    );
+                }
+
+                // 任务看板（第三十二轮，用户要求「办公模式下关闭 taskboard 功能」）。                // 与 mnemon 那条同一套判据：bundle 在 profile 里启用着，所以只能靠 preset
+                // 的禁用行把它挡在办公会话之外；挡不住的话，宿主半侧的 10 个 task_board_*
+                // 工具与浏览器半侧的看板界面会一起漏进来（工具面与提示都白涨）。
+                // 两条断言：① preset 里确实写了这一行（改 id 会被抓）；② profile 里那一行
+                // 真的被关掉了（bundle 换名 / 换 id 时会被抓）。
+                record(
+                    'preset 里写了任务看板的禁用行（id: ui-task-board）',
+                    rows.some((row) => row?.id === 'ui-task-board' && row?.disabled === true),
+                    '办公模式下不要任务看板：10 个 task_board_* 工具 + 看板界面都该关掉',
+                );
+                const boardRows = collectProfileRows().filter((row) => row.id === 'ui-task-board');
+                if (boardRows.length === 0) {
+                    console.log('注意：profile 里找不到任务看板行（bundle 未装？），跳过任务看板核对。');
+                } else {
+                    const boardClosed = new Set(rows.filter((row) => row?.disabled === true).map((row) => row.id));
+                    const boardLeaking = boardRows
+                        .filter((row) => !row.disabled && row.bundleEnabled !== false)
+                        .map((row) => row.id)
+                        .filter((id) => !boardClosed.has(id));
+                    record(
+                        `任务看板在办公模式下已关闭（profile 里有 ${boardRows.length} 个任务看板行）`,
+                        boardLeaking.length === 0,
+                        boardLeaking.length === 0 ? '' : `这些行没被关掉，task_board_* 与看板界面会出现在办公会话里：${boardLeaking.join('、')}`,
                     );
                 }
 

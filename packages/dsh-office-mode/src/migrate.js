@@ -232,8 +232,13 @@ export async function migrateMnemon({
             }
             already.add(id);
             archive.added += 1;
+            const links = linkCounts(edges, id);
             archive.items.push({
                 kind: 'mnemon',
+                // 稳定 id 必须有（第十九轮 P0-1）：归档条目的唯一入口 entryIndex 只认 `id`，
+                // 只写 mnemonId 的话这 18 条在 link / related 里等于不存在。加前缀是为了
+                // 一眼看出它是迁移来的，同时保持与 mnemon 原始 id 一一对应（幂等去重仍用 mnemonId）。
+                id: `mnemon:${id}`,
                 mnemonId: id,
                 content,
                 category: asText(row?.category),
@@ -244,7 +249,10 @@ export async function migrateMnemon({
                 source: asText(row?.source),
                 memoryBodyId: database.bodyId,
                 memoryBodyName: database.bodyName,
-                links: linkCounts(edges, id),
+                // 边数给渲染用的那个字段名（renderArchiveDigest 读 linkedCount），
+                // 明细仍留在 links 里 —— 两个名字当初就是因为只写了一个而静默丢空。
+                linkedCount: links.total,
+                links,
             });
         }
     }

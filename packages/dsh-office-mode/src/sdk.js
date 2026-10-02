@@ -13,8 +13,11 @@
  */
 import { createEnv } from './engine/kit.js';
 import { themeCatalog, resolveTheme } from './engine/theme.js';
+import { archiveExtract, archiveFind, archiveHintForBytes, archiveInfo, archiveList, archiveText } from './archive.js';
 import { avCheck, avExtract, avFrames, avInfo, avTranscribe } from './av.js';
+import { imageChannels, imageFetch, imageSearch } from './image-source.js';
 import { pdfEngines, pdfInfo, pdfPages, pdfText } from './pdf.js';
+import { previewCheck, previewImages, previewPdf } from './preview.js';
 import { pythonCheck, pythonFile, pythonRun } from './python.js';
 import { loadAllFormats, formatByExtension, formatIds } from './registry.js';
 
@@ -33,6 +36,23 @@ function normalizeEdits(edits) {
 }
 
 const OFFICE_EXTENSIONS = new Set(['.docx', '.xlsx', '.pptx']);
+
+/**
+ * OOXML 文档（也是 ZIP）该用哪个入口读 —— `office.files.read` 的错误里要指对路。
+ *
+ * 不指路的话，模型读到「这是一份 zip 归档，换 office.archive」会真的去列 XML 部件名，
+ * 而它要的其实是 `office.word.read` / `excel.read` / `ppt.read` 的结构报告。
+ */
+function ooxmlReaderOf(filePath) {
+    const at = String(filePath ?? '').lastIndexOf('.');
+    if (at === -1) return undefined;
+    const ext = String(filePath).slice(at).toLowerCase();
+    if (ext === '.docx') return { what: 'Word 文档', how: 'office.word.read(path)' };
+    if (ext === '.xlsx') return { what: 'Excel 工作簿', how: 'office.excel.read(path)' };
+    if (ext === '.pptx') return { what: 'PPT 演示文稿', how: 'office.ppt.read(path)' };
+    if (ext === '.tex') return { what: 'LaTeX 项目', how: 'office.tex.read(path)' };
+    return undefined;
+}
 
 /**
  * 这个写出的文件要不要按格式复检。
@@ -109,7 +129,29 @@ export async function buildSdk(options) {
 
         /** 文件操作：批量改 Markdown 也只写一次盘。 */
         files: {
-            read: (filePath) => env.readText(filePath),
+            /**
+             * 读文本（read / edit / template 共用一个入口）。
+             *
+             * 读到 ZIP / gzip / zstd 时**不返回乱码**：那种「读出来了但全是问号」
+             * 的结果会让模型以为文件坏了或内容就是这样。这里按魔数认出来就抛错，
+             * 并把该走的路（office.archive）写在错误里 —— 一次调用就能自我纠正。
+             *
+             * 三个动作共用它是**必须的**：`edit` / `template` 会拿读出来的文本整份写回，
+             * 按乱码读再写回等于把压缩包毁掉（数据丢失，不是「没命中」）。
+             */
+            read: (filePath) => {
+                const data = env.readFile(filePath);
+                const hint = archiveHintForBytes(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+                if (hint !== undefined) {
+                    // OOXML 也是 ZIP：对 .docx/.xlsx/.pptx 说「换 office.archive」是指错了路
+                    // （那里只能看到 XML 部件名）。按扩展名指到对应的格式读取器。
+                    const reader = ooxmlReaderOf(filePath);
+                    throw new Error(`office.files.read：${filePath} ${reader === undefined
+                        ? hint
+                        : `这是 OOXML 文档（${reader.what}），不是文本：用 ${reader.how} 读它。`}`);
+                }
+                return data.toString('utf8');
+            },
             write(filePath, content) {
                 const written = env.writeFile(filePath, typeof content === 'string' ? content : JSON.stringify(content, null, 2));
                 return { path: written.path, bytes: written.bytes };
@@ -119,7 +161,7 @@ export async function buildSdk(options) {
              * 没有命中的 find 会进 `missing`，不会静默吃掉。
              */
             edit(filePath, edits) {
-                const original = env.readText(filePath);
+                const original = office.files.read(filePath);
                 let text = original;
                 const applied = [];
                 const missing = [];
@@ -154,7 +196,7 @@ export async function buildSdk(options) {
             },
             /** 把 `{{key}}` 占位符一次性替换掉（模板填充）。 */
             template(filePath, variables) {
-                const original = env.readText(filePath);
+                const original = office.files.read(filePath);
                 let text = original;
                 const used = [];
                 for (const [key, value] of Object.entries(variables ?? {})) {
@@ -174,6 +216,47 @@ export async function buildSdk(options) {
                 const info = env.stat(filePath);
                 return info === undefined ? null : { bytes: info.size, modifiedMs: info.mtimeMs };
             },
+        },
+
+        /**
+         * 归档与会话日志（office.archive）。
+         *
+         * 会话导出（`session*.zip`，里面是 `session.v4.jsonl` 与 `media/*`）、
+         * 单独压缩的 jsonl（`.gz` / `.zst`）以前在办公模式里读不出：按文本读只会
+         * 得到乱码。这里按魔数判型（ZIP / gzip / zstd / 纯文本），给**五个**有界的读法。
+         */
+        archive: {
+            info: (filePath, options) => archiveInfo(filePath, env, options ?? {}),
+            list: (filePath, options) => archiveList(filePath, env, options ?? {}),
+            text: (filePath, options) => archiveText(filePath, env, options ?? {}),
+            find: (filePath, options) => archiveFind(filePath, env, options ?? {}),
+            extract: (filePath, options) => archiveExtract(filePath, env, options ?? {}),
+        },
+
+        /**
+         * 渲染预览（office.preview）：把自家写出的文档渲染成页面图 / PDF。
+         *
+         * 引擎是宿主随部署安装的那份 LibreOffice（`@deepseek-ai/libreoffice-kit`），
+         * 不是要另装的插件；解析不到时 check() 会如实说缺什么。
+         * 渲染一次几秒，所以按需调用：生成完想看一眼版式再调。
+         */
+        preview: {
+            check: () => previewCheck(),
+            render: (filePath, options) => previewImages(filePath, options ?? {}, env, cache),
+            pdf: (filePath, options) => previewPdf(filePath, options ?? {}, env, cache),
+        },
+
+        /**
+         * 配图（office.image）：网络取图与图库检索，并带上署名。
+         *
+         * 只用免 Key 的公开图库（维基共享资源 / Openverse），HTTP 走与取网页同一套
+         * 字节通道（地址校验、限长、超时分类都只有一份实现）。取回来的图落到工作目录，
+         * 来源与许可随返回值一起给 —— 嵌进文档时把 `credit` 传给 `source` 选项。
+         */
+        image: {
+            channels: () => imageChannels(),
+            search: (query, options) => imageSearch(query, options ?? {}),
+            fetch: (ref, options) => imageFetch(ref, options ?? {}, env),
         },
 
         /**

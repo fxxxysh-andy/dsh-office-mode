@@ -19,7 +19,7 @@ import { createCache } from '../src/engine/cache.js';
 import { resolveConfig } from '../src/config.js';
 import { buildHelp } from '../src/docs.js';
 import { executeRun } from '../src/run.js';
-import { buildTools, renderRun } from '../src/tools.js';
+import { buildTools, officeRunErrorResult, renderRun } from '../src/tools.js';
 
 const results = [];
 async function check(name, fn) {
@@ -432,6 +432,91 @@ await check('工作目录里没有残留垃圾', () => {
         entries.sort(),
         ['.office', 'notes.md', 'out', 'smoke-deck.pptx'].filter((n) => existsSync(join(root, n))).sort(),
     );
+});
+
+// ── office_run 的失败必须让宿主看见（第十八轮 P0-1，第二十七轮落地） ────────────
+
+await check('office_run 脚本失败：守卫把它换成宿主认识的 isError 结果', async () => {
+    const failedValue = {
+        ok: false,
+        files: [],
+        otherFiles: [],
+        returned: null,
+        logs: [],
+        notes: [],
+        warnings: ['这次调用没有写出任何文件。'],
+        error: { name: 'TypeError', message: 'w.titel is not a function', line: 3, column: 9, stack: [] },
+        cache: { dir: '.office/cache', kept: 0, keptBytes: 0, hits: 0, pruned: [], ttlMinutes: 720 },
+        elapsedMs: 5,
+    };
+
+    // 1) 纯函数：只把 ok:false 认成失败，别的值一律返回 null（别动它）。
+    const failure = officeRunErrorResult(failedValue);
+    assert.equal(failure.isError, true);
+    assert.equal(failure.error.message, 'w.titel is not a function');
+    assert.equal(failure.error.info.code, 'OFFICE_RUN_FAILED', '给宿主一个稳定的 code 便于路由与复现');
+    assert.equal(failure.error.info.name, 'TypeError');
+    assert.match(failure.error.info.reason, /第 3 行/);
+    assert.match(failure.content[0].text, /office_run 执行失败/);
+    assert.match(failure.content[0].text, /脚本第 3 行/, '失败反馈仍要带脚本行号');
+    assert.match(failure.content[0].text, /没有写出任何文件/, '告警不能被丢掉');
+    assert.equal(officeRunErrorResult({ ...failedValue, ok: true }), null, '成功的结果不许动');
+    assert.equal(officeRunErrorResult(undefined), null);
+    assert.equal(officeRunErrorResult('ok'), null);
+
+    // 2) 接线：插件启动时把守卫挂在宿主的 tools/execute 环绕点上。
+    const { apply } = await import('../src/index.js');
+    const handlers = new Map();
+    const ctx = {
+        tools: { register: () => () => {} },
+        get: () => undefined,
+        inject: () => {},
+        on: (event, listener) => { handlers.set(event, listener); return () => {}; },
+        logger: {},
+    };
+    apply(ctx, {});
+    const guard = handlers.get('tools/execute');
+    assert.equal(typeof guard, 'function', '要把守卫挂在 tools/execute 上（与宿主自带的 timeout 策略同一个点）');
+
+    const success = { isError: false, value: failedValue, content: [{ type: 'text', text: '❌ 工具体已经渲染好的失败反馈' }] };
+    const guarded = await guard({ name: 'office_run' }, async () => success);
+    assert.equal(guarded.isError, true);
+    assert.equal(guarded.content[0].text, '❌ 工具体已经渲染好的失败反馈', '要保留已经渲染好的那段文本（里面有文件清单与告警）');
+    assert.equal(guarded.error.info.code, 'OFFICE_RUN_FAILED');
+
+    // 宿主拿到这个结果之后会做什么，是本条断言真正依赖的契约 —— 照抄
+    // `dsh-tools` 的 `normalizeDispatchResult` / `materializeFinalResult` 的 isError 分支：
+    // 只保留 content / error / meta / additionalContexts，**丢掉 value**。
+    // 这一步是仿真（没有起真调度器），但它把「哪些字段能活下来」写成了可读的断言：
+    // 宿主那两段一旦改成重渲染 content，这里就该跟着改，而不是继续假绿。
+    const hostNormalize = (result) => (result.isError === true
+        ? {
+            isError: true,
+            error: result.error,
+            content: result.content,
+            ...(result.meta !== undefined ? { meta: result.meta } : {}),
+            ...(result.additionalContexts !== undefined ? { additionalContexts: result.additionalContexts } : {}),
+        }
+        : { isError: false, value: result.value, content: result.content });
+    const recorded = hostNormalize(guarded);
+    assert.equal(recorded.isError, true, '会话日志里要记成失败');
+    assert.equal(recorded.error.info.code, 'OFFICE_RUN_FAILED');
+    assert.equal(recorded.error.info.name, 'TypeError');
+    assert.match(recorded.error.info.reason, /第 3 行/);
+    assert.equal(recorded.content[0].text, '❌ 工具体已经渲染好的失败反馈');
+    assert.equal(Object.hasOwn(recorded, 'value'), false, 'isError 结果没有 value —— 宿主的契约如此');
+
+    // meta / additionalContexts 要跟着带过去（宿主只保留这两样展示元数据）
+    const withMeta = await guard({ name: 'office_run' }, async () => ({ ...success, meta: { surface: 'x' }, additionalContexts: [{ role: 'user' }] }));
+    assert.deepEqual(withMeta.meta, { surface: 'x' }, 'meta 不能丢');
+    assert.deepEqual(withMeta.additionalContexts, [{ role: 'user' }], 'additionalContexts 不能丢');
+
+    const okResult = { isError: false, value: { ...failedValue, ok: true }, content: [{ type: 'text', text: '✅ 完成' }] };
+    assert.equal((await guard({ name: 'office_run' }, async () => okResult)).isError, false, '成功的结果照旧成功');
+    const other = { isError: false, value: { ok: false }, content: [] };
+    assert.equal(await guard({ name: 'office_search_run' }, async () => other), other, '别的工具原样透传');
+    const hostError = { isError: true, error: { message: 'boom' }, content: [{ type: 'text', text: 'Error: boom' }] };
+    assert.equal(await guard({ name: 'office_run' }, async () => hostError), hostError, '宿主已经标成失败的结果不许再包一层');
 });
 
 const failed = results.filter((item) => !item.ok);

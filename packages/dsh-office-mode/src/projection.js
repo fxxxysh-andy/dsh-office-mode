@@ -49,12 +49,95 @@ import { renderDigest } from './memory.js';
 
 /** 连续多少次「未变化」之后强制重贴一次全文（防宿主压缩把早先那份裁掉）。 */
 export const REFRESH_EVERY = 12;
+/** 一个会话最多记多少条「已经贴过」的条目 id（超出按插入序淘汰最旧的）。 */
+const MAX_NOTED = 64;
 /** 最多记多少个会话的投影状态（超出按插入序淘汰最旧的）。 */
 const MAX_SESSIONS = 32;
 /** 最多记多少条「这条长指引已经说过」（超出按插入序淘汰最旧的）。 */
 const MAX_HINTS = 64;
 
-/** sessionId → { revision, since }。since = 自上次贴全文以来省略了几次。 */
+/**
+ * 「本次在做什么」的话题词表（第三十六轮：按需投影）。
+ *
+ * 口径三条：
+ *   1. **词是可以出现在记忆条目正文里的词**，不是 API 名的同义词表 —— 匹配方向是
+ *      「条目正文包含词」，所以中文词取两字以上、英文取小写整词，单字（如「域」）
+ *      与过泛的词（如「文件」「页面」单独使用时）会大面积误命中，宁可不放。
+ *   2. **多给比少给安全**：词表偏宽只损失一点字节，偏窄会把该看到的条目折叠掉。
+ *      折叠不是丢信息（折叠行带条数与读取入口），但「看不到」的代价仍大于「多看到」。
+ *   3. 话题之间允许重叠（「表格」同时在 word 与 excel、「主题」同时在 ppt 与 theme）：
+ *      一条记忆本来就可能同时属于两个话题。
+ */
+export const SIGNAL_TERMS = {
+    word: ['word', 'docx', 'winword', '文档', '排版', '目录', '页码', '字体', '段落', '表格', '弹窗', '标题', '题注'],
+    excel: ['excel', 'xlsx', 'sheet', '工作表', '单元格', '公式', '透视', '图表'],
+    ppt: ['ppt', 'pptx', '幻灯', '版面', '审阅', '微调', '插图', '母版', '演示', '参考稿', '页面填充'],
+    tex: ['tex', 'latex', 'thuthesis', '论文', '学位论文', 'latexmk', 'xelatex', 'texlive'],
+    pdf: ['pdf', 'fitz', 'poppler', 'pdftoppm', '页面图', '文本型', '扫描件'],
+    python: ['python', 'numpy', 'scipy', 'pandas', 'matplotlib', 'sympy', '绘图', '科学计算'],
+    av: ['音频', '视频', '语音', '转写', '抽帧', '分块', 'asr', 'sensevoice', 'sherpa', 'ffmpeg'],
+    files: ['批量', '改文件', '回写', '编码', '乱码', 'powershell', '占位符', '模板填充', '换行符'],
+    cache: ['缓存', 'ttl', '命中复用', 'keepcache', '中间产物'],
+    theme: ['主题', '令牌', '配色', '浅色', '深色', '亮色'],
+    search: ['检索', '搜索', '通道', '来源', '代理', 'proxy', 'duckduckgo', 'searxng', '联网', '站点', '网页', '抓取', '预处理', 'url', 'web', 'provider'],
+    memory: ['记忆', '召回', '归档', '台账', '投影', 'mnemon', '配额', '墓碑', '迁移', 'pack', '热记忆'],
+    settings: ['设置', '面板', '分组', '折叠', '定位', '滚动', '字号', 'localStorage'],
+};
+
+/** 脚本里能认出来的文件扩展名 → 话题。office.* 的 API 名与话题同名，走词表的键。 */
+const SCRIPT_EXTENSIONS = [
+    ['.docx', 'word'], ['.doc', 'word'], ['.xlsx', 'excel'], ['.xls', 'excel'],
+    ['.pptx', 'ppt'], ['.pdf', 'pdf'], ['.py', 'python'], ['.tex', 'tex'],
+    ['.mp3', 'av'], ['.wav', 'av'], ['.m4a', 'av'], ['.mp4', 'av'], ['.mkv', 'av'],
+];
+
+/**
+ * 扩展名匹配要带边界：`.pdf` 不能命中 `office.pdf.text(` 里的 `.tex`（那是
+ * `.text(` 的一部分），`.py` 也不能命中 `.python`。要求扩展名后面跟的不是
+ * 字母数字（引号、括号、空白、行尾都行）。
+ */
+const extensionRegex = () => new RegExp(
+    `\\.(${SCRIPT_EXTENSIONS.map(([extension]) => extension.slice(1)).join('|')})(?![a-z0-9])`,
+    'gi',
+);
+
+/**
+ * 从「这次调用在做什么」里取话题信号。
+ *
+ * 两个来源：office_help 的 `topic`（模型自己点名的话题，最干净）；office_run 的
+ * `script`（里面写的 `office.ppt.…` 与文件扩展名就是它要动的东西）。两处都给时
+ * 取并集。认不出来（空话题、guide/run 这类总览话题、没有 office.* 的脚本）返回
+ * null —— **没有信号就不筛**，宁可用旧行为也不猜。
+ *
+ * @param {{topic?: string, script?: string}} source
+ * @returns {{key: string, terms: string[]}|null} key 用于「换了话题要重贴」，terms 给匹配用
+ */
+export function signalOf({ topic = '', script = '' } = {}) {
+    const ids = new Set();
+    if (typeof topic === 'string' && Object.prototype.hasOwnProperty.call(SIGNAL_TERMS, topic)) ids.add(topic);
+    if (typeof script === 'string' && script !== '') {
+        for (const match of script.matchAll(/office\.([a-zA-Z]+)/g)) {
+            const name = match[1].toLowerCase();
+            if (Object.prototype.hasOwnProperty.call(SIGNAL_TERMS, name)) ids.add(name);
+        }
+        const lowered = script.toLowerCase();
+        for (const match of lowered.matchAll(extensionRegex())) {
+            const extension = `.${match[1].toLowerCase()}`;
+            const id = SCRIPT_EXTENSIONS.find(([wanted]) => wanted === extension)?.[1];
+            if (id !== undefined) ids.add(id);
+        }
+    }
+    if (ids.size === 0) return null;
+    const terms = [...new Set([...ids].sort().flatMap((id) => SIGNAL_TERMS[id]))];
+    return { key: [...ids].sort().join('+'), terms };
+}
+
+/**
+ * sessionId → { writeRevision, ledgerRevision, since, signalKey, noted, refreshes }。
+ * `since` = 自上次贴正文以来省略了几次；`noted` = 本会话**已经贴过正文**的条目 id
+ * （第四十八轮 P0-2：节流的依据不再是「上一次是什么话题」，而是「哪些条目真的贴过」——
+ * 话题 A→B→A 时第二次 A 不再重付全文）；`refreshes` = 本会话做过几次心跳重贴。
+ */
 const state = new Map();
 /** 「会话|指引标识」→ true。与 state 分开存，见 hintOnce 的注释。 */
 const hints = new Map();
@@ -89,34 +172,133 @@ function evict() {
 }
 
 /**
- * 决定这一次投影贴全文还是只报「未变化」。
+ * 决定这一次投影贴什么。
  *
- * @param {object} digest `memory.digest()` 的结果（含 revision）
- * @param {{sessionId?: string, context?: 'help'|'run'}} options
- * @returns {{text: string, mode: 'full'|'unchanged', reason: string}}
- *   text 就是要追加到工具反馈末尾的那段；mode / reason 给测试与排查用
+ * 三个维度各有各的时钟（第三十六轮起）：
+ *   · **热记忆正文**：`writeRevision`（「有没有写操作」那个指纹）变了、第一次见这个
+ *     会话、或**话题信号换了**（同一份热记忆，模型这次问的是另一件事）→ 贴；贴的时候
+ *     **按信号筛**，无关条目折叠成一行（带条数与读取入口）。连续 `REFRESH_EVERY` 次
+ *     没变 → 强制重贴**不筛的**全文 —— 心跳的职责是完整性（防宿主压缩把先前那份裁掉），
+ *     所以这一份故意不筛。
+ *   · **台账近况**：用自己的 `ledgerRevision`（最近几条的指纹）判断，变了就贴，
+ *     没变也折叠成一行。台账不体现在热记忆的 `writeRevision` 里，但它同样只在登记新产物
+ *     时才变 —— 两次交付之间反复贴同样三行，付的是纯重复的钱。
+ *   · **读全文的入口**：任何折叠行都必须带 `office_memory` 的读取调用 —— 折叠是
+ *     「把选择权交回给模型」，不是「替模型决定它不需要」。
+ *
+ * 指纹用哪个**故意写清楚**（第二十四轮 P2-5 / 第二十六轮 24-17）：这里要的是
+ * 「有没有写操作」`writeRevision`，不是 memory.json 里那个由内容算的 `contentRevision`。
+ *
+ * @param {object} digest `memory.digest()` 的结果（含 writeRevision 与 ledgerRevision）
+ * @param {{sessionId?: string, context?: 'help'|'run', signal?: {key: string, terms: string[]}|null, budget?: number|null}} options
+ *   `budget`（第四十八轮 P0-2）= 条目正文的字节上限，透传给 renderDigest；不传 = 不限。
+ * @returns {{text: string, mode: 'full'|'unchanged', reason: string, bytes?: number, printed?: number}}
+ *   text 就是要追加到工具反馈末尾的那段；mode / reason 给测试与排查用。
+ *   mode 为 'full' 表示「这次贴了新内容」（热记忆或台账任一）。
  */
-export function projectDigest(digest, { sessionId = '', context = 'help' } = {}) {
+export function projectDigest(digest, { sessionId = '', context = 'help', signal = null, budget = null } = {}) {
     // 空记忆：整段本来就小（讲的是「怎么记」，不是内容），而且那几句指引正是
     // 该反复出现的时候 —— 不做省略。
     if (digest?.empty === true) {
         return { text: renderDigest(digest, { context }), mode: 'full', reason: 'empty' };
     }
     const id = typeof sessionId === 'string' ? sessionId.trim() : '';
+    const terms = signal !== null && signal !== undefined && Array.isArray(signal.terms) && signal.terms.length > 0
+        ? signal.terms
+        : null;
+    const signalKey = terms === null ? '' : String(signal?.key ?? terms.join(','));
     if (id === '') {
-        // 拿不到会话身份：不假装「刚贴过」。
-        return { text: renderDigest(digest, { context }), mode: 'full', reason: 'no-session' };
+        // 拿不到会话身份：不假装「刚贴过」。信号照样筛（它与谁是会话无关）。
+        return {
+            text: renderDigest(digest, { context, signal: terms === null ? null : { label: signalKey, terms } }),
+            mode: 'full',
+            reason: 'no-session',
+        };
     }
-    const revision = String(digest?.revision ?? '');
+    const revision = String(digest?.writeRevision ?? '');
+    const ledgerRevision = String(digest?.ledgerRevision ?? '');
     const previous = state.get(id);
-    const changed = previous === undefined || previous.revision !== revision;
-    const since = changed ? 0 : previous.since + 1;
-    const refresh = !changed && since >= REFRESH_EVERY;
-    state.set(id, { revision, since: refresh ? 0 : since });
-    evict();
-    if (changed) return { text: renderDigest(digest, { context }), mode: 'full', reason: 'changed' };
-    if (refresh) return { text: renderDigest(digest, { context }), mode: 'full', reason: 'refresh' };
-    return { text: renderDigest(digest, { context, hot: 'unchanged' }), mode: 'unchanged', reason: 'unchanged' };
+    const hotChanged = previous === undefined || previous.writeRevision !== revision;
+    const ledgerChanged = previous === undefined || previous.ledgerRevision !== ledgerRevision;
+    // 记下「这次真正贴出去的条目」（第四十八轮 P0-2）：下次遇到同一条就直接折叠，
+    // 话题来回切（A→B→A）不再重付一份全文。
+    const remember = (base, printed) => {
+        const noted = new Set(base.noted ?? []);
+        for (const entryId of printed) {
+            noted.delete(entryId);
+            noted.add(entryId);
+        }
+        while (noted.size > MAX_NOTED) {
+            const oldest = noted.keys().next().value;
+            if (oldest === undefined) break;
+            noted.delete(oldest);
+        }
+        return noted;
+    };
+    const emit = (activeSignal, hot, ledger, skip) => {
+        const report = { printedIds: [] };
+        const text = renderDigest(digest, {
+            context,
+            hot,
+            ledger,
+            signal: activeSignal,
+            budget,
+            skip,
+            report,
+        });
+        return { text, report };
+    };
+    const signalArg = terms === null ? null : { label: signalKey, terms };
+    if (hotChanged) {
+        const { text, report } = emit(signalArg, 'full', ledgerChanged ? 'full' : 'unchanged', null);
+        state.set(id, {
+            writeRevision: revision, ledgerRevision, since: 0, signalKey,
+            noted: remember({ noted: new Set() }, report.printedIds), refreshes: 0,
+        });
+        evict();
+        return { text, mode: 'full', reason: 'changed', bytes: report.bytes, printed: report.printedIds.length };
+    }
+    let since = previous.since + 1;
+    const refresh = since >= REFRESH_EVERY;
+    // 心跳照旧**不筛**（完整性兜底：宿主压缩把先前那份裁掉时，靠它把条目带回来），
+    // 但同样受预算约束 —— 于是「每 12 次一次全文」从 15 KB 级降到预算级。
+    if (refresh) {
+        const { text, report } = emit(null, 'full', ledgerChanged ? 'full' : 'unchanged', null);
+        state.set(id, {
+            writeRevision: revision, ledgerRevision, since: 0, signalKey,
+            noted: remember({ noted: new Set() }, report.printedIds),
+        });
+        evict();
+        return {
+            text,
+            mode: 'full',
+            reason: 'refresh',
+            bytes: report.bytes,
+            printed: report.printedIds.length,
+        };
+    }
+    if (ledgerChanged) {
+        const { text, report } = emit(null, 'unchanged', 'full', null);
+        state.set(id, { ...previous, ledgerRevision, since, signalKey });
+        return { text, mode: 'full', reason: 'ledger', bytes: report.bytes, printed: 0 };
+    }
+    // 没写、没登记、也不是心跳：只有在这次的话题下**还有没贴过的条目**时才贴正文。
+    const { text, report } = emit(signalArg, 'full', 'unchanged', previous.noted);
+    state.set(id, { ...previous, ledgerRevision, since, signalKey });
+    if (report.printedIds.length > 0) {
+        state.set(id, {
+            ...previous, ledgerRevision, since: 0, signalKey,
+            noted: remember(previous, report.printedIds),
+        });
+        return { text, mode: 'full', reason: 'changed', bytes: report.bytes, printed: report.printedIds.length };
+    }
+    return {
+        text: renderDigest(digest, { context, hot: 'unchanged', ledger: 'unchanged' }),
+        mode: 'unchanged',
+        reason: 'unchanged',
+        bytes: undefined,
+        printed: 0,
+    };
 }
 
 /** 清空投影状态（测试用；进程内状态不该被测试互相污染）。 */
@@ -175,5 +357,8 @@ export function resetHints() {
 /** 看一眼某个会话的投影状态（测试与排查用）。 */
 export function projectionStateOf(sessionId) {
     const found = state.get(sessionId);
-    return found === undefined ? null : { revision: found.revision, since: found.since };
+    return found === undefined
+        ? null
+        : { writeRevision: found.writeRevision, ledgerRevision: found.ledgerRevision, since: found.since, signalKey: found.signalKey };
 }
+

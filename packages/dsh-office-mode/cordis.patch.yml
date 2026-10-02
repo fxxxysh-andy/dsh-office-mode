@@ -14,6 +14,8 @@
 #         office_help: true
 #         office_run: true
 #         office_memory: true
+#         office_web_search: true   # 网页抓取搜索（免 Key，来源直接回对话，不落盘）
+#         office_web_fetch: true    # 网页抓取取正文（PDF 交给 office.pdf 抽文本）
 #         office_search_run: true   # 内置检索直查（office_search_run）
 #         office_search_brief: true
 #         office_search_dispatch: true
@@ -26,7 +28,9 @@
 #         provider: auto            # 用哪条联网通道（第二十轮）：auto 按 providerOrder 试，
 #                                   # 也可以固定成 seam / anthropic / openai / tavily / brave /
 #                                   # bocha / exa / serper / searxng / duckduckgo
-#         providerOrder: [seam, anthropic, openai, tavily, brave, bocha, exa, serper, searxng, duckduckgo]
+#         providerOrder: [duckduckgo, searxng, seam]   # 第三十轮起：免 Key 抓取在前、接缝兜底；
+#                                   # 三方检索 API（anthropic / openai / tavily / brave /
+#                                   # bocha / exa / serper）不进默认顺序，要显式加回
 #         providers:                # 每条通道各自的参数（键集 = 它真正用得上的那几个）
 #           anthropic: { apiKeyEnv: DEEPSEEK_API_KEY, baseURL: ..., model: ..., timeoutMs: 60000 }
 #           tavily:    { apiKeyEnv: TAVILY_API_KEY, timeoutMs: 30000 }
@@ -99,11 +103,20 @@
 # 迁移入口（node scripts/migrate-mnemon.mjs 或 office_memory 的 migrate 动作）
 # 也写在这一页上。
 #
+# 两页的骨架都是**可折叠的分组**（第三十五轮，用户口径「添加展开和收起功能，
+# 方便定位功能位置」）：默认全部收起，进页面先看到一份分组目录（每组写「几项」），
+# 顶上一条「定位」框按名称 / 配置项过滤（命中的行只留它自己、命中组自动展开、
+# 报出命中数），旁边是「全部展开 / 全部收起」。开合状态记在 localStorage
+# （键 dsh-office-mode.groups.<office|memory>），拿不到就只记在这次会话里。
+#
 # 记忆浏览面板：侧栏的「记忆」入口（注册进 sidebar.panellist + main 两个槽位），
-# 数据来自本插件注册的只读端点 GET /office-memory/snapshot。该端点**只服务
-# 本进程真的跑过办公工具的工作目录**（见 src/view.js 的信任边界说明），
-# 且只接受 GET。组合里没有 webServer（例如 headless）时端点不注册，
-# 面板显示可读提示，插件其余功能不受影响。
+# 数据来自本插件注册的只读端点 GET /office-memory/snapshot。该端点只服务**宿主
+# 认得的工作目录**（见 src/view.js 的信任边界说明）：本进程真跑过办公工具的工作目录、
+# 宿主工作区登记表里的项目目录（ctx.workspaceRegistry，跨重启仍在）、会话日志里出现过
+# 的目录（ctx.sessionPersistence，兜底）—— 所以重启 DSH 之后、以及还没跑过办公工具的
+# 工作区里，面板照样能显示 .office/memory 的内容，不必先用一次办公工具把它「喂」进来。
+# 端点只接受 GET，点名的工作目录不在上述来源里时 404。组合里没有 webServer（例如
+# headless）时端点不注册，面板显示可读提示，插件其余功能不受影响。
 #
 # 设置页的可编辑字段来自 export const Config（schemastery；字段整片标 volatile
 # —— dsh-settings 只接受 volatile 路径的写入）。浏览器半侧按插件行 id 经
@@ -119,25 +132,29 @@
 # 所以不能用 ctx.subagents）。拿不到服务时派工失败并指向 Agent Teams 的
 # spawn_teammate；精简部署（组合里没有 dsh-base 的 subagent 行）里插件其余功能照常。
 #
-# 内置检索（src/web.js + src/web-providers.js + src/web-preprocess.js）：办公 preset
-# 是一份**完整的**组合（plugins 列表就是那个会话的全部插件行），里面没有
-# @deepseek-ai/dsh-tool-web，所以办公会话的工具面里没有 web_search /
-# advanced_search / platform_search / web_fetch —— 派子代理检索会整批失败
-# （tools.restrict() names unknown global tools "web_search"…，2026-09-25
-# 的真实会话就是这样）。第二十轮起这条通道是**多条**：
-#   1) 接缝优先：宿主的 web 服务 ctx.web（host 层，办公会话照样在；它带来公网地址
-#      校验、地址钉死、同源跳转、体积与超时上限这些现成策略）；
-#   2) 拿不到接缝（或用户点名了别的通道）就按 search.provider / providerOrder 走
-#      多路通道：Anthropic 兼容 + 原生 web_search（默认 DeepSeek 官方）、OpenAI 兼容、
-#      Tavily、Brave、博查、Exa、Serper、自建 SearXNG、DuckDuckGo（免 Key）。
-#      每条通道自己发 HTTP、自己解析，返回统一形状；一条失败就试下一条，
-#      全部失败时把**每条通道的原因**分别写出来（配置缺失 / 网络不可达 / 被挡 / 没结果）。
-#   3) 取正文：接缝优先，其次自带的安全抓取（只许公网地址、只跟同源跳转、限长限时）。
-#      两者拿到的页面都过**内容级成败哨兵**（HTTP 200 也可能是区域封锁页），
-#      再走**脚本式预处理**（src/web-preprocess.js）：去脚本样式与语义骨架、按属性
-#      去样板区、挑主容器、丢样板行、去重、压空行，并把「洗掉多少」写进结果文件与反馈。
-#      哨兵读的是**清洗前**的文本（清洗会把拦截页的样板也删掉，拿清洗后的文本判会把
-#      「目标站拒绝」误判成「正文几乎为空」）。
+# 内置检索（src/web.js + src/web-providers.js + src/web-preprocess.js）：
+# 第三十轮起办公 preset **不声明** @deepseek-ai/dsh-tool-web（宿主的 web_search /
+# web_fetch / advanced_search / platform_search 不进办公会话），资料搜索只走本插件的
+# 通道：两个免 Key 抓取工具（office_web_search / office_web_fetch，主会话与检索子代理
+# 都用它们）+ 落盘取证的三步走。这条内置通道由此成为唯一的检索出口，在没装子代理
+# 服务的精简部署里也一样能跑。通道是**多条**，默认顺序（第三十轮）：
+#   1) duckduckgo：免 Key 抓取（抓 DuckDuckGo HTML 结果页解析，零配置可查）；
+#   2) searxng：自建 SearXNG 实例（免 Key，要填端点）；
+#   3) seam：宿主的 web 服务 ctx.web（兜底；它带来公网地址校验、地址钉死、体积与
+#      超时上限这些现成策略）。
+#   三方检索 API（Anthropic 兼容 + 原生 web_search（默认 DeepSeek 官方）、OpenAI 兼容、
+#   Tavily、Brave、博查、Exa、Serper）不进默认顺序——要用就显式点名（provider 参数）
+#   或在设置页把它们加回 providerOrder。每条通道自己发 HTTP、自己解析，返回统一形状；
+#   一条失败就试下一条，全部失败时把**每条通道的原因**分别写出来（配置缺失 /
+#   网络不可达 / 被挡 / 没结果）。
+#   取正文：**自带的安全抓取优先**（只许公网地址、只跟同源跳转、限长限时、PDF 交给
+#   office.pdf 抽文本），宿主接缝兜底。两者拿到的页面都过**内容级成败哨兵**
+#   （HTTP 200 也可能是区域封锁页），再走**脚本式预处理**（src/web-preprocess.js）：
+#   去脚本样式与语义骨架、按属性去样板区、挑主容器、丢样板行、去重、压空行，并把
+#   「洗掉多少」写进结果文件与反馈。哨兵读的是**清洗前**的文本（清洗会把拦截页的
+#   样板也删掉，拿清洗后的文本判会把「目标站拒绝」误判成「正文几乎为空」）。
+#   第二十九轮新增：`search.proxy` 出口代理（src/web-proxy.js：优先插件私有的
+#   undici 分派器，拿不到才退回进程级环境变量）。
 # office_search_dispatch 在 auto 引擎下先试子代理，失败（或没有 subagents 服务）就
 # 自动切到这条通道；两边写出的结果文件格式一致，office_parse_findings 一行都不用改。
 # office_search_run 还可以用 provider 参数按次点名一条通道（bocha 中文好、

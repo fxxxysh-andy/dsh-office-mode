@@ -129,6 +129,29 @@ export function createTurnQuota({ limits = {} } = {}) {
         return { allowed: true, enforced: true, used: counter[kind], limit, turn: identity.turn, reason: '' };
     }
 
+    /**
+     * 退回一次名额（只给「这次调用抛错了」那条路用）。
+     *
+     * 为什么需要它：名额是在**参数校验之前**申请的 —— 不先占名额就去做重活，两件事都不对；
+     * 但这样「模型把 `tier` / 时间词拼错一个字母」这种当场抛错的调用也会吃掉一次机会。
+     * 第四十五轮独立复核实测（P3）：默认 2 次下，一次错拼 tier + 一次正常检索之后，
+     * 第 3 次就被拒 —— 模型会以为是检索坏了。
+     *
+     * 退回的语义是「**没有产生结果，所以不算查过一次**」，不是「事后无限重试」：
+     * 只有抛错这条路上调用方才会调它，且名额不会被退成负数。
+     */
+    function release(kind, exec) {
+        const identity = turnKeyOf(exec);
+        if (identity === null) return false;
+        const counter = used.get(identity.key);
+        if (counter === undefined) return false;
+        const current = Number.isFinite(counter[kind]) ? counter[kind] : 0;
+        if (current <= 0) return false;
+        counter[kind] = current - 1;
+        used.set(identity.key, counter);
+        return true;
+    }
+
     /** 本回合已经用掉多少（给「回合记忆条」与回执用）。 */
     function usedIn(exec) {
         const identity = turnKeyOf(exec);
@@ -143,5 +166,5 @@ export function createTurnQuota({ limits = {} } = {}) {
         turnCache.clear();
     }
 
-    return { take, usedIn, reset };
+    return { take, release, usedIn, reset };
 }

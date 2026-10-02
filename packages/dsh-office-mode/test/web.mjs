@@ -1,7 +1,8 @@
 /**
  * 内置联网通道的单元测试（全部离线）。
  *
- * 这些用例钉的是「办公 preset 里没有 web_search，检索还能不能用」这条需求的可判定部分：
+ * 这些用例钉的是「工具面里缺这几个联网工具的精简部署（第二十九轮之前的办公 preset 就是
+ * 这样），检索还能不能用」这条需求的可判定部分：
  * 通道选择（接缝优先、失败回落）、HTML 收文本、地址分类（SSRF 防线）、
  * 响应映射与摘录挑选。真正的联网检索单独用 `node test/web-live.mjs` 跑，
  * 不进默认测试套件（默认套件不许依赖网络）。
@@ -21,6 +22,7 @@ import {
     htmlToText,
     inspectFetchedPage,
     isPublicAddress,
+    looksLikePdf,
     mapSearchResponse,
     mergeSources,
     resolveBuiltinOptions,
@@ -598,6 +600,48 @@ await check('auto：按顺序试通道，第一条成功的就用它；全失败
     assert.match(status.reason, /Anthropic 兼容/);
 });
 
+// ── 失败分类与自检的如实性（第三十三轮）──────────────────────────────────
+
+await check('同一次调用里，后续查询的失败分类不退化成「其它」', async () => {
+    // 第三十三轮实测：一条通道第一次失败记的是「网络出口不可达」，缓存下来的却只有
+    // message，第二条查询再命中缓存时被重包成通用错误 → 分类变成「其它」。而分类正是
+    // 告诉调用方「该换出口」还是「该换来源」的那句话（web-errors.js 的 P0-9 口径）。
+    const access = createWebAccess(cordisLikeCtx({}), {
+        provider: 'auto',
+        providerOrder: ['duckduckgo', 'searxng'],
+        providers: {
+            // 回环地址在 SSRF 防线处当场被挡：离线、快，且带确定的错误码。
+            duckduckgo: { baseURL: 'http://127.0.0.1:1' },
+            searxng: { baseURL: 'http://127.0.0.1:1' },
+        },
+    });
+    const first = await access.search('第一次').then(() => null, (error) => error);
+    const second = await access.search('第二次').then(() => null, (error) => error);
+    assert.ok(first instanceof WebAccessError, '两条通道都不通时必须抛错');
+    assert.ok(second instanceof WebAccessError);
+    assert.equal(webFailureKind(second), webFailureKind(first), '两次查询的失败分类必须一致');
+    assert.notEqual(webFailureKind(second), 'other', `分类不该退化成「其它」：${second.message.slice(0, 120)}`);
+});
+
+await check('probe 不把「只判过配置」的通道说成「可用」', async () => {
+    // 免 Key 抓取通道 probe 时不联网，所以「配置齐了」不等于「出口通」。
+    // 旧措辞一律说「可用」，于是通道全灭时看起来像「搜了但没资料」。
+    const access = createWebAccess(cordisLikeCtx({}), {
+        provider: 'auto',
+        providerOrder: ['duckduckgo', 'searxng'],
+        providers: { duckduckgo: { baseURL: 'https://html.duckduckgo.com/html' } },
+    });
+    const status = await access.probe();
+    assert.equal(status.ok, true, '配置齐了就该算「能试」');
+    assert.equal(status.verified, false, '没联网确认过就不能说「已验证」');
+    assert.ok(!/「DuckDuckGo（免 Key）」可用/.test(status.reason), `不该说成「可用」：${status.reason}`);
+    assert.match(status.reason, /未联网确认/, `要说清只是配置齐了：${status.reason}`);
+    // 接缝那条真的问过运行时（服务在不在），才配叫「可用」。
+    const seam = createWebAccess(cordisLikeCtx({ web: { search: async () => ({ sources: [] }), fetch: async () => ({}) } }), { provider: 'seam' });
+    const seamStatus = await seam.probe();
+    assert.equal(seamStatus.verified, true, '接缝是问过运行时的');
+});
+
 // ── 网页预处理（第二十轮）────────────────────────────────────────────────
 
 /** 一个「正文 + 导航 + 页脚 + cookie 条」的网页。 */
@@ -718,6 +762,172 @@ await check('漂移守卫：src/web*.js 里抛出的每个错误码都已登记�
     assert.deepEqual(missing, [], `这些错误码没有登记分类：${missing.join('、')}`);
 });
 
+// ── 取正文撞上 PDF（第二十九轮）────────────────────────────────────────────
+
+await check('PDF 识别：MIME 说了算；含糊时才看 URL 后缀', () => {
+    assert.equal(looksLikePdf('application/pdf', 'https://a.example.com/x'), true);
+    assert.equal(looksLikePdf('application/pdf; charset=binary', 'https://a.example.com/x'), true);
+    assert.equal(looksLikePdf('', 'https://a.example.com/x.pdf'), true);
+    assert.equal(looksLikePdf('application/octet-stream', 'https://a.example.com/x.pdf?dl=1'), true);
+    assert.equal(looksLikePdf('', 'https://a.example.com/x'), false);
+    assert.equal(looksLikePdf('text/html', 'https://a.example.com/x.pdf'), false, '站点说是 HTML 就按 HTML 处理，不按后缀猜');
+});
+
+/** 一个 PDF 响应的替身。 */
+function pdfResponse(bytes) {
+    return {
+        status: 200,
+        headers: { get: (name) => (name === 'content-type' ? 'application/pdf' : null) },
+        body: {
+            getReader() {
+                let sent = false;
+                return {
+                    async read() {
+                        if (sent) return { done: true, value: undefined };
+                        sent = true;
+                        return { done: false, value: bytes };
+                    },
+                    async cancel() {},
+                };
+            },
+        },
+    };
+}
+
+await check('取正文：application/pdf 交给 office.pdf 抽文本，正文进 content、页数进 pdf', async () => {
+    const seen = {};
+    const extracted = '第一章 不定积分\n\n1. 求 ∫x dx';
+    const access = createWebAccess(cordisLikeCtx({}), { apiKey: 'k', pdfMaxBytes: 4 * 1024 * 1024 }, {
+        lookup: async () => [{ address: '93.184.216.34', family: 4 }],
+        fetch: async () => pdfResponse(new TextEncoder().encode('%PDF-1.4 fake')),
+        pdf: {
+            async text(path, options) {
+                seen.path = path;
+                seen.maxPages = options.maxPages;
+                seen.maxBytes = options.maxBytes;
+                return { text: extracted, pages: 3, extractor: 'stub' };
+            },
+        },
+    });
+    const page = await access.fetch('https://a.example.com/paper.pdf');
+    assert.equal(page.kind, 'pdf');
+    assert.equal(page.content, extracted);
+    assert.deepEqual(page.pdf, { pages: 3, chars: extracted.length, bytes: 13, extractor: 'stub' });
+    assert.match(page.notice, /PDF（3 页，抽取引擎 stub）/);
+    assert.equal(page.preprocess, undefined, 'PDF 不做网页预处理');
+    assert.ok(seen.path.endsWith('.pdf'), '抽文本前要落成一个 .pdf 临时文件');
+    assert.equal(seen.maxPages, 30, '页数上限来自配置');
+});
+
+await check('取正文：PDF 超体积上限直接放弃（截断的 PDF 抽不出文本）', async () => {
+    const access = createWebAccess(cordisLikeCtx({}), { apiKey: 'k', pdfMaxBytes: 1024 * 1024 }, {
+        lookup: async () => [{ address: '93.184.216.34', family: 4 }],
+        // 声明 2 MB，实际只给 1 MB 上限的量：读满上限即判截断。
+        fetch: async () => pdfResponse(new Uint8Array(1024 * 1024 + 10)),
+        pdf: { async text() { throw new Error('超上限时不该走到抽取'); } },
+    });
+    await assert.rejects(() => access.fetch('https://a.example.com/big.pdf'), (error) => {
+        assert.equal(error.code, 'OFFICE_WEB_PDF_TOO_BIG');
+        assert.match(error.message, /超过 1 MB 上限/);
+        return true;
+    });
+});
+
+await check('取正文：PDF 抽不出文本按「没拿到结果」报，并带出扫描件提示', async () => {
+    const access = createWebAccess(cordisLikeCtx({}), { apiKey: 'k' }, {
+        lookup: async () => [{ address: '93.184.216.34', family: 4 }],
+        fetch: async () => pdfResponse(new TextEncoder().encode('%PDF-1.4')),
+        pdf: { async text() { return { text: '   ', pages: 8, extractor: 'fitz', hint: '这份 PDF 没有文本层（扫描/手写）：改用 office.pdf.pages() 渲染成图片。' }; } },
+    });
+    await assert.rejects(() => access.fetch('https://a.example.com/scan.pdf'), (error) => {
+        assert.equal(error.code, 'OFFICE_WEB_EMPTY');
+        assert.equal(webFailureKind(error), 'empty');
+        assert.match(error.message, /没有文本层/);
+        return true;
+    });
+});
+
+await check('取正文：没有 PDF 抽取通道时按「配置缺失」报，不假装读到了页', async () => {
+    const access = createWebAccess(cordisLikeCtx({}), { apiKey: 'k' }, {
+        lookup: async () => [{ address: '93.184.216.34', family: 4 }],
+        fetch: async () => pdfResponse(new TextEncoder().encode('%PDF-1.4')),
+        // 注意用 `{}` 而不是 `undefined`：`hooks.pdf ?? defaultNetwork.pdf` 会把 undefined
+        // 换成真的读取器，用例就测不到这个守卫了（审查 P1-4）。
+        pdf: {},
+    });
+    await assert.rejects(() => access.fetch('https://a.example.com/x.pdf'), (error) => {
+        assert.equal(error.code, 'OFFICE_WEB_PDF_ENGINE');
+        assert.equal(webFailureKind(error), 'config');
+        assert.match(error.message, /没有可用的抽取通道/, '要断言守卫自己的话，别靠 pdftotext|PyMuPDF 碰巧命中');
+        return true;
+    });
+});
+
+await check('取正文：标着 PDF 但内容不是 PDF（HTML 错误页）按「不支持的类型」报', async () => {
+    const access = createWebAccess(cordisLikeCtx({}), { apiKey: 'k' }, {
+        lookup: async () => [{ address: '93.184.216.34', family: 4 }],
+        fetch: async () => ({
+            status: 200,
+            headers: { get: (name) => (name === 'content-type' ? 'application/octet-stream' : null) },
+            body: {
+                getReader() {
+                    let sent = false;
+                    const bytes = new TextEncoder().encode('<!doctype html><title>404</title>');
+                    return {
+                        async read() {
+                            if (sent) return { done: true, value: undefined };
+                            sent = true;
+                            return { done: false, value: bytes };
+                        },
+                        async cancel() {},
+                    };
+                },
+            },
+        }),
+        pdf: { async text() { throw new Error('不是 PDF，不该走到抽取'); } },
+    });
+    await assert.rejects(() => access.fetch('https://a.example.com/error.pdf'), (error) => {
+        assert.equal(error.code, 'OFFICE_WEB_UNSUPPORTED_TYPE');
+        assert.match(error.message, /内容却不是 PDF/);
+        return true;
+    });
+});
+
+await check('取正文：抽取器抛错时归类为「配置缺失」并带上原因', async () => {
+    const access = createWebAccess(cordisLikeCtx({}), { apiKey: 'k' }, {
+        lookup: async () => [{ address: '93.184.216.34', family: 4 }],
+        fetch: async () => pdfResponse(new TextEncoder().encode('%PDF-1.4')),
+        pdf: { async text() { throw new Error('抽文本失败（可用引擎：无）：没有引擎'); } },
+    });
+    await assert.rejects(() => access.fetch('https://a.example.com/x.pdf'), (error) => {
+        assert.equal(error.code, 'OFFICE_WEB_PDF_ENGINE');
+        assert.match(error.message, /可用引擎：无/);
+        return true;
+    });
+});
+
+await check('取正文：PDF 文本很短时给提醒（不判失败），响应体为空时明确报「没拿到结果」', async () => {
+    const access = createWebAccess(cordisLikeCtx({}), { apiKey: 'k' }, {
+        lookup: async () => [{ address: '93.184.216.34', family: 4 }],
+        fetch: async () => pdfResponse(new TextEncoder().encode('%PDF-1.4')),
+        pdf: { async text() { return { text: '封面', pages: 1, extractor: 'stub' }; } },
+    });
+    const page = await access.fetch('https://a.example.com/cover.pdf');
+    assert.match(page.notice, /文本很短（2 字符）/, '短文本只提醒，不当失败');
+    assert.equal(page.content, '封面');
+
+    const empty = createWebAccess(cordisLikeCtx({}), { apiKey: 'k' }, {
+        lookup: async () => [{ address: '93.184.216.34', family: 4 }],
+        fetch: async () => pdfResponse(new Uint8Array(0)),
+        pdf: { async text() { throw new Error('空响应体不该走到抽取'); } },
+    });
+    await assert.rejects(() => empty.fetch('https://a.example.com/empty.pdf'), (error) => {
+        assert.equal(error.code, 'OFFICE_WEB_EMPTY');
+        assert.match(error.message, /响应体是空的/);
+        return true;
+    });
+});
+
 // ── 配置收敛 ──────────────────────────────────────────────────────────────
 
 await check('内置检索配置在安全区间内收敛，坏值退回默认', () => {
@@ -728,6 +938,12 @@ await check('内置检索配置在安全区间内收敛，坏值退回默认', (
     assert.equal(options.searchTimeoutMs, 60_000, '解析不出来的退回默认');
     assert.equal(options.baseURL, 'https://x.example.com/v1', '末尾斜杠要去掉，避免拼出 //messages');
     assert.equal(options.apiKeyEnv, 'K');
+    // 第二十九轮：PDF 两项也要收敛（1 MB 下限 / 128 MB 上限 / 500 页上限）。
+    const pdf = resolveBuiltinOptions({ pdfMaxBytes: 1, pdfMaxPages: 9_999 });
+    assert.equal(pdf.pdfMaxBytes, 1024 * 1024, '低于下限抬到 1 MB');
+    assert.equal(pdf.pdfMaxPages, 500, '超上限夹到 500 页');
+    assert.equal(resolveBuiltinOptions({}).pdfMaxBytes, 24 * 1024 * 1024, '默认 24 MB');
+    assert.equal(resolveBuiltinOptions({}).pdfMaxPages, 30, '默认 30 页');
 });
 
 // ── 收尾 ──────────────────────────────────────────────────────────────────

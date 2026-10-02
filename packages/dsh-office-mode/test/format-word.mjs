@@ -135,7 +135,13 @@ function buildSample(env) {
         .para('旧标题：待改样式')
         // 公式：一条块级（无编号）+ 一段行内混排，主样例也要覆盖到
         .formula('\\frac{a+b}{c}')
-        .para([{ text: '行内公式混排：' }, { math: 'E = mc^2' }, { text: ' 与普通文本同段。' }]);
+        .para([{ text: '行内公式混排：' }, { math: 'E = mc^2' }, { text: ' 与普通文本同段。' }])
+        // 标题过长告警（第十八轮 V10 / P0-6）：43 个汉字在 12.5pt 的版心里放不下，
+        // 必须报出来；下面那条 16 字的标题刚刚好放得下，**不能**报（旧实现只按
+        // 「>40 字」判，这两条都测不出来）。
+        .heading('这是一个用于验证标题过长告警的标题它在版心里放不下会折行并且这里再补几个字刚好超过一行', 3)
+        .para('上面那条标题应当触发「放不下」告警，这一段的正文不受影响。')
+        .heading('这个标题刚刚好放得下不会触发告警', 3);
 
     return builder;
 }
@@ -641,7 +647,8 @@ checkEqual(draft.bytes, bytes.length, '同一 builder 二次保存的字节数�
 check(env.exists('word-draft.docx'), 'save(显式路径) 没有落盘');
 
 // stats 必须来自真实解析：逐条核对可数的东西
-checkEqual(report.stats.headings, 6, 'stats.headings');
+// 8 = 原样例 6 条 + 本轮为「标题过长告警」加的长短各一条
+checkEqual(report.stats.headings, 8, 'stats.headings');
 checkEqual(report.stats.tables, 1, 'stats.tables');
 checkEqual(report.stats.images, 2, 'stats.images');
 checkEqual(report.stats.listItems, 3 + 3 + 2, 'stats.listItems（无序 3 + 有序 3 + 附录 2 步）');
@@ -658,6 +665,17 @@ const warningText = report.warnings.join('\n');
 check(/未分段（超过 500 字）/.test(warningText), '缺少「正文过长」告警', warningText);
 check(/标题层级跳跃/.test(warningText), '缺少「标题层级跳跃」告警', warningText);
 check(/超出版心/.test(warningText), '缺少「图片超出版心」告警', warningText);
+
+// 标题过长告警（第十八轮 V10 / P0-6）：判据是「按字号与版心真的放不下」，不是「超过 40 字」。
+// 上面那条 43 字的标题在 12.5pt 下折两行，必须报；16 字那条放得下，不能报。
+// 报出来的话要能直接照做：说清字号、版心宽与「压到几个字以内」。
+check(/放不下（约折 2 行）/.test(warningText), '长标题没有报「放不下」', warningText);
+check(/12\.5pt 字号在 \d+pt 版心里放不下/.test(warningText), '标题告警里没有字号与版心宽', warningText);
+check(/压到 \d+ 字以内/.test(warningText), '标题告警里没有「压到几个字以内」', warningText);
+const LONG_HEADING = '这是一个用于验证标题过长告警的标题它在版心里放不下会折行并且这里再补几个字刚好超过一行';
+const FIT_HEADING = '这个标题刚刚好放得下不会触发告警';
+check(warningText.includes(LONG_HEADING.slice(0, 18)), '标题告警原文里没有那条长标题', warningText);
+check(!warningText.includes(FIT_HEADING.slice(0, 18)), '放得下的标题不该被报成折行', warningText);
 
 // outline 结构
 const outlineText = report.outline.join('\n');
@@ -707,7 +725,7 @@ checkEqual(editReport.skipped.length, 3, 'skipped 操作数（find 未命中 / a
 check(editReport.skipped.some((item) => /找不到/.test(item.reason)), 'skipped 应说明 find 未命中');
 check(editReport.skipped.some((item) => /append\.type/.test(item.reason)), 'skipped 应说明 append.type 非法');
 check(editReport.skipped.some((item) => /未知操作/.test(item.reason)), 'skipped 应说明未知操作');
-checkEqual(editReport.stats.headings, 8, 'setStyle + append heading 后标题数应为 8');
+checkEqual(editReport.stats.headings, 10, 'setStyle + append heading 后标题数应为 10');
 checkEqual(editReport.stats.tables, 2, 'append 表格后应有两个表格');
 checkEqual(editReport.stats.listItems, 8 + 2, 'append 列表后 listItems 应 +2');
 
@@ -917,6 +935,12 @@ check(descendants(formulaBody, 'm:r').length > 20, '公式里应该有大量 m:r
     checkEqual(text, 'a\\foobarb\\constructorc\\foobard', '未知命令应原样输出');
     checkEqual(formulaReport.warnings.filter((line) => line.includes('\\foobar')).length, 1, '未知命令应按命令去重，只报一次');
     checkEqual(formulaReport.warnings.filter((line) => line.includes('\\constructor')).length, 1, '\\constructor 应被当成未知命令，而不是命中原型链上的成员');
+    // 第四十八轮 P0-1：这两条是「公式没写成公式」的确定性标记，且必须双写 env.warn ——
+    // office_run 顶层的 warnings 只收 env.warnings，只放进 report 的返回值等于没报
+    check(formulaReport.stats.formulaErrors >= 1,
+        `stats.formulaErrors 应数出含未知命令的段落，实际 ${formulaReport.stats.formulaErrors}`);
+    check(env.warnings.some((line) => line.startsWith('word：') && line.includes('未识别的命令')),
+        `构建期警告要双写 env.warn：${env.warnings.join(' / ')}`);
 }
 // 12b) 显式空格：\, \; \: \quad \qquad 各自对应一个不可见空格字符，\! 是负空格（吞掉）
 {
@@ -937,6 +961,7 @@ check(descendants(formulaBody, 'm:r').length > 20, '公式里应该有大量 m:r
 {
     const formulaRead = read('word-formula.docx', env);
     checkEqual(formulaRead.stats.formulas, formulaReport.stats.formulas, 'read() 的 stats.formulas');
+    checkEqual(formulaRead.stats.formulaErrors, formulaReport.stats.formulaErrors, 'read() 与 create() 的 stats.formulaErrors 同口径');
     checkEqual(JSON.stringify(formulaRead.outline), JSON.stringify(formulaReport.outline), 'read() 的 outline 应与 create() 一致');
 }
 

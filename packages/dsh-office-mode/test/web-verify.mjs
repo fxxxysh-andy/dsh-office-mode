@@ -631,6 +631,159 @@ async function main() {
         })()`);
         log(`设置页控件：${JSON.stringify(findings.dom.settings.controls)}`);
         await shot('settings-office.png');
+
+        // ── 第三十五轮：设置页的分组折叠与「定位」 ──
+        //
+        // 这一段量三件事，都是单测量不到的：
+        //   1) 默认收起是不是**真的**收起（组体内的控件 offsetParent 为 null、
+        //      组体 display:none），而不是只写了个属性；
+        //   2) 「定位」框在真实 React 受控输入下过滤得对不对 —— 用原生 value setter
+        //      + input 事件，而不是直接改 .value（那样 React 的 onChange 不触发）；
+        //   3) 定位条 sticky 有没有生效（设置页展开后这一页很长，输入框得跟着留）。
+        log('\n── 第三十五轮：设置页分组折叠与定位 ──');
+        // 以定位条所在的那个 section 为范围：设置对话框里还有别的插件页面。
+        const OFFICE_ROOT = `document.querySelector('[data-locator="office"]').parentElement`;
+        const readOffice = () => evaluate(`(() => {
+            const root = ${OFFICE_ROOT};
+            if (!root) return null;
+            const bar = root.querySelector('[data-locator="office"]');
+            return {
+                groups: Array.from(root.querySelectorAll('[data-group]')).map((el) => {
+                    const body = el.querySelector('[data-group-body]');
+                    return {
+                        id: el.getAttribute('data-group'),
+                        open: el.getAttribute('data-group-open'),
+                        head: (() => { const b = el.querySelector('[data-group-toggle]'); return b ? (b.innerText || '').replace(/\\s+/g, ' ').trim() : null; })(),
+                        bodyDisplay: body ? getComputedStyle(body).display : null,
+                        controls: body ? body.querySelectorAll('input,select,textarea').length : 0,
+                        visibleControls: body ? Array.from(body.querySelectorAll('input,select,textarea')).filter((el) => el.offsetParent !== null).length : 0,
+                    };
+                }),
+                stats: bar && bar.querySelector('[data-locator-stats]') ? bar.querySelector('[data-locator-stats]').innerText.trim() : null,
+                storage: (() => { try { return window.localStorage.getItem('dsh-office-mode.groups.office'); } catch (e) { return 'storage-unavailable'; } })(),
+            };
+        })()`);
+        /** 受控输入：必须走原生 setter + input 事件，直接改 .value 不会触发 React 的 onChange。 */
+        const typeLocator = (page, text) => evaluate(`(() => {
+            const input = document.querySelector('[data-locator-input="${page}"]');
+            if (!input) return null;
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            setter.call(input, ${JSON.stringify(text)});
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            return input.value;
+        })()`);
+
+        findings.dom.round35 = {};
+        findings.dom.round35.collapsed = await readOffice();
+        log(`默认态：${JSON.stringify(findings.dom.round35.collapsed)}`);
+
+        // 点开「检索编排」，量展开真的发生（组体不再 display:none、控件可见）
+        findings.dom.round35.expandClick = await evaluate(`(() => {
+            const t = document.querySelector('[data-group-toggle="search"]');
+            if (!t) return false;
+            t.click();
+            return true;
+        })()`);
+        await sleep(700);
+        findings.dom.round35.afterExpand = await readOffice();
+
+        // 全部展开 → 量 sticky（页面被撑长之后）
+        await evaluate(`(() => { const b = document.querySelector('[data-groups-expand="office"]'); if (b) b.click(); return !!b; })()`);
+        await sleep(900);
+        findings.dom.round35.allExpanded = await readOffice();
+        findings.dom.round35.sticky = await evaluate(`(() => {
+            const bar = document.querySelector('[data-locator="office"]');
+            if (!bar) return null;
+            let scroller = bar.parentElement;
+            while (scroller && scroller !== document.body) {
+                const style = getComputedStyle(scroller);
+                if ((style.overflowY === 'auto' || style.overflowY === 'scroll') && scroller.scrollHeight > scroller.clientHeight + 4) break;
+                scroller = scroller.parentElement;
+            }
+            if (!scroller || scroller === document.body) return { found: false, position: getComputedStyle(bar).position };
+            const topBefore = Math.round(bar.getBoundingClientRect().top - scroller.getBoundingClientRect().top);
+            const previous = scroller.scrollTop;
+            scroller.scrollTop = 320;
+            const scrolled = scroller.scrollTop;
+            const topAfter = Math.round(bar.getBoundingClientRect().top - scroller.getBoundingClientRect().top);
+            scroller.scrollTop = previous;
+            return { found: true, position: getComputedStyle(bar).position, topBefore, topAfter, scrolled,
+                     stuck: Math.abs(topAfter - topBefore) <= 2 };
+        })()`);
+        log(`sticky：${JSON.stringify(findings.dom.round35.sticky)}`);
+        await shot('settings-office-groups.png');
+
+        // 定位：一个词命中一行
+        findings.dom.round35.typed = await typeLocator('office', '出口代理');
+        await sleep(700);
+        findings.dom.round35.located = await evaluate(`(() => {
+            const root = ${OFFICE_ROOT};
+            if (!root) return null;
+            return {
+                groups: Array.from(root.querySelectorAll('[data-group]')).map((el) => el.getAttribute('data-group')),
+                rows: Array.from(root.querySelectorAll('[data-group-body]')).map((body) => Array.from(body.querySelectorAll('input,select')).length),
+                hasProxyRow: (root.innerText || '').includes('出口代理'),
+                hasChannelRow: (root.innerText || '').includes('联网通道'),
+                stats: (() => { const el = root.querySelector('[data-locator-stats]'); return el ? el.innerText.trim() : null; })(),
+            };
+        })()`);
+        log(`定位「出口代理」：${JSON.stringify(findings.dom.round35.located)}`);
+
+        // 定位：命中折在 Fold 里的高级参数 → 折叠块要自动展开
+        await typeLocator('office', 'search.providers.anthropic.timeoutMs');
+        await sleep(700);
+        findings.dom.round35.locatedInFold = await evaluate(`(() => {
+            const root = ${OFFICE_ROOT};
+            const body = root ? root.querySelector('[data-fold-body="search-advanced"]') : null;
+            return {
+                stats: (() => { const el = root.querySelector('[data-locator-stats]'); return el ? el.innerText.trim() : null; })(),
+                foldBodyDisplay: body ? getComputedStyle(body).display : null,
+                foldToggleExpanded: (() => { const t = root.querySelector('[data-fold-toggle="search-advanced"]'); return t ? t.getAttribute('aria-expanded') : null; })(),
+                hasProxyRow: (root.innerText || '').includes('出口代理'),
+            };
+        })()`);
+        log(`定位高级参数：${JSON.stringify(findings.dom.round35.locatedInFold)}`);
+        await shot('settings-office-locate.png');
+
+        // 定位：没有命中时的提示；清空后回到全量 + 全部收起
+        await typeLocator('office', 'zzz-没有这一项');
+        await sleep(600);
+        findings.dom.round35.noHit = await evaluate(`(() => {
+            const root = ${OFFICE_ROOT};
+            const groups = Array.from(root.querySelectorAll('[data-group]')).map((el) => el.getAttribute('data-group'));
+            const el = root.querySelector('[data-locator-stats]');
+            return { groups, stats: el ? el.innerText.trim() : null };
+        })()`);
+        await typeLocator('office', '');
+        await sleep(600);
+        await evaluate(`(() => { const b = document.querySelector('[data-groups-collapse="office"]'); if (b) b.click(); return !!b; })()`);
+        await sleep(700);
+        findings.dom.round35.cleared = await readOffice();
+        log(`没有命中：${JSON.stringify(findings.dom.round35.noHit)}`);
+        log(`清空 + 全部收起后：${JSON.stringify({ groups: findings.dom.round35.cleared.groups, stats: findings.dom.round35.cleared.stats, storage: findings.dom.round35.cleared.storage })}`);
+
+        // 记忆系统页：同一套骨架（定位框按页分开）
+        await evaluate(`(() => {
+            const item = Array.from(document.querySelectorAll('button,[role="tab"],[role="button"]')).find((e) => (e.innerText || '').trim() === '记忆系统');
+            if (!item) return false;
+            item.click();
+            return true;
+        })()`);
+        await sleep(1000);
+        findings.dom.round35.memoryPage = await evaluate(`(() => {
+            const bar = document.querySelector('[data-locator="memory"]');
+            if (!bar) return null;
+            const root = bar.parentElement;
+            return {
+                groups: Array.from(root.querySelectorAll('[data-group]')).map((el) => el.getAttribute('data-group')),
+                open: Array.from(root.querySelectorAll('[data-group]')).map((el) => el.getAttribute('data-group-open')),
+                stats: bar.querySelector('[data-locator-stats]') ? bar.querySelector('[data-locator-stats]').innerText.trim() : null,
+                storage: (() => { try { return window.localStorage.getItem('dsh-office-mode.groups.memory'); } catch (e) { return 'storage-unavailable'; } })(),
+            };
+        })()`);
+        log(`记忆系统页：${JSON.stringify(findings.dom.round35.memoryPage)}`);
+        await shot('settings-memory-groups.png');
+
         ws.close();
     } finally {
         killTree(chrome);
@@ -678,6 +831,18 @@ async function main() {
     log(`设置页字号与控件：${JSON.stringify(findings.dom.settings && findings.dom.settings.controls)}`);
     log(`折叠块：${findings.dom.settings && findings.dom.settings.foldBefore} →（点 ${findings.dom.settings && findings.dom.settings.foldClick}）→ ${findings.dom.settings && findings.dom.settings.foldAfter}`);
     log(`折叠块里的控件：${JSON.stringify(findings.dom.settings && findings.dom.settings.foldBodyRows)}`);
+    log('── 第三十五轮：分组折叠与定位 ──');
+    const r35 = findings.dom.round35 || {};
+    log(`默认态（每组：开合 / 组体 display / 控件数 / 可见控件数）：${JSON.stringify(r35.collapsed && r35.collapsed.groups)}`);
+    log(`定位状态行：${JSON.stringify(r35.collapsed && r35.collapsed.stats)}`);
+    log(`点开「检索编排」后：${JSON.stringify(r35.afterExpand && r35.afterExpand.groups)}`);
+    log(`全部展开后：${JSON.stringify(r35.allExpanded && r35.allExpanded.groups)}`);
+    log(`定位条 sticky：${JSON.stringify(r35.sticky)}`);
+    log(`定位「出口代理」：${JSON.stringify(r35.located)}`);
+    log(`定位折在 Fold 里的高级参数：${JSON.stringify(r35.locatedInFold)}`);
+    log(`没有命中：${JSON.stringify(r35.noHit)}`);
+    log(`清空 + 全部收起后：${JSON.stringify(r35.cleared && r35.cleared.groups)}（localStorage：${JSON.stringify(r35.cleared && r35.cleared.storage)}）`);
+    log(`记忆系统页：${JSON.stringify(r35.memoryPage)}`);
     log(`面板正文：\n${String(findings.dom.panelText).slice(0, 1200)}`);
     log(`详情写到 ${outFile}`);
 }

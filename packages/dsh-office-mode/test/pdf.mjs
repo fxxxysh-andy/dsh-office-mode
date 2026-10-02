@@ -19,6 +19,7 @@ import assert from 'node:assert/strict';
 import { createCache } from '../src/engine/cache.js';
 import { createEnv } from '../src/engine/kit.js';
 import { pdfEngines, pdfInfo, pdfPages, pdfText, probePdfEngines } from '../src/pdf.js';
+import { defaultPdfReader } from '../src/web.js';
 import { resolveConfig } from '../src/config.js';
 import { executeRun } from '../src/run.js';
 import { renderRun } from '../src/tools.js';
@@ -124,6 +125,19 @@ await check('pdf：抽文本（文本型）', async () => {
     assert.equal(value.chars > 0, true, `chars=${value.chars}`);
     assert.match(readFileSync(join(root, 'raw.md'), 'utf8'), /Page One Hello/);
     assert.equal(value.path, 'raw.md');
+});
+
+await check('pdf：取正文用的那个读取器在真实引擎上跑得通（第二十九轮）', async () => {
+    // 这条守的是 web.js 里 defaultPdfReader 的 env 垫片：pdfText 除了 env.resolve 还会用
+    // env.root（displayPath 要它），少一个就在「真的抽一份 PDF」时炸成 TypeError ——
+    // 注入假读取器的单测看不出这一点，所以这里用真文件、真引擎跑一次。
+    const engines = await pdfEngines();
+    if (!engines.text.includes('pdftotext') && !engines.text.includes('fitz')) skip('本机没有抽文本引擎');
+    const value = await defaultPdfReader.text(textPdf, { maxPages: 1 });
+    assert.equal(value.extractor === 'pdftotext' || value.extractor === 'fitz', true, `engine=${value.extractor}`);
+    assert.match(value.text, /Page One Hello/);
+    assert.equal(value.pages, 1, 'maxPages 传 1 时只抽一页');
+    assert.equal(typeof value.hint, 'string');
 });
 
 await check('pdf：渲染页面并复用（缓存命中）', async () => {

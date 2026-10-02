@@ -25,6 +25,7 @@ import { resolveConfig } from '../src/config.js';
 import { executeRun } from '../src/run.js';
 import { runPdfProcess } from '../src/pdf.js';
 import {
+    AV_CHUNK_OVERLAP_SECONDS,
     AV_ERROR_CODES,
     avSettings,
     canonicalizeWav,
@@ -35,6 +36,7 @@ import {
     planFrameTimes,
     probeAv,
     resetAvProbe,
+    resolveChunkBoundary,
 } from '../src/av.js';
 
 const results = [];
@@ -145,11 +147,161 @@ await check('canonicalizeWav：不是 16 kHz 单声道 PCM16 时明确报错（�
 // ── 2. 纯函数：分块 / 抽帧时间点 / 拼接 / 时间戳 ──────────────────────────────
 
 await check('planChunks：按块切分并覆盖到尾（最后一块可以更短）', () => {
-    const chunks = planChunks(250, 120);
+    // 第三十一轮起每块多两个量：ownedEnd 是这块自己出稿的末尾，end 是喂给 VAD 的
+    // 窗口末尾（比 ownedEnd 多出 overlapSeconds 的重叠）。
+    const chunks = planChunks(250, 120, 0);
     assert.deepEqual(chunks.map((item) => [item.start, item.end]), [[0, 120], [120, 240], [240, 250]]);
     assert.equal(chunks.length, 3);
-    assert.deepEqual(planChunks(0, 120), [{ index: 0, start: 0, end: 0, seconds: 0 }]);
+    assert.deepEqual(chunks.map((item) => item.ownedEnd), [120, 240, 250]);
+    assert.deepEqual(planChunks(0, 120), [{ index: 0, start: 0, end: 0, ownedEnd: 0, seconds: 0, ownedSeconds: 0 }]);
     return '250 秒 → 3 块';
+});
+
+await check('planChunks：相邻块有重叠，自有区间无缝铺满且最后一块截到总长', () => {
+    const overlap = AV_CHUNK_OVERLAP_SECONDS;
+    assert.equal(overlap, 0.5);
+    const chunks = planChunks(250, 120);
+    assert.deepEqual(chunks.map((item) => [item.start, item.end]), [[0, 120.5], [120, 240.5], [240, 250]]);
+    // 不变量一：自有区间 [start, ownedEnd) 首尾相接、无缝、不重叠 —— 每段音频都有人负责
+    for (let i = 1; i < chunks.length; i += 1) {
+        assert.equal(chunks[i].start, chunks[i - 1].ownedEnd, `第 ${i} 块的自有区间没接上前一块`);
+    }
+    assert.equal(chunks[0].start, 0);
+    assert.equal(chunks[chunks.length - 1].ownedEnd, 250);
+    // 不变量二：每一处内部切点都被两块同时覆盖（这就是「一个音不会被切开」的来源）
+    for (let i = 1; i < chunks.length; i += 1) {
+        assert.ok(chunks[i - 1].end > chunks[i].start, `第 ${i} 处切点没有重叠`);
+        assert.equal(chunks[i - 1].end - chunks[i].start, overlap, `第 ${i} 处重叠不等于 ${overlap}`);
+    }
+    // 不变量三：最后一块没有下一块，重叠自然截到总长
+    assert.equal(chunks[chunks.length - 1].end, 250);
+    // 重叠 0 时退化成「完全切开」（老行为），接口仍然成立
+    const none = planChunks(30, 10, 0);
+    assert.deepEqual(none.map((item) => item.end - item.ownedEnd), [0, 0, 0]);
+    return `250 秒 / 120 秒块 / 重叠 ${overlap} → ${chunks.length} 块`;
+});
+
+/**
+ * 分块的边界契约（第三十一轮的核心断言）。
+ *
+ * 这一份测的不是「分块算术」，而是**不丢字、不重复**：把「真相句子」按窗口裁剪来
+ * 模拟 VAD 在每个窗口里独立跑（VAD 在窗口起点会从窗口开头起算、在窗口末尾会被
+ * 截断），再跑 worker 的那套循环，最后比对逐字稿里的区间与真相是否一致。
+ *
+ * 没有它的话，「加了重叠」这件事只能靠听一段真实录音来判断，而那种验证既不可复现，
+ * 也盖不到「一句话正好跨在切点上」这种低频情形 —— 那正是这一轮要修的东西。
+ */
+function simulateChunks(truth, total, chunkSeconds, overlapSeconds) {
+    const kept = [];
+    let base = 0;
+    let emittedUntil = 0;
+    let guard = 0;
+    while (base < total - 1e-9) {
+        guard += 1;
+        assert.ok(guard < 4000, '分块循环没有前进（死循环）');
+        const ownedEnd = Math.min(total, base + chunkSeconds);
+        const winEnd = Math.min(total, ownedEnd + overlapSeconds);
+        const raw = truth
+            .filter((item) => item.end > base + 1e-9 && item.start < winEnd - 1e-9)
+            .map((item) => ({ start: Math.max(item.start, base), end: Math.min(item.end, winEnd) }));
+        const decision = resolveChunkBoundary({ base, ownedEnd, winEnd, total, raw, emittedUntil });
+        for (const index of decision.keep) {
+            kept.push(raw[index]);
+            emittedUntil = Math.max(emittedUntil, raw[index].end);
+        }
+        base = decision.nextBase;
+    }
+    // 碎屑不算：VAD 按 512 样本（32 ms）切帧，几十毫秒的片段在真实链路上解不出
+    // 任何文字（worker 里 text === '' 的结果直接丢掉）。
+    return kept.filter((item) => item.end - item.start >= 0.05);
+}
+
+/** 一个确定性伪随机数（测试要可复现，不能用 Math.random）。 */
+function makeRandom(seed = 12345) {
+    let state = seed;
+    return () => {
+        state = (state * 1103515245 + 12345) % 2147483648;
+        return state / 2147483648;
+    };
+}
+
+await check('分块边界：切点上的话不会被切成两半，也不会重复出稿（随机扫描）', () => {
+    const random = makeRandom();
+    let cases = 0;
+    let lostTotal = 0;
+    let duplicatedTotal = 0;
+    for (let round = 0; round < 1500; round += 1) {
+        const total = 5 + Math.floor(random() * 400);
+        const chunkSeconds = [10, 30, 120][Math.floor(random() * 3)];
+        const overlapSeconds = [0, 0.2, 0.5, 1, 3][Math.floor(random() * 5)];
+        // 真相句子不超过单块秒数：worker 把 VAD 的单句上限夹到不超过单块，
+        // 所以「一句话装不进任何窗口」在真实链路上不该出现。
+        const maxLen = Math.min(30, chunkSeconds);
+        const truth = [];
+        let cursor = random() * 2;
+        while (cursor < total) {
+            const end = Math.min(total, cursor + 0.3 + random() * (maxLen - 0.3));
+            truth.push({ start: Math.round(cursor * 1000) / 1000, end: Math.round(end * 1000) / 1000 });
+            cursor = end + random() * 1.5;
+        }
+        const kept = simulateChunks(truth, total, chunkSeconds, overlapSeconds);
+        cases += 1;
+        // 不丢字：每条真相句子的中间段（去掉两端 50 ms）都要被保留区间盖住
+        for (const item of truth) {
+            const inner = Math.max(0, item.end - item.start - 0.1);
+            let covered = 0;
+            for (const piece of kept) {
+                covered += Math.max(0, Math.min(piece.end, item.end - 0.05) - Math.max(piece.start, item.start + 0.05));
+            }
+            lostTotal += Math.max(0, inner - covered - 0.02);
+        }
+        // 不重复：保留的总时长不能超过真相总时长（每条留 20 ms 的取整余量）
+        const keptTotal = kept.reduce((sum, item) => sum + (item.end - item.start), 0);
+        const truthTotal = truth.reduce((sum, item) => sum + (item.end - item.start), 0);
+        duplicatedTotal += Math.max(0, keptTotal - truthTotal - 0.02 * truth.length);
+        // 顺序：保留的句子按时间递增，互不重叠
+        for (let i = 1; i < kept.length; i += 1) {
+            assert.ok(kept[i].start >= kept[i - 1].end - 0.05, `第 ${round} 组：保留的句子重叠了`);
+        }
+    }
+    assert.ok(lostTotal < 0.01, `${cases} 组里丢了 ${lostTotal.toFixed(3)} 秒语音`);
+    assert.ok(duplicatedTotal < 0.01, `${cases} 组里多出 ${duplicatedTotal.toFixed(3)} 秒（重复出稿）`);
+    return `${cases} 组随机用例：丢字 ${lostTotal.toFixed(3)}s / 重复 ${duplicatedTotal.toFixed(3)}s`;
+});
+
+await check('分块边界：跨在切点上的那句话被整句解出（重叠区里一句、重叠区外一句）', () => {
+    // 一句 8→13 秒的话，块长 10 秒：切点正好落在句子中间。
+    // 重叠 0.5 秒时，它结束在 13 秒 —— 超出切点 3 秒，靠重叠盖不住，走边界回退。
+    const deep = simulateChunks([{ start: 8, end: 13 }], 30, 10, 0.5);
+    assert.deepEqual(deep, [{ start: 8, end: 13 }], '跨得比重叠深的一句要被整句解出（不能断成两半）');
+    // 重叠 0 时同样不能断成两半 —— 回退规则自己就能兜住，重叠只是减少回退次数
+    const none = simulateChunks([{ start: 8, end: 13 }], 30, 10, 0);
+    assert.deepEqual(none, [{ start: 8, end: 13 }], '没有重叠时也不许把这句切成两半');
+    // 结束点正好落在重叠区里：这一块自己就能解完，不必回退（这正是重叠买到的效果）
+    const shallow = simulateChunks([{ start: 5, end: 10.3 }], 30, 10, 0.5);
+    assert.deepEqual(shallow, [{ start: 5, end: 10.3 }]);
+    // 边界上不出重复：上一块已经报过的尾巴，下一块不许再报一次
+    const decision = resolveChunkBoundary({
+        base: 10,
+        ownedEnd: 20,
+        winEnd: 20.5,
+        total: 30,
+        raw: [{ start: 10, end: 20.5 }],
+        emittedUntil: 20.5,
+    });
+    assert.deepEqual(decision.keep, [], '整条都在水位线之前时不许再出稿');
+    // 前半截出过稿、后半截还没：下一块挪到水位线上接着解（不重复、也不丢后半截）
+    const straddle = resolveChunkBoundary({
+        base: 10,
+        ownedEnd: 20,
+        winEnd: 20.5,
+        total: 30,
+        raw: [{ start: 10, end: 20.5 }],
+        emittedUntil: 20.2,
+    });
+    assert.deepEqual(straddle.keep, []);
+    assert.equal(straddle.nextBase, 20.2, '下一块要从水位线接着解');
+    return `深跨 ${JSON.stringify(deep)} / 浅跨 ${JSON.stringify(shallow)}`;
 });
 
 await check('planFrameTimes：at > every > count，且 from/to 能限制区间', () => {
@@ -187,6 +339,7 @@ await check('avSettings：默认值来自「设备上本来就有」，坏值在
     assert.equal(settings.enabled, true);
     assert.equal(settings.language, 'auto');
     assert.equal(settings.chunkSeconds, 120);
+    assert.equal(settings.overlapSeconds, AV_CHUNK_OVERLAP_SECONDS);
     assert.equal(settings.maxSeconds, 3600);
     assert.equal(settings.precision, 'int8');
     assert.ok(settings.modelDir.includes('speech-to-text'), '默认模型目录要指向语音输入下载的那份');
@@ -195,6 +348,10 @@ await check('avSettings：默认值来自「设备上本来就有」，坏值在
     assert.equal(clamped.language, 'auto');
     assert.equal(clamped.precision, 'int8');
     assert.equal(clamped.threads, 16);
+    // 重叠上限是半块：超过就不是重叠，而是同一段音频解两遍（重叠区里的话会被报两次）
+    assert.equal(avSettings({ av: { chunkSeconds: 10, overlapSeconds: 30 } }).overlapSeconds, 5);
+    assert.equal(avSettings({ av: { overlapSeconds: -1 } }).overlapSeconds, 0);
+    assert.equal(avSettings({ av: { overlapSeconds: 2 } }).overlapSeconds, 2);
     return `模型目录 ${settings.modelDir}`;
 });
 
@@ -227,7 +384,7 @@ await check('SDK 面在：office.av.check() 经 office_run 拿得到能力清单
     assert.equal(result.ok, true, result.error?.message);
     const value = result.returned;
     assert.ok(value !== null && typeof value === 'object', 'office.av.check 要有返回值');
-    for (const key of ['available', 'missing', 'ffmpeg', 'ffprobe', 'sensevoice', 'chunkSeconds', 'maxSeconds', 'maxFrames', 'hint']) {
+    for (const key of ['available', 'missing', 'ffmpeg', 'ffprobe', 'sensevoice', 'chunkSeconds', 'overlapSeconds', 'maxSeconds', 'maxFrames', 'hint']) {
         assert.ok(Object.prototype.hasOwnProperty.call(value, key), `check() 缺少 ${key}`);
     }
     assert.ok(Array.isArray(value.missing), 'missing 要是数组');
@@ -295,6 +452,23 @@ if (!ready) {
         assert.equal(typeof value.text, 'string');
         assert.ok(value.model.includes('SenseVoice'), `模型名异常：${value.model}`);
         return `语音 ${value.audioSeconds}s / ${value.segmentCount} 句 / 推理 ${value.inferenceSeconds}s`;
+    });
+
+    await check('office.av.transcribe：多块 + 重叠真的跑起来（块数、重叠与水位线都回报）', async () => {
+        // 24 秒的纯音：VAD 一句都不出，于是每块走「退回整段解码」那条路 ——
+        // 正好把多块循环、重叠窗口与水位线（不许重复解同一段）都走一遍。
+        const long = join(mediaDir, 'long.mp3');
+        const made = await runFfmpeg(['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'sine=frequency=330:duration=24', '-ac', '1', '-ar', '16000', '-c:a', 'libmp3lame', long]);
+        assert.equal(made.code, 0, `造长音频失败：${made.err}`);
+        const result = await runScript(`return await office.av.transcribe(${JSON.stringify(long)}, { language: 'zh', chunkSeconds: 10, overlapSeconds: 1 });`);
+        assert.equal(result.ok, true, result.error?.message);
+        const value = result.returned;
+        assert.equal(value.chunkSeconds, 10);
+        assert.equal(value.overlapSeconds, 1, 'overlapSeconds 要原样回报');
+        assert.ok(value.chunks >= 3, `24 秒按 10 秒切至少要 3 块，实际 ${value.chunks}`);
+        assert.ok(value.audioSeconds > 23.5, `解码时长异常：${value.audioSeconds}`);
+        assert.equal(typeof value.rolls, 'number');
+        return `${value.audioSeconds}s → ${value.chunks} 块（重叠 ${value.overlapSeconds}s，回退 ${value.rolls} 次）`;
     });
 
     await check('office.av.transcribe：out 落成带时间戳的 Markdown 逐字稿', async () => {

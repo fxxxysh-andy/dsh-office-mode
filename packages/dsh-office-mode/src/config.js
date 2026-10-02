@@ -4,10 +4,12 @@
  * @module dsh-office-mode/config
  */
 import { DEFAULT_THEME_ID, THEMES } from './engine/theme.js';
+import { SITE_PRIORITY_LIMITS } from './site-catalog.js';
 import { DEFAULT_PREPROCESS, PREPROCESS_MODES } from './web-preprocess.js';
 import { PROVIDER_IDS } from './web-providers.js';
 import { DEFAULT_PYTHON_OUT_DIR, DEFAULT_PYTHON_TIMEOUT_MS } from './python.js';
 import {
+    AV_CHUNK_OVERLAP_SECONDS,
     AV_CHUNK_SECONDS,
     AV_DEFAULT_FRAMES,
     AV_LANGUAGES,
@@ -20,6 +22,9 @@ import {
     DEFAULT_LEDGER_LIMIT,
     DEFAULT_MEMORY_DIR,
     DEFAULT_PROJECT_LIMIT_BYTES,
+    DEFAULT_PROJECTION_BUDGET_BYTES,
+    DEFAULT_ENTRY_HINT_BYTES,
+    DEFAULT_ENTRY_LIMIT_BYTES,
     DEFAULT_USER_LIMIT_BYTES,
     DEFAULT_LAYERS,
     DEFAULT_RECALL_QUALITY,
@@ -87,6 +92,8 @@ export const DEFAULT_TOOLS = {
     office_help: true,
     office_run: true,
     office_memory: true,
+    office_web_search: true,
+    office_web_fetch: true,
     office_search_run: true,
     office_search_brief: true,
     office_search_dispatch: true,
@@ -111,6 +118,23 @@ export const DEFAULT_MEMORY = {
     promptHint: true,
     userLimitBytes: DEFAULT_USER_LIMIT_BYTES,
     projectLimitBytes: DEFAULT_PROJECT_LIMIT_BYTES,
+    /**
+     * 一次投影里条目正文的字节上限（第四十八轮 P0-2）。0 = 不限。
+     *
+     * 热记忆的容量上限管的是「库里能放多少」，这个管的是「一次反馈里贴多少」——
+     * 两件事在旧实现里混着：本机实测全文 15,444 B，一轮 20 次调用累计 76,656 B，
+     * 是九个工具全部声明（15,451 B）的 4.96 倍。超出预算的条目不丢：折叠行报条数并给
+     * 读取入口（第三十六轮的三条纪律照旧）。
+     */
+    projectionBudgetBytes: DEFAULT_PROJECTION_BUDGET_BYTES,
+    /**
+     * 单条记忆的硬上限与建议线（第四十八轮 新-11），都是 0 = 关掉。
+     *
+     * 硬上限拒绝写入（附压缩模板），建议线只在回执里提醒。两者与容量上限是**三件不同的事**：
+     * 容量上限管「这一层能装多少」，硬上限管「一条能多长」，建议线管「多长算写歪了」。
+     */
+    entryLimitBytes: DEFAULT_ENTRY_LIMIT_BYTES,
+    entryHintBytes: DEFAULT_ENTRY_HINT_BYTES,
     ledgerLimit: DEFAULT_LEDGER_LIMIT,
     archiveKeep: DEFAULT_ARCHIVE_KEEP,
     /** 记忆层拓扑（C6）：每层独立开关，关掉不删数据。 */
@@ -142,13 +166,11 @@ export const DEFAULT_SUBAGENT_MODEL = { mode: 'inherit', provider: '', model: ''
 /**
  * 内置检索（office 自己的联网通道）的默认参数。
  *
- * 为什么需要它：办公 preset 是一份完整的组合，里面没有 @deepseek-ai/dsh-tool-web，
- * 办公会话的工具面因此没有 web_search / web_fetch，派子代理检索会整批失败
- * （tools.restrict() names unknown global tools）。内置通道优先用宿主的 web 服务
- * （ctx.web，host 层，一直在），拿不到时用这里的参数自己发 HTTP。
- *
- * 默认端点是 DeepSeek 的 Anthropic 兼容 Messages 接口 + 原生 web_search 工具，
- * 与宿主 web-search-deepseek 的默认一致；Key 默认取 DEEPSEEK_API_KEY。
+ * 为什么需要它：它让「办公会话没有宿主联网工具（preset 不声明 tool-web）」
+ * 时也能查资料 —— 这正是第三十轮起的常态。默认端点是 DeepSeek 的 Anthropic
+ * 兼容 Messages 接口 + 原生 web_search 工具，与宿主 web-search-deepseek 的
+ * 默认一致；Key 默认取 DEEPSEEK_API_KEY。它只在显式点名 anthropic 通道或把它
+ * 加回 providerOrder 时才会用到（默认顺序是免 Key 的抓取通道）。
  */
 export const DEFAULT_BUILTIN_WEB = {
     /** 字面量 Key（设置页里填的）；留空则按 apiKeyEnv 去凭据服务/环境/凭据文件里取。 */
@@ -172,6 +194,16 @@ export const DEFAULT_BUILTIN_WEB = {
     maxChars: 20_000,
     maxRedirects: 3,
     userAgent: 'dsh-office-mode/0.1 (+built-in web access)',
+    /**
+     * 取正文撞上 PDF 时的上限（第二十九轮新增）。
+     *
+     * 检索回来的来源里 PDF 很常见（学生题库、期刊与机构站点），以前这一律报
+     * 「不支持的内容类型」；现在下载后交给 office.pdf 抽文本。截断的 PDF 抽不出
+     * 东西，所以体积上限**不是截断线而是放弃线**：超了就明确说「太大，换来源」。
+     * 页数上限用来圈住抽取耗时（pdftotext / fitz 都是按页跑的）。
+     */
+    pdfMaxBytes: 24 * 1024 * 1024,
+    pdfMaxPages: 30,
 };
 
 /** 检索编排的默认参数。 */
@@ -184,8 +216,8 @@ export const DEFAULT_SEARCH = {
     fallbackOnPlatformError: true,
     /**
      * 检索的执行引擎。
-     *   auto     —— 先按老路子派子代理；组合里没有联网检索工具（办公 preset 就是
-     *               这样）或没有 subagents 服务时，自动改用插件内置的检索通道。
+     *   auto     —— 先按老路子派子代理；组合里没有联网检索工具（精简部署就是这样）
+     *               或没有 subagents 服务时，自动改用插件内置的检索通道。
      *   subagent —— 只用子代理（老行为）。
      *   builtin  —— 只用内置通道，不起子代理。
      */
@@ -197,14 +229,43 @@ export const DEFAULT_SEARCH = {
      */
     provider: 'auto',
     /**
-     * auto 时的尝试顺序。
+     * auto 时的尝试顺序（第三十轮起换主次）。
      *
-     * 接缝在最前（策略最全）；Anthropic 兼容紧随其后（DeepSeek 官方 Key 常常
-     * 已经配好）；然后是需要 Key 的三方 API；最后才是零配置的 DuckDuckGo ——
-     * 排在最后还是会被试到，只是不会抢在「已经配好的 Key」前面。
-     * 没配 Key 的通道**失败得很快**（当场报配置缺失，不联网），所以长顺序不拖时间。
+     * 办公模式的资料搜索走**自己的网页抓取通道**：DuckDuckGo HTML 抓取（免 Key）
+     * 最前，自建 SearXNG 随后，宿主的 web 服务（seam）只做兜底。三方检索 API
+     * （anthropic / openai / tavily / brave / bocha / exa / serper）不再进默认
+     * 顺序 —— 要用就在设置页把 providerOrder 加回去，或用 provider 参数按次点名
+     * （office_search_run({ provider: 'bocha' })）。
      */
-    providerOrder: [...PROVIDER_IDS],
+    providerOrder: ['duckduckgo', 'searxng', 'seam'],
+    /**
+     * 站点清单与「站点优先检索」（第三十四轮新增）。
+     *
+     * 语义三层，别混：
+     *   enabled  总开关。关掉 = 检索完全按原来的路子走，不看清单。
+     *   fallback 限定站点一无所获时退回不限定来源的泛搜（用户要求「被墙了就不纠结」）。
+     *   entries  清单本体。`undefined` = 没配过 → 用内置目录；`[]` = 用户把行删空了
+     *            → 这次真的不限定任何站点（不再兜回内置目录，否则「删空」在界面上等于没生效）。
+     *
+     * maxPerCall 是一次最多把几条查询限定到站点上：限定会多花请求，所以默认只 4 条。
+     */
+    sites: {
+        enabled: true,
+        fallback: true,
+        maxPerCall: 4,
+        entries: undefined,
+    },
+    /**
+     * 出口代理（第二十九轮新增）：留空 = 不动本进程原有的出口（直连，或宿主启动时
+     * 从环境变量装好的那条代理）。
+     *
+     * 填了优先装成**本插件私有**的分派器（宿主装了 undici 时；只有本插件的请求走它，
+     * 改值 / 清空当场生效）；取不到 undici 才退回 Node 24+ 的
+     * `http.setGlobalProxyFromEnv()` —— 那条是**进程级**、会顶掉宿主按环境变量装的
+     * 全局 dispatcher、代理值也会进 process.env 被子进程继承，而且**只能装不能清**
+     * （清空要重启 DSH 才回直连）。两条路都让回环地址直连。细节见 src/web-proxy.js。
+     */
+    proxy: '',
     /**
      * 每条通道各自的参数。**每条的键集就是它真正用得上的那几个**：
      * 接缝不吃参数；检索 API 只需要 Key；Anthropic / OpenAI 兼容还要端点与模型；
@@ -279,6 +340,11 @@ export const DEFAULT_AV = {
     language: 'auto',
     /** 单块秒数：官方那条链一次 131 秒封顶，这里默认 120 秒留余量。 */
     chunkSeconds: AV_CHUNK_SECONDS,
+    /**
+     * 相邻块的重叠秒数（第三十一轮）：块不再是完全切开的两段，跨在切点上的短音
+     * 能在同一块里解完。跨得更深的长句由 worker 的边界回退兜住，不靠调大这个数。
+     */
+    overlapSeconds: AV_CHUNK_OVERLAP_SECONDS,
     /** 单次处理的音频时长上限（秒）：超过就报错，不把内存吃满。 */
     maxSeconds: AV_MAX_SECONDS,
     timeoutMs: AV_TIMEOUT_MS,
@@ -363,6 +429,8 @@ function resolveBuiltinWeb(raw) {
         maxChars: positiveInt(source.maxChars, base.maxChars, 1_000, 400_000),
         maxRedirects: positiveInt(source.maxRedirects, base.maxRedirects, 0, 10),
         userAgent: text(source.userAgent) || base.userAgent,
+        pdfMaxBytes: positiveInt(source.pdfMaxBytes, base.pdfMaxBytes, 1024 * 1024, 128 * 1024 * 1024),
+        pdfMaxPages: positiveInt(source.pdfMaxPages, base.pdfMaxPages, 1, 500),
     };
 }
 
@@ -410,15 +478,35 @@ function resolveProviders(raw, builtin) {
     return providers;
 }
 
-/** auto 时的通道顺序：丢掉认不出来的名字，空表退回默认顺序。 */
+/** auto 时的通道顺序：丢掉认不出来的名字，空表退回默认顺序（抓取通道优先）。 */
 function resolveProviderOrder(raw) {
     const list = Array.isArray(raw) ? raw.map((item) => text(item)).filter((item) => PROVIDER_IDS.includes(item)) : [];
     const unique = [...new Set(list)];
-    return unique.length > 0 ? unique : [...PROVIDER_IDS];
+    return unique.length > 0 ? unique : [...DEFAULT_SEARCH.providerOrder];
 }
 
-/** 预处理模式：认不出来的模式与坏值一律退回默认。 */
-function resolvePreprocess(raw) {
+/**
+ * 站点清单（第三十四轮）：把设置里的四件事收敛成可用值。
+ *
+ * `entries` 三种形态要分开，别合并：
+ *   缺省（undefined）→ 返回 undefined，交给 site-catalog 决定「用内置目录」；
+ *   数组             → 逐条规范化（非法域名丢掉、重复域名去重）；
+ *   其它类型         → 空数组（用户写坏了就当没站点，不猜）。
+ */
+function resolveSites(raw) {
+    const source = raw !== null && typeof raw === 'object' ? raw : {};
+    const entries = source.entries === undefined
+        ? undefined
+        : (Array.isArray(source.entries) ? source.entries : []);
+    return {
+        enabled: bool(source.enabled, DEFAULT_SEARCH.sites.enabled),
+        fallback: bool(source.fallback, DEFAULT_SEARCH.sites.fallback),
+        maxPerCall: positiveInt(source.maxPerCall, DEFAULT_SEARCH.sites.maxPerCall, ...SITE_PRIORITY_LIMITS.maxPerCall),
+        entries,
+    };
+}
+
+/** 预处理模式：认不出来的模式与坏值一律退回默认。 */function resolvePreprocess(raw) {
     const source = raw !== null && typeof raw === 'object' ? raw : {};
     const mode = PREPROCESS_MODES.includes(source.mode) ? source.mode : DEFAULT_PREPROCESS.mode;
     return {
@@ -451,6 +539,7 @@ function number(value, fallback, min, max) {
  */
 function resolveAv(raw) {
     const source = raw !== null && typeof raw === 'object' ? raw : {};
+    const chunkSeconds = positiveInt(source.chunkSeconds, DEFAULT_AV.chunkSeconds, 10, 600);
     return {
         enabled: bool(source.enabled, DEFAULT_AV.enabled),
         ffmpegPath: text(source.ffmpegPath) || text(process.env[AV_FFMPEG_ENV]),
@@ -461,7 +550,10 @@ function resolveAv(raw) {
         precision: oneOf(source.precision, ['int8', 'fp32'], DEFAULT_AV.precision),
         threads: positiveInt(source.threads, DEFAULT_AV.threads, 1, 16),
         language: oneOf(source.language, AV_LANGUAGES, DEFAULT_AV.language),
-        chunkSeconds: positiveInt(source.chunkSeconds, DEFAULT_AV.chunkSeconds, 10, 600),
+        chunkSeconds,
+        // 重叠上限是半块（与 av.js 的 avSettings 同一条判据）：再大就不是重叠，
+        // 而是「同一段音频解两遍」，重叠区里的话会被两块各报一次。
+        overlapSeconds: Math.min(number(source.overlapSeconds, DEFAULT_AV.overlapSeconds, 0, 30), chunkSeconds / 2),
         maxSeconds: positiveInt(source.maxSeconds, DEFAULT_AV.maxSeconds, 10, 21_600),
         timeoutMs: positiveInt(source.timeoutMs, DEFAULT_AV.timeoutMs, 5_000, 1_800_000),
         audioDir: text(source.audioDir) || DEFAULT_AV.audioDir,
@@ -529,6 +621,8 @@ export function resolveConfig(raw) {
         fallbackOnPlatformError: bool(rawSearch.fallbackOnPlatformError, DEFAULT_SEARCH.fallbackOnPlatformError),
         provider: oneOf(rawSearch.provider, ['auto', ...PROVIDER_IDS], DEFAULT_SEARCH.provider),
         providerOrder: resolveProviderOrder(rawSearch.providerOrder),
+        proxy: text(rawSearch.proxy),
+        sites: resolveSites(rawSearch.sites),
         providers: resolveProviders(rawSearch.providers, builtin),
         preprocess: resolvePreprocess(rawSearch.preprocess),
         builtin,
@@ -550,6 +644,11 @@ export function resolveConfig(raw) {
         promptHint: bool(rawMemory.promptHint, DEFAULT_MEMORY.promptHint),
         userLimitBytes: positiveInt(rawMemory.userLimitBytes, DEFAULT_MEMORY.userLimitBytes, 512, 65_536),
         projectLimitBytes: positiveInt(rawMemory.projectLimitBytes, DEFAULT_MEMORY.projectLimitBytes, 1_024, 262_144),
+        // 0 = 不限（第四十八轮 P0-2）：投影预算与「库里能放多少」是两件事，所以下限给 0
+        projectionBudgetBytes: positiveInt(rawMemory.projectionBudgetBytes, DEFAULT_MEMORY.projectionBudgetBytes, 0, 131_072),
+        // 0 = 关掉（新-11）：硬上限与建议线也允许关 —— 有人就是要把长篇结论放热记忆里
+        entryLimitBytes: positiveInt(rawMemory.entryLimitBytes, DEFAULT_MEMORY.entryLimitBytes, 0, 131_072),
+        entryHintBytes: positiveInt(rawMemory.entryHintBytes, DEFAULT_MEMORY.entryHintBytes, 0, 131_072),
         ledgerLimit: positiveInt(rawMemory.ledgerLimit, DEFAULT_MEMORY.ledgerLimit, 10, 10_000),
         archiveKeep: positiveInt(rawMemory.archiveKeep, DEFAULT_MEMORY.archiveKeep, 1, 1_000),
         layers: resolveLayers(rawMemory.layers),

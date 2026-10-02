@@ -31,6 +31,8 @@ import {
     basename, join,
 } from '../engine/kit.js';
 import { DEFAULT_THEME_ID, resolveTheme, toHex } from '../engine/theme.js';
+import { chartSpaceXml, normalizeChartSpec, presentationChartFrame } from './chart.js';
+import { latexToMath, looksLikeLatex, mathPlain } from './ppt-math.js';
 
 // ───────────────────────────────────────────────────────────────────────────
 // 常量：OOXML 里写死的固定部分
@@ -49,6 +51,11 @@ const NS_DC = 'http://purl.org/dc/elements/1.1/';
 const NS_DCTERMS = 'http://purl.org/dc/terms/';
 const NS_DCMITYPE = 'http://purl.org/dc/dcmitype/';
 const NS_XSI = 'http://www.w3.org/2001/XMLSchema-instance';
+// 公式（a14:m）：markup-compatibility 的 AlternateContent 包装 + DrawingML 2010 的 a14
+// + Office Math 的 m 三个命名空间都内联声明在节点上（与 PowerPoint 自己写的文件一致）
+const NS_MC = 'http://schemas.openxmlformats.org/markup-compatibility/2006';
+const NS_A14 = 'http://schemas.microsoft.com/office/drawing/2010/main';
+const NS_MATH = 'http://schemas.openxmlformats.org/officeDocument/2006/math';
 
 /** 关系类型。PPT 的关系类型比 Word/Excel 多，写错一个就是「需要修复」。 */
 const RT = {
@@ -61,6 +68,7 @@ const RT = {
     theme: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme',
     image: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image',
     hyperlink: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink',
+    chart: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart',
     core: 'http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties',
     app: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties',
 };
@@ -73,6 +81,7 @@ const CT = {
     notesSlide: 'application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml',
     notesMaster: 'application/vnd.openxmlformats-officedocument.presentationml.notesMaster+xml',
     theme: 'application/vnd.openxmlformats-officedocument.theme+xml',
+    chart: 'application/vnd.openxmlformats-officedocument.drawingml.chart+xml',
     core: 'application/vnd.openxmlformats-package.core-properties+xml',
     app: 'application/vnd.openxmlformats-officedocument.extended-properties+xml',
 };
@@ -442,6 +451,21 @@ function wordsOf(text) {
 }
 
 /**
+ * 图注 + 署名（历史遗留 `1-2`「配图无来源」）。
+ *
+ * PPT 的题注是页面底部那一行居中小字，没有第二个自然落点，所以署名并进同一行；
+ * 有题注时用 `｜` 分隔，只有署名时就直接是署名那一行。
+ * @param {string} caption
+ * @param {unknown} source 通常传 office.image.fetch 返回的 `credit`
+ */
+function withCredit(caption, source) {
+    const credit = asString(source).trim();
+    const text = asString(caption).trim();
+    if (credit === '') return text;
+    return text === '' ? `来源：${credit}` : `${text} ｜ 来源：${credit}`;
+}
+
+/**
  * 图片格式与像素尺寸：只认 PNG / JPEG / GIF 三种 PowerPoint 原生支持的位图。
  *
  * 导出（`images()`）与生成共用这一个探测器：两边若各写一套，同一张图在
@@ -542,9 +566,10 @@ function makePalette(theme) {
 /**
  * runs 的纯文本（runs 为空时给空串）。段落的「文字」与「runs」两个字段要一致，
  * 否则 warnings 里报的字数、read() 复检的行数会与画面脱节。
+ * math run 用公式的纯文本近似顶上 —— 量算与字数统计都从这里走。
  */
 function runText(runs) {
-    return asArray(runs).map((run) => asString(run?.text)).join('');
+    return asArray(runs).map((run) => asString(run?.text) || (run?.math === undefined ? '' : mathPlain(run.math))).join('');
 }
 
 /**
@@ -579,7 +604,9 @@ function buildBulletParas(items, baseSize, pal) {
  */
 function paragraphText(para) {
     const runs = asArray(para?.runs);
-    if (runs.length > 0) return runs.map((run) => asString(run?.text)).join('');
+    if (runs.length > 0) {
+        return runs.map((run) => asString(run?.text) || (run?.math === undefined ? '' : mathPlain(run.math))).join('');
+    }
     return asString(para?.text);
 }
 
@@ -668,8 +695,12 @@ function shapeProps(opts) {
  * - 新写法 `runXml(run, font, para)`：段内混排时，没写的属性自动继承段落基值。
  *
  * `spacing` 与旧的 `spc` 是同一个东西（a:rPr 的 spc，单位 1/100 磅），两个名字都收。
+ * run 带 `math` 时改走公式通道（a14:m 的 AlternateContent，见 mathRunXml）。
  */
-function runXml(run, font, base = run) {
+function runXml(run, font, base = run, scope = {}) {
+    if (run?.math !== undefined && run?.math !== null && String(run.math) !== '') {
+        return mathRunXml(run, font, base, scope);
+    }
     // run 的字号两个名字都收：段落对象里叫 sizePt，用户写 runs 时习惯写 size
     const size = Math.round(asNumber(run.sizePt ?? run.size ?? base.sizePt, 18) * 100);
     const bold = run.bold ?? base.bold;
@@ -682,16 +713,96 @@ function runXml(run, font, base = run) {
         spc ? `spc="${Math.round(asNumber(spc, 0))}"` : '', 'dirty="0"',
     ].filter((item) => item !== '').join(' ');
     const fill = `<a:solidFill><a:srgbClr val="${toHex(run.color ?? base.color ?? '000000')}"/></a:solidFill>`;
-    // 单个 run 可以换字体（图标字形就靠这个：Segoe MDL2 Assets 与正文完全不同）
-    const face = run.font === undefined || run.font === null || run.font === ''
-        ? font
-        : { en: asString(run.font), cn: asString(run.font) };
+    // 单个 run / 段落基值可以换字体（字符串 = 中英文同一张脸；{en,cn} = 分开指定；
+    // 图标字形就靠这个：Segoe MDL2 Assets 与正文完全不同）
+    const rawFace = run.font ?? base.font;
+    const face = fontFaceOf(rawFace, font);
     const faces = `<a:latin typeface="${escapeAttr(face.en)}"/>`
         + `<a:ea typeface="${escapeAttr(face.cn)}"/><a:cs typeface="${escapeAttr(face.en)}"/>`;
     // a:hlinkClick 排在 latin/ea/cs 之后（CT_TextCharacterProperties 的顺序）
     const relId = run.linkRelId ?? base.linkRelId;
     const link = relId === undefined || relId === '' ? '' : `<a:hlinkClick r:id="${escapeAttr(relId)}"/>`;
     return `<a:r><a:rPr ${attrs}>${fill}${faces}${link}</a:rPr><a:t>${escapeAttr(asString(run.text))}</a:t></a:r>`;
+}
+
+/**
+ * 字体声明收敛：run/段落写的 font（字符串或 {en,cn}）→ {en,cn}；没写就用全篇默认。
+ * 字体名是自由值（PowerPoint 缺字体时自己回落），这里只做转义与空值处理，不校验枚举。
+ */
+function fontFaceOf(raw, fallback) {
+    const base = fallback !== null && typeof fallback === 'object'
+        ? { en: asString(fallback.en, ''), cn: asString(fallback.cn, '') }
+        : { en: '', cn: '' };
+    if (raw === undefined || raw === null || raw === '') return base;
+    if (typeof raw === 'object') {
+        return {
+            en: asString(raw.en, base.en),
+            cn: asString(raw.cn, base.cn),
+        };
+    }
+    return { en: asString(raw), cn: asString(raw) };
+}
+
+/**
+ * 公式 run：a14:m 的 AlternateContent。
+ *
+ * - Choice 给 PowerPoint 2010+ / WPS / LibreOffice：原生 OMML，可在 PowerPoint 里继续编辑；
+ * - Fallback 给不认 a14 的阅读器：公式的纯文本近似（斜体），内容不丢。
+ * 段落里只有这一条 run 时按「展示式」排（oMathPara，独立成行居中），否则行内混排。
+ * 解析失败不抛异常：按原样排成普通文字 run，并把原因写进 warnings。
+ */
+function mathRunXml(run, font, base, scope) {
+    const latex = String(run.math);
+    const size = Math.round(asNumber(run.sizePt ?? run.size ?? base.sizePt, 18) * 100);
+    const color = toHex(run.color ?? base.color ?? '000000');
+    const notes = asArray(scope.notes);
+    const page = asNumber(scope.page, 0);
+    // 数学 run 的字号/颜色写在 m:r 内嵌的 a:rPr 上；字体不写 —— 公式区由 Cambria Math 接管，
+    // 显式写正文字体反而会破坏数学排版
+    const rPr = `<a:rPr lang="en-US" altLang="zh-CN" sz="${size}" i="1" dirty="0">`
+        + `<a:solidFill><a:srgbClr val="${color}"/></a:solidFill></a:rPr>`;
+    const parsed = latexToMath(latex, { rPr });
+    if (!parsed.ok) {
+        // 定位到「哪一页、哪个形状、第几个 math run」：只有页码的话，一页里几个公式
+        // 同时失败时分不清是哪一条（第四十八轮 P0-1）。
+        const shape = asString(scope.shape);
+        const runIndex = asNumber(scope.runIndex, 0);
+        const where = `第 ${page} 页${shape === '' ? '' : `形状「${shape}」`}`
+            + `${runIndex > 0 ? ` 第 ${runIndex} 个 math run ` : ''}`;
+        if (scope.notes !== undefined) {
+            notes.push(`${where}公式无法解析（${parsed.error}）：${latex.slice(0, 40)} 已按原样排成普通文字`);
+        }
+        // 结构化的失败记录：stats.formulaErrors 与回执都从这里来（报告比文字更好用）
+        if (Array.isArray(scope.formulaErrors)) {
+            scope.formulaErrors.push({
+                page, shape: shape === '' ? null : shape,
+                runIndex: runIndex > 0 ? runIndex : null,
+                latex: latex.slice(0, 80),
+                error: parsed.error,
+            });
+        }
+        return `<a:r><a:rPr lang="en-US" altLang="zh-CN" sz="${size}" i="1" dirty="0">`
+            + `<a:solidFill><a:srgbClr val="${color}"/></a:solidFill></a:rPr>`
+            + `<a:t>${escapeAttr(latex)}</a:t></a:r>`;
+    }
+    const spaceRun = `<m:r>${rPr}<m:t> </m:t></m:r>`;
+    const fallback = `<a:r><a:rPr lang="en-US" altLang="zh-CN" sz="${size}" i="1" dirty="0">`
+        + `<a:solidFill><a:srgbClr val="${color}"/></a:solidFill></a:rPr>`
+        + `<a:t>${escapeAttr(parsed.plain)}</a:t></a:r>`;
+    let choice;
+    if (scope.mathDisplay === true) {
+        const alignMap = { l: 'left', ctr: 'center', r: 'right', just: 'center', dist: 'center' };
+        const jc = alignMap[textAlignOf(scope.align, 'ctr')] ?? 'centerGroup';
+        const jcPr = jc === 'centerGroup' ? '' : `<m:oMathParaPr><m:jc m:val="${jc}"/></m:oMathParaPr>`;
+        const mathList = parsed.blocks.map((block) => `<m:oMath xmlns:m="${NS_MATH}">${block}</m:oMath>`).join('');
+        choice = `<m:oMathPara xmlns:m="${NS_MATH}">${jcPr}${mathList}</m:oMathPara>`;
+    } else {
+        const inner = parsed.blocks.join(spaceRun);
+        choice = `<m:oMath xmlns:m="${NS_MATH}">${inner}</m:oMath>`;
+    }
+    return `<mc:AlternateContent xmlns:mc="${NS_MC}">`
+        + `<mc:Choice xmlns:a14="${NS_A14}" Requires="a14"><a14:m>${choice}</a14:m></mc:Choice>`
+        + `<mc:Fallback>${fallback}</mc:Fallback></mc:AlternateContent>`;
 }
 
 function escapeAttr(value) {
@@ -733,7 +844,14 @@ function textAnchorOf(value, fallback) {
     return TEXT_ANCHOR[String(value).trim().toLowerCase()] ?? fallback;
 }
 
-function paragraphXml(para, font) {
+/**
+ * 段落序列化。
+ * 子元素顺序由 schema 定死：lnSpc → spcBef → spcAft → buClr → buFont → buChar/buNone，
+ * 顺序错了 PowerPoint 同样判定包损坏，所以这里不用「想到哪写到哪」的拼装方式。
+ * scope（notes/page/公式展示式判定）从 textBodyXml 的 opts 一路传进来 —— 公式解析
+ * 失败的 warning 要带上页码，而这一层拿不到 ctx，只能由上层注入。
+ */
+function paragraphXml(para, font, scope = {}) {
     const attrs = [];
     const align = textAlignOf(para.align);
     if (align) attrs.push(`algn="${align}"`);
@@ -754,7 +872,14 @@ function paragraphXml(para, font) {
     const runs = asArray(para.runs).filter((run) => run !== null && typeof run === 'object');
     let body;
     if (runs.length > 0) {
-        body = runs.map((run) => runXml(run, font, para)).join('');
+        // 整段只有一条 math run 时按展示式排（独立成行的居中大公式）；
+        // 与文字混排（哪怕夹着空 text run）一律行内 —— 与 PowerPoint 的两种插入方式对应
+        const mathOnly = runs.length === 1
+            && runs[0].math !== undefined && String(runs[0].math) !== ''
+            && asString(runs[0].text) === '';
+        const runScope = { ...scope, mathDisplay: mathOnly, align: para.align };
+        // run 序号（段内第几个 run）一路传下去：公式失败的告警要能指到具体那一条
+        body = runs.map((run, index) => runXml(run, font, para, { ...runScope, runIndex: index + 1 })).join('');
     } else if (para.text === undefined || para.text === '') {
         body = `<a:endParaRPr lang="zh-CN" sz="${size}"/>`;
     } else {
@@ -769,7 +894,8 @@ function textBodyXml(paras, font, opts = {}) {
     const autofit = opts.autofit === false ? '<a:noAutofit/>' : '<a:normAutofit/>';
     const bodyPr = `<a:bodyPr wrap="square" lIns="${insets.l ?? 0}" tIns="${insets.t ?? 0}"`
         + ` rIns="${insets.r ?? 0}" bIns="${insets.b ?? 0}" anchor="${anchor}">${autofit}</a:bodyPr>`;
-    const list = paras.map((para) => paragraphXml(para, font)).join('');
+    const scope = { notes: opts.notes, page: opts.page, shape: opts.shape, formulaErrors: opts.formulaErrors };
+    const list = paras.map((para) => paragraphXml(para, font, scope)).join('');
     return `<p:txBody>${bodyPr}<a:lstStyle/>${list === '' ? '<a:p><a:pPr><a:buNone/></a:pPr><a:endParaRPr lang="zh-CN"/></a:p>' : list}</p:txBody>`;
 }
 
@@ -784,6 +910,8 @@ function createSink() {
         textBoxes: 0,
         tableCount: 0,
         imageCount: 0,
+        // 原生公式数（a14:m）：报告里要能看出「这页有没有公式、有几个」
+        formulas: 0,
         nextId() {
             this.id += 1;
             return this.id;
@@ -792,6 +920,7 @@ function createSink() {
             return `rId${this.rels.length + 2}`;
         },
         push(xml) {
+            this.formulas += (xml.match(/<a14:m[ >]/g) ?? []).length;
             this.shapes.push(xml);
         },
     };
@@ -806,7 +935,9 @@ function addRect(sink, opts) {
 }
 
 function addText(sink, ctx, opts) {
-    const font = ctx.font;
+    // opts.title: 标题类文本框（封面/章节/内容页/结尾的标题）用主题的「标题字体对」，
+    // 与 fontScheme 的 majorFont 对齐；正文与其它元素用 minorFont（ctx.font）
+    const font = opts.title === true ? ctx.titleFont : ctx.font;
     const paras = asArray(opts.paras);
     const id = sink.nextId();
     sink.textBoxes += 1;
@@ -816,7 +947,13 @@ function addText(sink, ctx, opts) {
     const name = opts.name ?? `TextBox ${id}`;
     const xml = `<p:sp><p:nvSpPr><p:cNvPr id="${id}" name="${escapeAttr(name)}"/>`
         + `<p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>${shapeProps(opts)}`
-        + textBodyXml(paras, font, opts) + '</p:sp>';
+        + textBodyXml(paras, font, {
+            ...opts,
+            notes: ctx.notes,
+            page: ctx.page,
+            shape: name,
+            formulaErrors: ctx.formulaErrors,
+        }) + '</p:sp>';
     sink.push(xml);
     return { id, lines: measureParas(paras, opts.w).lines };
 }
@@ -985,6 +1122,11 @@ function shapeTextXml(spec, ctx) {
         body: textBodyXml(list, ctx.font, {
             anchor: asString(opts.anchor, 'ctr'),
             insets,
+            notes: ctx.notes,
+            page: ctx.page,
+            // 形状名进 scope：形状里的公式失败要能指到「哪个形状」
+            shape: asString(spec.name),
+            formulaErrors: ctx.formulaErrors,
             // 形状里文字一律 noAutofit：autofit 会让 PowerPoint 自己缩字号，
             // 那报告里算出来的字号就与实际显示的不一致了
             autofit: false,
@@ -1080,7 +1222,9 @@ function shapeLineOf(raw, ctx) {
 function cellText(cell) {
     if (cell !== null && typeof cell === 'object' && !Array.isArray(cell)) {
         const runs = asArray(cell.runs);
-        if (runs.length > 0) return runs.map((run) => asString(run?.text)).join('');
+        if (runs.length > 0) {
+            return runs.map((run) => asString(run?.text) || (run?.math === undefined ? '' : mathPlain(run.math))).join('');
+        }
         return asString(cell.text);
     }
     return asString(cell);
@@ -1245,7 +1389,12 @@ function tableCellXml(cell, opts) {
     const cellAnchor = textAnchorOf(opts.anchor, 'ctr');
     const bodyPr = `<a:bodyPr wrap="square" lIns="${insets.l}" tIns="${insets.t}"`
         + ` rIns="${insets.r}" bIns="${insets.b}" anchor="${cellAnchor}"><a:noAutofit/></a:bodyPr>`;
-    const txBody = `<a:txBody>${bodyPr}<a:lstStyle/>${paras.map((para) => paragraphXml(para, font)).join('')}</a:txBody>`;
+    const txBody = `<a:txBody>${bodyPr}<a:lstStyle/>${paras.map((para) => paragraphXml(para, font, {
+        notes: opts.notes,
+        page: opts.page,
+        shape: opts.shape,
+        formulaErrors: opts.formulaErrors,
+    })).join('')}</a:txBody>`;
     const span = `${opts.colSpan > 1 ? ` gridSpan="${opts.colSpan}"` : ''}${opts.rowSpan > 1 ? ` rowSpan="${opts.rowSpan}"` : ''}`;
     const tcPr = `<a:tcPr marL="${insets.l}" marR="${insets.r}" marT="${insets.t}" marB="${insets.b}"`
         + ` anchor="${cellAnchor}">${cellBorderLines(opts)}${fillXml(opts.fill)}</a:tcPr>`;
@@ -1398,7 +1547,7 @@ function addContentChrome(sink, ctx, title, options = {}) {
     const fit = fitTitle(title, boxW, g.titleH);
     addText(sink, ctx, {
         x: g.margin, y: g.titleY, w: boxW, h: g.titleH, anchor: 'ctr',
-        name: 'Title', autofit: false, defaultColor: pal.primary,
+        name: 'Title', autofit: false, defaultColor: pal.primary, title: true,
         paras: [{
             text: asString(title), sizePt: fit.sizePt, bold: true,
             color: pal.primary, lineSpacing: 1.08, align: 'l',
@@ -1453,7 +1602,7 @@ function renderCover(sink, ctx, data) {
         });
     }
     addText(sink, ctx, {
-        x: g.margin, y: titleY, w: titleW, h: cmToEmu(3.6), anchor: 't', name: 'Title', autofit: false,
+        x: g.margin, y: titleY, w: titleW, h: cmToEmu(3.6), anchor: 't', name: 'Title', autofit: false, title: true,
         paras: [{
             text: title, runs, sizePt: fit.sizePt, bold: true, color: pal.coverText, lineSpacing: 1.12,
         }],
@@ -1510,7 +1659,7 @@ function renderSection(sink, ctx, data) {
     });
     addText(sink, ctx, {
         x: g.margin, y: Math.round(g.cy * 0.575), w: titleW, h: cmToEmu(2.2),
-        anchor: 't', name: 'Title', autofit: false,
+        anchor: 't', name: 'Title', autofit: false, title: true,
         paras: [{ text: title, runs, sizePt: fit.sizePt, bold: true, color: pal.primary, lineSpacing: 1.1 }],
     });
     if (asString(data.subtitle) !== '') {
@@ -1583,6 +1732,43 @@ function renderBullets(sink, ctx, data) {
     };
 }
 
+/**
+ * 原生图表页（历史遗留 `11-6`）。
+ *
+ * 画的是一个 `p:graphicFrame`，内容 `<c:chart r:id>` 指向 `ppt/charts/chartN.xml`
+ * —— 与 Excel 那边共用同一份 `c:chartSpace`（见 formats/chart.js）。数据内联在图表里，
+ * 所以幻灯片打开就能画；PowerPoint 里它是一个**图表对象**（可改类型、可编辑数据）。
+ *
+ * 编号：`ctx.chartSpecs` 是这次 compile 的图表清单，第 n 个就是 chartN.xml，
+ * 关系目标按同一编号算 —— 一处编号，两处引用，不会错位。
+ */
+function renderChart(sink, ctx, data) {
+    const { g, pal } = ctx;
+    addContentChrome(sink, ctx, data.title);
+    ctx.chartSpecs.push(data.spec);
+    const chartIndex = ctx.chartSpecs.length;
+    const relId = sink.nextRelId();
+    sink.rels.push({ id: relId, type: RT.chart, target: `../charts/chart${chartIndex}.xml` });
+    // 图表占满版心：标题条由 addContentChrome 画在顶部，图从 bodyY 起、铺到 bodyH。
+    sink.push(presentationChartFrame({
+        id: sink.nextId(),
+        name: `图表 ${chartIndex}`,
+        x: g.margin,
+        y: g.bodyY,
+        cx: g.contentW,
+        cy: Math.max(cmToEmu(4), g.bodyH),
+        chartRelId: relId,
+    }));
+    sink.chartCount = (sink.chartCount ?? 0) + 1;
+    return {
+        title: asString(data.title),
+        chart: chartIndex,
+        type: data.spec.type,
+        series: data.spec.series.length,
+        kinds: { chart: 1 },
+    };
+}
+
 function renderTable(sink, ctx, data) {
     const { g, pal } = ctx;
     addContentChrome(sink, ctx, data.title);
@@ -1605,6 +1791,9 @@ function renderTable(sink, ctx, data) {
         insets: options.insets,
         borders,
         notes: ctx.notes,
+        page: ctx.page,
+        shape: asString(data.title, '表格'),
+        formulaErrors: ctx.formulaErrors,
         pal,
         bottomLine: { color: pal.accent, width: 25400 },
     })).join('');
@@ -1638,6 +1827,9 @@ function renderTable(sink, ctx, data) {
                 insets: options.insets,
                 borders,
                 notes: ctx.notes,
+                page: ctx.page,
+                shape: asString(data.title, '表格'),
+                formulaErrors: ctx.formulaErrors,
                 pal,
                 linkRelId,
                 underline: linkRelId === undefined ? undefined : true,
@@ -1734,8 +1926,13 @@ function renderStatement(sink, ctx, data) {
     const text = asString(data.text);
     const sub = asString(data.sub);
     const runs = asArray(data.runs);
+    // 宣言文字默认 onPrimary（白），那是给深色底准备的；浅色主题的陈述页没有深色底，
+    // 白字会直接隐形 —— 深浅按下页有没有深底选色，展示式公式页（statement + math run）
+    // 在浅色主题上同样靠这一条才看得见
+    const statementColor = ctx.theme.dark === true ? pal.onPrimary : pal.text;
+    const subColor = ctx.theme.dark === true ? colorMix(pal.primary, pal.onPrimary, 0.72) : pal.muted;
     const fit = fitParas(
-        (size) => [{ text, runs, sizePt: size, bold: true, color: pal.onPrimary, lineSpacing: 1.2, align: 'ctr' }],
+        (size) => [{ text, runs, sizePt: size, bold: true, color: statementColor, lineSpacing: 1.2, align: 'ctr' }],
         g.contentW - cmToEmu(1.2),
         Math.round(g.cy * 0.34),
         [36, 32, 28, 24, 20],
@@ -1747,13 +1944,13 @@ function renderStatement(sink, ctx, data) {
     addText(sink, ctx, {
         x: g.margin, y: Math.round(g.cy * 0.29), w: g.contentW, h: Math.round(g.cy * 0.36),
         anchor: 'ctr', name: 'Statement', autofit: false,
-        paras: [{ text, runs, sizePt: fit.sizePt, bold: true, color: pal.onPrimary, lineSpacing: 1.2, align: 'ctr' }],
+        paras: [{ text, runs, sizePt: fit.sizePt, bold: true, color: statementColor, lineSpacing: 1.2, align: 'ctr' }],
     });
     if (sub !== '') {
         addText(sink, ctx, {
             x: g.margin, y: Math.round(g.cy * 0.68), w: g.contentW, h: cmToEmu(1.2),
             anchor: 't', name: 'Statement Sub', autofit: false,
-            paras: [{ text: sub, sizePt: 16, color: colorMix(pal.primary, pal.onPrimary, 0.72), align: 'ctr', lineSpacing: 1.3 }],
+            paras: [{ text: sub, sizePt: 16, color: subColor, align: 'ctr', lineSpacing: 1.3 }],
         });
     }
     addFooter(sink, ctx, ctx.docTitle, { color: pal.onBandMuted, lineColor: { color: pal.onBandMuted, dash: true } });
@@ -2169,7 +2366,7 @@ function renderClosing(sink, ctx, data) {
     );
     addText(sink, ctx, {
         x: g.margin, y: Math.round(g.cy * 0.34), w: g.contentW, h: Math.round(g.cy * 0.18),
-        anchor: 'ctr', name: 'Title', autofit: false,
+        anchor: 'ctr', name: 'Title', autofit: false, title: true,
         paras: [{ text: title, runs, sizePt: fit.sizePt, bold: true, color: pal.coverText, align: 'ctr', lineSpacing: 1.15 }],
     });
     addRect(sink, {
@@ -3955,19 +4152,33 @@ function compile(state) {
     const pal = makePalette(theme);
     const size = SIZES[state.sizeId];
     const g = makeGeometry(size.cx, size.cy);
-    const font = { cn: theme.fonts.cn, en: theme.fonts.en, titleCn: theme.fonts.titleCn, titleEn: theme.fonts.titleEn };
+    // 全篇字体：主题的字体对 + create({font}) 的覆盖（字符串 = 四个槽全换；
+    // 对象 = 只换写到的槽）。titleFont 是「标题字体对」，与 fontScheme 的 majorFont 对齐。
+    const font = {
+        cn: state.fontOverride.cn ?? theme.fonts.cn,
+        en: state.fontOverride.en ?? theme.fonts.en,
+        titleCn: state.fontOverride.titleCn ?? theme.fonts.titleCn,
+        titleEn: state.fontOverride.titleEn ?? theme.fonts.titleEn,
+    };
+    const titleFont = { en: font.titleEn ?? font.en, cn: font.titleCn ?? font.cn };
     const warnings = [...state.inputWarnings];
     const warn = (message) => {
         if (!warnings.includes(message)) warnings.push(message);
     };
 
     const ctx = {
-        theme, pal, g, font,
+        theme, pal, g, font, titleFont,
         docTitle: state.title, author: state.author, date: state.date,
         page: 0, total: state.slides.length, sectionIndex: 0,
         // 版式渲染时产生的「非致命输入问题」都进这里，最后统一并入 warnings：
         // 非法 fit / 负数尺寸之类的输入错误不该让整次生成失败
         notes: [],
+        // 公式解析失败的结构化记录（第四十八轮 P0-1）：stats.formulaErrors 与 read() 侧同名同口径。
+        // 回落到普通文字 run 的公式只有这里能证明它「本来是个公式」
+        formulaErrors: [],
+        // 原生图表部件清单（历史遗留 11-6）：渲染时按页顺序 push，
+        // 第 n 个就是 ppt/charts/chartN.xml，幻灯片的 rels 目标按同一编号算。
+        chartSpecs: [],
     };
 
     // 媒体部件按「绝对路径」去重：同一张图在几页里复用同一个 imageN
@@ -4047,6 +4258,8 @@ function compile(state) {
             ctx.media = undefined;
         } else if (source.kind === 'images') {
             info = renderImages(sink, ctx, source);
+        } else if (source.kind === 'chart') {
+            info = renderChart(sink, ctx, source);
         } else if (source.kind === 'shape') {
             info = renderShapePage(sink, ctx, source);
         } else if (HELPER_RENDERERS[source.kind] !== undefined) {
@@ -4102,6 +4315,8 @@ function compile(state) {
                 ...notes.map((item, index) => ({ name: `ppt/notesSlides/notesSlide${index + 1}.xml`, contentType: CT.notesSlide })),
             ]),
             ...mediaParts.map((item) => ({ name: `ppt/media/${item.partName}`, mediaType: item.mediaType })),
+            // 原生图表：每个图表部件一条 Override（PPT 的图表部件与 Excel 同格式）
+            ...ctx.chartSpecs.map((_spec, index) => ({ name: `ppt/charts/chart${index + 1}.xml`, contentType: CT.chart })),
         ]),
     });
     parts.push({
@@ -4196,6 +4411,10 @@ function compile(state) {
     for (const item of mediaParts) {
         parts.push({ name: `ppt/media/${item.partName}`, mediaType: item.mediaType, data: item.bytes });
     }
+    // 图表部件（历史遗留 11-6）：与 Excel 共用 chartSpaceXml，编号与 slide rels 一致。
+    ctx.chartSpecs.forEach((spec, index) => {
+        parts.push({ name: `ppt/charts/chart${index + 1}.xml`, contentType: CT.chart, data: chartSpaceXml(spec) });
+    });
 
     const bytes = zip(parts);
     const layouts = {};
@@ -4206,6 +4425,19 @@ function compile(state) {
     }
     // 版式渲染过程中攒下的输入问题（非法 fit、负数尺寸…）与状态机产生的警告合并去重
     for (const message of ctx.notes) warn(message);
+    // 构建期警告双写 env.warn（第四十八轮 P0-1）：office_run 顶层的 warnings 只由
+    // env.warnings + 逐文件的 read() 复检警告拼成，不并进来模型就只能看到一半风险
+    // —— excel.js 一直是这么做的，ppt.js 与 word.js 缺的就是这一步，于是「公式解析失败」
+    // 这类构建期问题在批量脚本里彻底静默。compile() 会被 invalidate() 反复调用，
+    // 所以按 state 去重：同一份稿子重编译多少次都只报一遍。
+    if (state.env !== undefined && typeof state.env.warn === 'function') {
+        state.reportedWarnings ??= new Set();
+        for (const message of warnings) {
+            if (state.reportedWarnings.has(message)) continue;
+            state.reportedWarnings.add(message);
+            state.env.warn(`ppt：${message}`);
+        }
+    }
     const shapeKinds = {};
     for (const item of built) {
         for (const [key, count] of Object.entries(item.info?.kinds ?? {})) {
@@ -4222,6 +4454,8 @@ function compile(state) {
         shapeKinds,
         textBoxes: built.reduce((sum, item) => sum + item.sink.textBoxes, 0),
         tables: built.reduce((sum, item) => sum + item.sink.tableCount, 0),
+        // 原生图表数（历史遗留 11-6），read() 侧同名同口径
+        charts: ctx.chartSpecs.length,
         // 合并区域数（gridSpan/rowSpan > 1 的 origin 格），read() 侧同名同口径
         mergedCells: built.reduce((sum, item) => sum + (item.info?.merges ?? 0), 0),
         // images = 页面上真实放置的图片数（含缺图占位框），imageParts = 去重后的媒体部件数。
@@ -4232,6 +4466,12 @@ function compile(state) {
         lowDpi: built.filter((item) => (item.info?.dpi ?? 0) > 0 && item.info.dpi < 96).length,
         notes: notes.length,
         words: built.reduce((sum, item) => sum + item.sink.words, 0),
+        // 原生公式数（a14:m 计数），read() 侧同名同口径
+        formulas: built.reduce((sum, item) => sum + item.sink.formulas, 0),
+        // 解析失败、已回落成普通文字的公式数（第四十八轮 P0-1）。与 formulas 分开报：
+        // 「一共有几个公式」与「有几个没写成公式」是两个问题，合在一起等于都答不清楚
+        formulaErrors: ctx.formulaErrors.length,
+        formulaErrorList: ctx.formulaErrors.slice(0, 8),
         mediaBytes: mediaParts.reduce((sum, item) => sum + item.bytesLength, 0),
         bytes: bytes.length,
     };
@@ -4251,6 +4491,8 @@ function layoutKeyOf(kind) {
  */
 function layoutPartKeyOf(kind) {
     if (kind === 'images') return 'image';
+    // 图表借用「陈述」版式（titleOnly）：几何全部自带，挂哪个布局部件都不影响渲染。
+    if (kind === 'chart') return 'statement';
     return LAYOUT_KEYS.includes(kind) ? kind : (KIND_LAYOUT_KEY[kind] ?? 'statement');
 }
 
@@ -4339,6 +4581,9 @@ function outlineLine(item, page) {
     }
     if (item.kind === 'statement') {
         return `${head}：${asString(info.text).slice(0, 24)}${asString(info.sub) === '' ? '' : `｜${asString(info.sub)}`}${suffix}`;
+    }
+    if (item.kind === 'chart') {
+        return `${head}：${asString(info.title)}｜${info.type} 图，${info.series} 个系列（原生图表）${suffix}`;
     }
     if (item.kind === 'image' || item.kind === 'images') {
         const head2 = info.grid === true
@@ -4452,7 +4697,9 @@ export const meta = {
         + '还有「自由绘制」能力：deck.shape / deck.line / deck.icon 可在同一页任意摆放 33 种预设形状、'
         + '渐变/透明填充、虚线箭头、旋转圆角阴影与形状内文字，deck.master 给全篇加背景图（可压暗）、'
         + 'logo、页眉页脚与页码，表格支持 gridSpan/rowSpan 合并、单元格样式与超链接，'
-        + '任意段落可用 runs 做段内多色混排；自带主题配色与真实排版风险报告',
+        + '任意段落可用 runs 做段内多色混排；runs 里 {math:\'…\'} 写 LaTeX 公式'
+        + '（转原生 OMML，PowerPoint 里可继续编辑），字体可全篇换（create({font})）'
+        + '也可逐段逐 run 换；自带主题配色与真实排版风险报告',
     // office_help 的默认层用这一份（缓存提示词预算：全文那份 10 KB 只留给 detail:true）。
     // 签名与参数名必须与下面的全文层保持一致 —— 分层省的是解释与举例，不是接口。
     brief: {
@@ -4462,9 +4709,10 @@ export const meta = {
             '  deck.bullets({title, items, columns})   items: string 或 {text, level, runs}',
             '  deck.table({title, columns, rows, headerFill, zebra, border, cellPadCm, rowHeightCm, firstRowBold})',
             '  deck.quote({text, by, runs}) / deck.statement({text, sub, runs})',
-            '  deck.image({path, title, caption, fit, widthCm, heightCm, align, frame, fullBleed})',
+            '  deck.image({path, title, caption, source, fit, widthCm, heightCm, align, frame, fullBleed})',
             '    fit: contain（默认）/ cover（裁切）/ natural（96 DPI 原尺寸）',
-            '  deck.images(items, {title, columns, gapCm, fit})   items: [{path, caption}]',
+            '  deck.images(items, {title, columns, gapCm, fit})   items: [{path, caption, source}]',
+            '  deck.chart({type, title, categories, series:[{name, values}]})  原生图表页（bar/column/line/pie/area/scatter）',
             '  ── 版式助手（各新起一页，之后可继续叠元素级助手）──',
             '  deck.cards({title, items, columns, cardFill, cardLine, radius, gapCm, numbered, iconSizeCm, shadow})',
             '  deck.steps({title, items, direction, numbered, arrows, gapCm, fill, line})',
@@ -4483,7 +4731,10 @@ export const meta = {
             '  deck.master({background, logo, header, footer, pageNumber, accent, skipLayouts})',
             '  deck.background(spec) 只改当前页 / deck.page() 另起一页 / deck.notes(text)',
             '  deck.render() → Uint8Array / deck.save(path?) → report',
-            '  runs: [{text, bold, italic, underline, color, size, font, spacing}]',
+            "  runs: [{text, bold, italic, underline, color, size, font, spacing}]；{math:'E=mc^2'} 插入公式",
+            '    （LaTeX 子集，详见全文层）；整段只有一条 math run 时按展示式（独立成行）排版',
+            "  create({font:'楷体'}) 全篇换字体，或 {font:{body, bodyEn, title, titleEn}} 分槽覆盖；",
+            '    段落/run 的 font 收字符串或 {en, cn}，逐处覆盖',
             '  ── 三个约定 ──',
             '  1) preset 口语名会映射：flowChartData→flowChartInputOutput、roundedRectCallout→wedgeRoundRectCallout、',
             '     ovalCallout→wedgeEllipseCallout（写原名真实 PowerPoint 打不开）',
@@ -4527,13 +4778,20 @@ export const meta = {
             '    headerFill 表头底色 / zebra 隔行底色（true|false|色值）/ border 四边描边 / cellPadCm 单元格内边距',
             '    / rowHeightCm 最小行高 / firstRowBold 表头加粗（默认 true）',
             '  deck.quote({text, by, runs}) / deck.statement({text, sub, runs})',
-            '  deck.image({path, title, caption, fit, widthCm, heightCm, align, frame, fullBleed})',
+            '  deck.image({path, title, caption, source, fit, widthCm, heightCm, align, frame, fullBleed})',
             "    fit: 'contain'（默认，等比放进版心）| 'cover'（铺满版心，超出部分用 a:srcRect 裁切）",
             "         | 'natural'（按 96 DPI 折算原始像素尺寸，超出才缩）",
             '    widthCm / heightCm 只给一个时另一个按原图纵横比推算；align: left|center|right（默认 center）',
+            '    source 是署名（通常传 office.image.fetch 的 credit）：并进题注那一行（`题注 ｜ 来源：…`）',
             '    frame: true 加细边框；fullBleed: true 铺满整页（忽略页边距与标题区），可当背景图',
             '  deck.images(items, {title, columns, gapCm, fit})',
-            '    items: [{path, caption}]，columns 支持 2 或 3，gapCm 默认 0.4，逐格等比放入并居中',
+            '    items: [{path, caption, source}]，columns 支持 2 或 3，gapCm 默认 0.4，逐格等比放入并居中',
+            '  deck.chart({type, title, categories, series, legend, labels, stacked, gapWidth, colors}) → 原生图表页',
+            '    type: bar / column（默认）/ line / pie / area / scatter；series: [{name, values, x?}]（散点图用 x）',
+            '    categories 与每个系列的 values 必须等长（不等长当场报错，不会画一半）',
+            '    legend: bottom（默认）/ right / left / top / none；labels: true 显示数据标签；stacked: true 堆叠',
+            '    这是真正的 DrawingML 图表部件（ppt/charts/chartN.xml）：在 PowerPoint 里是可选中、可改类型、',
+            '    可「编辑数据」的图表对象；数据以 numLit / strLit 内联在图表里，所以打开即画、不需要刷新。',
             '  deck.closing({title, subtitle, runs})',
             '  ── 版式助手（每次调用新起一页，自动叠加母版与背景；之后可继续 deck.panel/banner/shape 叠在同一页）──',
             '  deck.cards({title, items, columns, cardFill, cardLine, radius, gapCm, numbered, iconSizeCm, shadow})',
@@ -4553,7 +4811,7 @@ export const meta = {
             '    items: [{value, label, unit, color}]；大号数字（54~18pt 阶梯自适应）+ 小标签，unit 作为小号 run 跟在数字后',
             '    columns 默认 min(items.length, 4)（支持 1~4）；数字压到 24pt 以下时进 warnings',
             '  deck.imageText({title, image, items, text, side, ratio, cardFill, cardLine})',
-            "    image: {path, fit, caption}；side 'left'（默认）| 'right'；ratio 图片占版心宽的比例（默认 0.46，钳制在 0.2~0.8）",
+            "    image: {path, fit, caption, source}；side 'left'（默认）| 'right'；ratio 图片占版心宽的比例（默认 0.46，钳制在 0.2~0.8）",
             '    另一侧写要点（items）或整段文字（text）；缺图照画虚线占位框并 warning，图片口径与 deck.image 一致',
             '  deck.timeline({title, items, direction, gapCm})',
             "    items: [{time, title, body}]；direction 'horizontal'（默认）| 'vertical'",
@@ -4618,15 +4876,34 @@ export const meta = {
             '  runs: [{text, bold, italic, underline, color, size, font, spacing}]',
             '    spacing 是字距（a:rPr spc，1/100 磅）；runs 可用于段落对象、形状文字、表格单元格与 bullets 条目；',
             '    带自动字号适配的版式（cover/section/quote/statement/bullets）按 runs 里最大字号做溢出估算',
+            '  ── 公式（原生 OMML，PowerPoint/WPS/LibreOffice 里都是可编辑公式）──',
+            "  run 写 {math:'E=mc^2'}（可与文字 run 混排；size/color 照 run 的规则取）。",
+            '    子集：\\frac \\binom \\sqrt[n]{}、上下标与撇号、\\sum \\prod \\int 等大运算符带上下限',
+            '    （\\limits/\\nolimits 改位置）、\\lim \\max 等极限、\\sin \\log 等函数名、\\text \\mathrm \\mathbf \\mathbb',
+            '    等样式、\\left\\right 定界符（含 \\lfloor \\langle 与空定界符 .）、\\hat \\vec \\overline \\overrightarrow',
+            '    等重音、矩阵族 matrix/pmatrix/bmatrix/vmatrix/Bmatrix、cases、aligned（& 分列、\\\\ 换行）、',
+            '    希腊字母与约 150 个常用符号、间距 \\, \\; \\quad 与注释 %',
+            '    整段只有一条 math run 时自动按「展示式」排（oMathPara 独立成行，jc 跟段落对齐）；',
+            '    解析失败不炸整份文件：按原样排成文字 run，并在 warnings 里报原因与位置',
+            '    推荐：行内公式放 bullets/table/cards 的 runs 里；展示式公式用 statement({runs:[{math}]})',
+            '    或 shape 的 textOpts.paras / panel —— 一页一条关键等式最常见',
+            '  ── 字体（三级可覆盖）──',
+            "  ① 全篇：create({font:'楷体'}) 四槽全换；或 {font:{body:'微软雅黑', bodyEn:'Calibri',",
+            "     title:'黑体', titleEn:'Georgia'}} 只换写到的槽（内部名 cn/en/titleCn/titleEn 也认）。",
+            '     字体名是自由值不校验（机器缺字体时 PowerPoint 自己回落），空值忽略、超 64 字符 warning；',
+            '     标题槽作用于封面/章节/内容页/结尾的标题，正文槽作用于其它一切文字',
+            '  ② 段落：para.font = 字符串或 {en, cn}（shape 的 textOpts.font、master 的 header.font 走这里）',
+            '  ③ run：run.font = 字符串或 {en, cn}（图标字形就靠它指定 Segoe MDL2 Assets）',
+            '    字体优先级 run → 段落 → 全篇 → 主题；数学 run 不写字体（公式区由 Cambria Math 接管）',
         ],
         read: [
             'read(path, env) → report（stats/outline/warnings 全部来自真实解析，不是脚本自述）',
             '  report 的键：ok / format / path / bytes / theme / size / stats / pages / outline / warnings',
-            '  stats: slides + layouts（各版式页数）+ shapes/autoShapes/textBoxes/tables/images/words/bytes 等',
+            '  stats: slides + layouts（各版式页数）+ shapes/autoShapes/textBoxes/tables/images/words/formulas/bytes 等',
             '  stats.media: [{part, contentType, bytes, width, height, slides[]}] —— 包里每个 ppt/media 部件一条',
             '    （与 stats.imageParts 同一批条目；slides 是引用它的页码，空数组表示没有页面引用它）',
             '  pages[]: 每页 {index, layout, title, shapes, autoShapes, tables, tableRows, tableColumns,',
-            '    mergedCells, images, cropped, fullBleed, dpi, imageSizes, textBoxes, lines, words, notes, helperCount}',
+            '    mergedCells, images, cropped, fullBleed, dpi, imageSizes, textBoxes, lines, words, formulas, notes, helperCount}',
             '  outline: ["P1 cover：标题", ...]；warnings: 排版风险（例如「第 N 页没有标题文本」）',
             '  注意：逐页数组叫 pages，不是 slides（slides 只在 stats 里是页数）。',
         ],
@@ -4759,12 +5036,54 @@ function normalizeSize(value) {
     return '16:9';
 }
 
+/**
+ * create({font}) 的归一：全篇字体覆盖。
+ * 字符串 = 四个槽（中文/西文正文、中文/西文标题）全换；
+ * 对象 = body/bodyEn/title/titleEn（内部名 cn/en/titleCn/titleEn 也认），只换写到的槽。
+ * 字体名不校验枚举（PowerPoint 缺字体时自己回落），但空值忽略、超长报 warning。
+ */
+function normalizeFontOverride(raw, push) {
+    const invalid = 'font 只收字符串或 {body, bodyEn, title, titleEn} 对象，已忽略';
+    if (raw === undefined || raw === null) return {};
+    const clean = (value, label) => {
+        const face = asString(value).trim();
+        if (face === '') return undefined;
+        if (face.length > 64) {
+            push(`字体 ${label} 超过 64 个字符，已忽略`);
+            return undefined;
+        }
+        return face;
+    };
+    if (typeof raw === 'string') {
+        const face = clean(raw, 'font');
+        if (face === undefined) return {};
+        return { cn: face, en: face, titleCn: face, titleEn: face };
+    }
+    if (typeof raw !== 'object' || Array.isArray(raw)) {
+        push(invalid);
+        return {};
+    }
+    const out = {};
+    const cn = clean(raw.body ?? raw.cn, 'body');
+    const en = clean(raw.bodyEn ?? raw.en, 'bodyEn');
+    const titleCn = clean(raw.title ?? raw.titleCn, 'title');
+    const titleEn = clean(raw.titleEn, 'titleEn');
+    if (cn !== undefined) out.cn = cn;
+    if (en !== undefined) out.en = en;
+    if (titleCn !== undefined) out.titleCn = titleCn;
+    if (titleEn !== undefined) out.titleEn = titleEn;
+    return out;
+}
+
 function makeDeck(spec, env) {
     const input = spec !== null && typeof spec === 'object' ? spec : {};
     const resolved = env.theme(input.theme);
     const theme = resolved.theme;
     const title = asString(input.title, '未命名演示文稿');
     const sizeId = normalizeSize(input.size);
+    // 全篇字体覆盖先归一（warning 要进 state.inputWarnings，所以先建数组再建 state）
+    const inputWarnings = [];
+    const fontOverride = normalizeFontOverride(input.font, (message) => inputWarnings.push(message));
     const state = {
         env,
         theme,
@@ -4773,11 +5092,12 @@ function makeDeck(spec, env) {
         author: asString(input.author, ''),
         date: asString(input.date, new Date().toISOString().slice(0, 10)),
         sizeId,
+        fontOverride,
         path: input.path === undefined || input.path === null || String(input.path) === ''
             ? ensureExtension(slugify(title, 'presentation'), '.pptx')
             : ensureExtension(String(input.path), '.pptx'),
         slides: [],
-        inputWarnings: [],
+        inputWarnings,
         stamp: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
     };
     if (resolved.fellBack) {
@@ -4955,7 +5275,11 @@ function makeDeck(spec, env) {
             return push('image', {
                 path: file,
                 title: asString(input2.title),
-                caption: asString(input2.caption, ''),
+                // 来源/署名（历史遗留 1-2）：PPT 的图注就是页面底部那一行居中文本，
+                // 署名并进同一行（用 ｜ 分隔）—— 页面里没有第二个自然落点，
+                // 而「配图无来源」正是要修的事。传 office.image.fetch 返回的 credit。
+                caption: withCredit(asString(input2.caption, ''), input2.source),
+                source: asString(input2.source, ''),
                 // 这里刻意只做「原样透传」：非法 fit / 负数尺寸统一在渲染时落成 warning，
                 // 这样 save() 之前随时改 spec 都不会让状态变得不可预期
                 spec: {
@@ -4967,6 +5291,24 @@ function makeDeck(spec, env) {
                     fullBleed: input2.fullBleed === true,
                 },
             });
+        },
+        /**
+         * 原生图表页（历史遗留 `11-6`）：真正的 DrawingML 图表部件，不是位图。
+         *
+         * 与「Python 画图再插进来」的区别：这是 PowerPoint 里的**图表对象** ——
+         * 能选中、能改图表类型、能「编辑数据」（数据以 numLit/strLit 内联在图表里，
+         * 所以打开即画，不需要刷新）。要改数据走 Office 的「编辑数据」。
+         *
+         * @param {{type?: 'bar'|'column'|'line'|'pie'|'area'|'scatter', title?: string,
+         *   categories?: Array<string|number>, series: Array<{name?: string, values: number[], x?: number[]}>,
+         *   legend?: 'bottom'|'right'|'left'|'top'|'none'|false, labels?: boolean, stacked?: boolean,
+         *   gapWidth?: number, colors?: string[]}} data
+         */
+        chart(data) {
+            const input2 = data ?? {};
+            // 当场校验：参数错了要在这一行报出来，而不是等到 save() 之后
+            const spec = normalizeChartSpec(input2);
+            return push('chart', { title: asString(input2.title), spec });
         },
         /** 一页多图：等分网格，逐格等比放入。items 为 [{path, caption}]。 */
         images(data, opts) {
@@ -4980,7 +5322,8 @@ function makeDeck(spec, env) {
                     }
                     return {
                         path: asString(item.path ?? item.src ?? item.file),
-                        caption: asString(item.caption, ''),
+                        caption: withCredit(asString(item.caption, ''), item.source),
+                        source: asString(item.source, ''),
                     };
                 });
             items.forEach((item, index) => {
@@ -5111,7 +5454,11 @@ function makeDeck(spec, env) {
             }
             return pushHelper('imageText', {
                 title: asString(input2.title),
-                image: { path, fit: asString(image.fit, ''), caption: asString(image.caption, '') },
+                image: {
+                    path,
+                    fit: asString(image.fit, ''),
+                    caption: withCredit(asString(image.caption, ''), image.source),
+                },
                 items: helperItems(input2.items),
                 text: asString(input2.text),
                 side: input2.side === undefined ? 'left' : asString(input2.side),
@@ -5362,6 +5709,7 @@ function parseSlide(root) {
     let tables = 0;
     let tableRows = 0;
     let tableCols = 0;
+    let charts = 0;
     let images = 0;
     let croppedImages = 0;
     let fullBleed = false;
@@ -5394,6 +5742,9 @@ function parseSlide(root) {
                 }
             } else if (node.name === 'p:graphicFrame') {
                 const table = descendants(node, 'a:tbl')[0];
+                // 没有 a:tbl 的 graphicFrame 就是图表框架（历史遗留 11-6）：以前这里
+                // 直接把它丢掉 —— 报告里既没有表格也没有图表，模型会以为这页是空的。
+                const chart = descendants(node, 'c:chart')[0];
                 if (table !== undefined) {
                     const rows = descendants(table, 'a:tr');
                     const cols = descendants(table, 'a:gridCol');
@@ -5407,6 +5758,10 @@ function parseSlide(root) {
                     }
                     const header = rows[0] === undefined ? '' : normalizeSpace(shapeText(rows[0])).slice(0, 40);
                     shapes.push({ kind: 'table', name: '表格', rows: rows.length, columns: cols.length, text: header });
+                } else if (chart !== undefined) {
+                    charts += 1;
+                    const cNvPr = descendants(node, 'p:cNvPr')[0];
+                    shapes.push({ kind: 'chart', name: cNvPr?.attrs?.name ?? '图表', relId: chart.attrs['r:id'] ?? '' });
                 }
             } else if (node.name === 'p:pic') {
                 images += 1;
@@ -5447,7 +5802,7 @@ function parseSlide(root) {
     const bodyShapes = textShapes.filter((item) => item !== titleShape && !CHROME_SHAPES.has(item.name));
     bodyLines = bodyShapes.reduce((sum, item) => sum + (item.paragraphs?.length ?? 0), 0);
     return {
-        shapes, title, tables, tableRows, tableCols, images, croppedImages,
+        shapes, title, tables, tableRows, tableCols, charts, images, croppedImages,
         fullBleed, bodyLines, textShapes, autoShapes, mergedCells, hasNamedStatement,
         helper: helper?.kind, helperCount: helper?.count ?? 0,
         imageShapes: shapes.filter((item) => item.kind === 'image'),
@@ -5480,12 +5835,15 @@ export function read(path, env) {
     let totalShapes = 0;
     let totalNotes = 0;
     let totalTables = 0;
+    let totalCharts = 0;
     let totalImages = 0;
     let totalWords = 0;
     let totalCropped = 0;
     let totalLowDpi = 0;
     let totalAutoShapes = 0;
     let totalMerged = 0;
+    let totalFormulas = 0;
+    let totalFormulaErrors = 0;
     // 图片页的展示尺寸与 DPI 从 slide 关系里的媒体部件反推：rels 指向哪个 imageN，
     // 就按那个部件的真实像素数算清晰度，报告里的 DPI 才不是凭空猜的
     const mediaByPart = new Map();
@@ -5543,21 +5901,23 @@ export function read(path, env) {
             }
         }
         if (layout === undefined) {
-            // 内容兜底：有表格认表格、有图认图片，首尾页分别按封面/结尾处理
+            // 内容兜底：有表格认表格、有图表认图表、有图认图片，首尾页分别按封面/结尾处理
             if (parsed.tables > 0) layout = 'table';
+            else if (parsed.charts > 0) layout = 'chart';
             else if (parsed.images > 0) layout = 'image';
             else if (index === 0) layout = 'cover';
             else if (index === ordered.length - 1) layout = 'closing';
             else layout = 'bullets';
         } else if (layout === 'statement' && parsed.autoShapes > 0 && !parsed.hasNamedStatement) {
-            // 自由绘制页与版式助手页借的都是「陈述」版式部件。页面上没有 Statement 文本框、
-            // 却有自绘形状时：名字能认出助手就报助手（cards/steps/…），否则才是自由页。
-            // 不这样认的话，read() 会把复刻的参考稿页报成「陈述」，助手页更是完全看不出来。
-            layout = parsed.helper ?? 'shape';
+            // 自由绘制页、版式助手页与图表页借的都是「陈述」版式部件。页面上没有 Statement
+            // 文本框、却有自绘形状时：有图表就是图表页，名字能认出助手就报助手，否则才是自由页。
+            // 不这样认的话，read() 会把复刻的参考稿页报成「陈述」，图表页更是会被报成自由页。
+            layout = parsed.charts > 0 ? 'chart' : (parsed.helper ?? 'shape');
         }
         layoutCount[layout] = (layoutCount[layout] ?? 0) + 1;
         totalShapes += parsed.shapes.length;
         totalTables += parsed.tables;
+        totalCharts += parsed.charts;
         totalImages += parsed.images;
         totalCropped += parsed.croppedImages;
         totalAutoShapes += parsed.autoShapes;
@@ -5583,8 +5943,22 @@ export function read(path, env) {
             warnings.push(`第 ${index + 1} 页有 ${parsed.croppedImages} 张图片带 a:srcRect 裁切，部分内容不显示`);
         }
         // 字数按整页所有文本节点算：这样与生成端的 words 口径一致（含表格单元格）
-        const words = descendants(root, 'a:t').reduce((sum, node) => sum + wordsOf(textOf(node)), 0);
+        const textNodes = descendants(root, 'a:t');
+        const words = textNodes.reduce((sum, node) => sum + wordsOf(textOf(node)), 0);
         totalWords += words;
+        // 公式按 a14:m 计数：自己写的与 PowerPoint 写的文件都是这个包装
+        const formulas = (xml.match(/<a14:m[ >]/g) ?? []).length;
+        totalFormulas += formulas;
+        // 兜底扫描（第四十八轮 P0-1）：解析失败的公式在写入时回落成普通 run，原文进 a:t，
+        // 之后再读就只是普通文本 —— 只看 a14:m 的话，这些页会被报成「没有公式、也没有问题」。
+        // 判据在 ppt-math 的 looksLikeLatex（要求命中支持域里的命令，Windows 路径不会误报）。
+        const strayLatex = textNodes.map((node) => textOf(node)).filter((text) => looksLikeLatex(text));
+        if (strayLatex.length > 0) {
+            totalFormulaErrors += strayLatex.length;
+            warnings.push(`第 ${index + 1} 页有 ${strayLatex.length} 处疑似未解析的 LaTeX 文本`
+                + `（如「${strayLatex[0].slice(0, 32)}」）：写入时公式解析失败会回落成普通文字，`
+                + '这几处要按 runs:[{ math }] 重写或改写成纯文本');
+        }
         const page = {
             index: index + 1,
             layout,
@@ -5595,6 +5969,7 @@ export function read(path, env) {
             tableRows: parsed.tableRows,
             tableColumns: parsed.tableCols,
             mergedCells: parsed.mergedCells,
+            charts: parsed.charts,
             images: parsed.images,
             cropped: parsed.croppedImages,
             fullBleed: parsed.fullBleed,
@@ -5603,6 +5978,7 @@ export function read(path, env) {
             textBoxes: parsed.textShapes.length,
             lines: parsed.bodyLines,
             words,
+            formulas,
             notes: notes.slice(0, 120),
             helperCount: parsed.helperCount,
         };
@@ -5706,6 +6082,8 @@ export function read(path, env) {
             mergedCells: totalMerged,
             textBoxes: pages.reduce((sum, page) => sum + page.textBoxes, 0),
             tables: totalTables,
+            // 原生图表（历史遗留 11-6）：生成端与 read() 侧同一口径
+            charts: totalCharts,
             images: totalImages,
             cropped: totalCropped,
             lowDpi: totalLowDpi,
@@ -5714,6 +6092,10 @@ export function read(path, env) {
             media,
             notes: totalNotes,
             words: totalWords,
+            // 原生公式数（a14:m 计数）：生成端与 read() 侧同一口径
+            formulas: totalFormulas,
+            // 疑似未解析的 LaTeX 文本数（兜底扫描，见上面的注释）：生成端与 read() 侧同一口径
+            formulaErrors: totalFormulaErrors,
             bytes: bytes.length,
         },
         pages,

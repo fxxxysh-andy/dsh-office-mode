@@ -12,7 +12,7 @@ import { createCache } from './engine/cache.js';
 import { createEnv } from './engine/kit.js';
 import { resolveTheme } from './engine/theme.js';
 import { createMemory } from './memory.js';
-import { projectDigest, sessionIdOf } from './projection.js';
+import { projectDigest, sessionIdOf, signalOf } from './projection.js';
 import { formatByExtension, formatIds, loadFormat } from './registry.js';
 import { buildSdk, isOfficeFile } from './sdk.js';
 
@@ -165,6 +165,20 @@ async function inspectFile(write, env) {
 }
 
 /**
+ * 台账 `note` 里的告警摘要：最多列 4 条，多的只报条数。
+ *
+ * 告警是**逐项 push** 的（一个 500 处公式错误的 xlsx 能带出几百条），而 note 会进
+ * `ledgerSearchText` 参与每次检索的匹配 —— 不封顶就等于给台账塞一条几十 KB 的键。
+ * memory.log 那一侧还有一道 400 字符的兜底（手工 log 也走那条）。
+ */
+function warningsNoteOf(warnings) {
+    const list = Array.isArray(warnings) ? warnings : [];
+    if (list.length === 0) return '';
+    const head = list.slice(0, 4).join('；');
+    return list.length > 4 ? `${head}；…共 ${list.length} 条告警` : head;
+}
+
+/**
  * 执行一次 office_run。
  * @param {unknown} rawArgs 工具参数
  * @param {{agent?: {session?: {header?: {cwd?: string}}}, signal?: AbortSignal}} exec 工具执行上下文
@@ -214,6 +228,34 @@ export async function executeRun(rawArgs, exec, config) {
     for (const write of writes) {
         if (isOfficeFile(write.path)) files.push(await inspectFile(write, env));
         else otherFiles.push({ path: write.path, bytes: write.bytes });
+    }
+
+    // 台账的 `source`（第十九轮 P1-4 / 第二十四轮 P1-3）：本次脚本**真的读过**、
+    // 而且不是这次自己写出来的那些输入文件。
+    //
+    // 两条口径都不是随手定的：
+    //   · 只算读过的内容（env.reads）——`exists` / `stat` / `list` 只是探路，不是依据；
+    //   · 自己写出来的文件不算来源 —— 原地 revise 会先读同一份产物，记进去是同义反复
+    //     （「这份 pptx 的来源是这份 pptx」），只会把台账的检索键灌满噪声。
+    // 上限 8 条与 memory.log 的 source 截断一致。
+    //
+    // 网络来源（第三十八轮起 env.citations：图片的图库页 / 许可页）排在文件之后：
+    // 它们同样是「这份产物依据了什么」，但不如本地输入常用，超出上限时先丢它们。
+    const writtenPaths = new Set(writes.map((write) => write.path));
+    const sourcePaths = [];
+    const seenSource = new Set();
+    for (const read of env.reads) {
+        if (writtenPaths.has(read.path) || seenSource.has(read.path)) continue;
+        seenSource.add(read.path);
+        sourcePaths.push(read.path);
+        if (sourcePaths.length >= 8) break;
+    }
+    for (const citation of env.citations ?? []) {
+        if (sourcePaths.length >= 8) break;
+        if (seenSource.has(citation.url)) continue;
+        seenSource.add(citation.url);
+        const license = citation.license === '' ? '' : `（${citation.license}）`;
+        sourcePaths.push(`${citation.url}${license}`);
     }
 
     // clearedAfter 表示「这次调用把缓存清空了」；keepCache 默认跟随配置（默认保留），
@@ -295,7 +337,11 @@ export async function executeRun(rawArgs, exec, config) {
                     purpose: result.purpose,
                     outline: file.outline,
                     stats: file.stats,
-                    note: file.note,
+                    // 复检没给 note 时，把这次文件自己的告警折进 note：`ledgerSearchText`
+                    // 的排序指望 outline + source + note 三块，而告警（如「正文溢出」）
+                    // 正是「以后再找这份东西」时最可能被想起的词。有界，见 warningsNoteOf。
+                    note: file.note ?? warningsNoteOf(file.warnings),
+                    source: sourcePaths,
                 })))
                 : { added: 0, kept: digest.ledgerTotal, rolled: 0 };
             result.memory = {
@@ -304,21 +350,33 @@ export async function executeRun(rawArgs, exec, config) {
                 logged: logged.added,
                 kept: logged.kept,
                 rolled: logged.rolled,
-                // 投影只在热记忆变化时贴全文（没变就给一行 + 台账照旧）——
+                // 投影只在热记忆变化、话题信号切换或台账指纹变化时贴正文（没变就一行）——
                 // office_run 是同一个会话里会被反复调的入口，详见 projection.js。
                 //
-                // 第十七轮再把「没变」那一档压成一行：office_run 的职责是把
+                // 第十七轮把「没变」那一档压成一行：office_run 的职责是把
                 // **这次写出了什么**说清楚，而热记忆的正文在动笔前的 office_help
-                // 上已经贴过（同一份热记忆，revision 没变就等于已经在上下文里）。
+                // 上已经贴过（同一份热记忆，writeRevision 没变就等于已经在上下文里）。
                 // 原来每次 office_run 都重贴一段骨架（标题 + 两条尾巴 + 用量行 ≈
                 // 1.1 KB），一轮里调三次就是 3.3 KB，收益为零。
+                //
+                // 注意时序：这里的 digest 在 log **之前**取，所以本次刚登记的台账
+                // 行不在这份反馈里（登记数在 memory.logged 上）；下一次调用会看到
+                // 台账指纹变了、把最近几行贴出来。
                 ...(digest.empty === false
                     ? (() => {
-                        const projected = projectDigest(digest, { sessionId: sessionIdOf(exec), context: 'run' });
+                        // 信号来自脚本本身：里面写的 office.ppt… / .pptx 就是这次在做的事，
+                        // 投影据此只给相关条目（详见 projection.js 的 signalOf）。
+                        const projected = projectDigest(digest, {
+                            sessionId: sessionIdOf(exec),
+                            context: 'run',
+                            signal: signalOf({ script }),
+                            // 投影预算（第四十八轮 P0-2）：0 / 未配置 = 不限
+                            budget: config?.memory?.projectionBudgetBytes,
+                        });
                         return {
                             digest: projected.mode === 'full'
                                 ? projected.text
-                                : '📒 热记忆与上次投影相同（要看：office_memory({ action: \'read\', layer: \'hot\' })）。',
+                                : '📒 热记忆与最近台账与上次投影相同（要看：office_memory({ action: \'read\' })）。',
                             digestMode: projected.mode,
                         };
                     })()
