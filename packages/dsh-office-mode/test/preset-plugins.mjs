@@ -410,6 +410,25 @@ await check('还原：关掉一行再还原 → 两份文件都回到快照那�
     return `${restored.restored.length} 个文件`;
 });
 
+await check('快照：同一毫秒内两次改动各留一份，还原取最新那份', () => {
+    resetFiles();
+    // Linux 上两次写盘的间隔可能小于 1 ms：快照文件名必须还能区分，否则后一份把前一份覆盖，
+    // 还原就退回更早的那一档（CI 上真出现过 1 !== 2）。
+    const at = new Date();
+    writePluginToggle(targets, { id: 'persona', enabled: false, at });
+    writePluginToggle(targets, { id: 'tool-fs', enabled: false, at });
+    const backups = listBackups(targets);
+    assert.equal(backups.length, 2, '两次改动要留两份快照，不能同名覆盖');
+    const restored = restoreLastBackup(targets);
+    assert.equal(restored.ok, true, restored.error);
+    assert.equal(restored.restored.length, 2);
+    // 最新一份是「tool-fs 改动之前」：persona 已关、tool-fs 还没关。
+    const listed = readPresetPlugins(targets);
+    assert.equal(listed.rows.find((row) => row.id === 'persona').enabled, false);
+    assert.equal(listed.rows.find((row) => row.id === 'tool-fs').enabled, true);
+    return '同毫秒两份不覆盖';
+});
+
 await check('还原：没有备份时明确拒绝', () => {
     resetFiles();
     const result = restoreLastBackup(targets);

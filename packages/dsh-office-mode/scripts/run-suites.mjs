@@ -163,7 +163,7 @@ function run(name) {
                 .slice(-1)[0] || '';
             console.log(`${code === 0 ? 'OK  ' : 'RED '} ${name.padEnd(20)} exit=${code} ${seconds}s  ${summary.slice(0, 110)}`);
             if (code !== 0) {
-                const tail = out.trim().split(/\r?\n/).slice(-18).join('\n');
+                const tail = out.trim().split(/\r?\n/).slice(-260).join('\n');
                 console.log(tail.split('\n').map((line) => `       | ${line}`).join('\n'));
             }
             done(code === 0);

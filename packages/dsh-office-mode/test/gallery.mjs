@@ -13,7 +13,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile, readdir } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { homedir, hostname, tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { deflateSync } from 'node:zlib';
 import {
     MAX_TAGS,
@@ -198,9 +198,16 @@ await check('addFromPath：只接受信任根内的普通文件', async () => {
 });
 
 await check('galleryRootDir：显式目录优先，相对路径相对用户主目录，否则与知识库同级', async () => {
-    assert.equal(galleryRootDir({ galleryDir: 'D:/data/gallery' }, 'D:/data/kb'), 'D:\\data\\gallery');
-    assert.equal(galleryRootDir({ galleryDir: 'pics/gallery' }, 'D:/data/kb'), resolve(homedir(), 'pics/gallery'));
-    assert.equal(galleryRootDir({}, 'D:/data/kb'), 'D:\\data\\gallery');
+    // 盘符只在 Windows 上是「绝对路径」；POSIX 上它是一段普通相对路径。
+    // 这一条要跨平台成立，所以两种语义都按当前平台算期望值，不写死 Windows 的形状。
+    const isWindows = process.platform === 'win32';
+    const kbRoot = join(tmpdir(), 'dsh-gallery-root-kb');
+    assert.equal(
+        galleryRootDir({ galleryDir: 'D:/data/gallery' }, kbRoot),
+        isWindows ? 'D:\\data\\gallery' : resolve(homedir(), 'D:/data/gallery'),
+    );
+    assert.equal(galleryRootDir({ galleryDir: 'pics/gallery' }, kbRoot), resolve(homedir(), 'pics/gallery'));
+    assert.equal(galleryRootDir({}, kbRoot), join(dirname(resolve(kbRoot)), 'gallery'));
     assert.equal(galleryRootDir({}, ''), '');
 });
 
