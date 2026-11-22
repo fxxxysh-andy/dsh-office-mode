@@ -369,7 +369,12 @@ export function writeSnapshot(targets, files, at = new Date()) {
     const stamp = `${at.getFullYear()}${String(at.getMonth() + 1).padStart(2, '0')}${String(at.getDate()).padStart(2, '0')}`
         + `-${String(at.getHours()).padStart(2, '0')}${String(at.getMinutes()).padStart(2, '0')}${String(at.getSeconds()).padStart(2, '0')}`
         + `-${String(at.getMilliseconds()).padStart(3, '0')}`;
-    const file = join(dir, `preset-${stamp}.json`);
+    // 同一毫秒内连续两次改动会撞同一个文件名：第二份把第一份覆盖掉，还原就少了那一档。
+    // 撞名时加 `~1`、`~2` 后缀（`~` 不是时间戳里的字，排序仍能按 base + 序号读）。
+    let file = join(dir, `preset-${stamp}.json`);
+    for (let seq = 1; existsSync(file) && seq <= 999; seq += 1) {
+        file = join(dir, `preset-${stamp}~${seq}.json`);
+    }
     const payload = {
         at: at.toISOString(),
         preset: targets.presetPatch,
@@ -389,7 +394,16 @@ export function writeSnapshot(targets, files, at = new Date()) {
     return file;
 }
 
-/** 快照清单：新的在前。 */
+/** 快照文件名拆成「时间戳 + 撞名序号」，供排序用（序号缺省是 0）。 */
+function snapshotRank(name) {
+    const body = String(name).replace(/^preset-/, '').replace(/\.json$/, '');
+    const mark = body.lastIndexOf('~');
+    if (mark < 0) return { base: body, seq: 0 };
+    const seq = Number(body.slice(mark + 1));
+    return Number.isFinite(seq) ? { base: body.slice(0, mark), seq } : { base: body, seq: 0 };
+}
+
+/** 快照清单：新的在前（同一毫秒的按撞名序号排，序号大的更新）。 */
 export function listBackups(targets) {
     const dir = backupDirOf(targets);
     if (!existsSync(dir)) return [];
@@ -411,7 +425,13 @@ export function listBackups(targets) {
             }
             return { path, name, at, size };
         })
-        .sort((a, b) => String(b.name).localeCompare(String(a.name)));
+        .sort((a, b) => {
+            const left = snapshotRank(a.name);
+            const right = snapshotRank(b.name);
+            if (left.base !== right.base) return right.base.localeCompare(left.base);
+            if (left.seq !== right.seq) return right.seq - left.seq;
+            return String(b.name).localeCompare(String(a.name));
+        });
 }
 
 /** 读出 preset 的插件行 + 每一行在 profile 侧有没有覆盖行。 */

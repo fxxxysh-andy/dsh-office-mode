@@ -18,6 +18,7 @@ import assert from 'node:assert/strict';
 
 import { resolveConfig } from '../src/config.js';
 import { createMemory } from '../src/memory.js';
+import { pdfEngines } from '../src/pdf.js';
 import { buildSnapshot, EXPORT_VIEW_PATH, knownWorkspaces, noteWorkspace, registerMemoryView, resetWorkspaces, MEMORY_MUTATE_PATH, MEMORY_VIEW_PATH, MODEL_STATUS_PATH, MODEL_DOWNLOAD_PATH, FS_LIST_PATH, KB_UPLOAD_PATH, KB_ASSET_PATH, OCR_PATH, LLM_MODELS_PATH, GALLERY_PATH } from '../src/view.js';
 
 // 测试中间产物统一落在仓库根的 .office/runtime/tmp/<suite>/ 下（不再用包内的 test/.tmp）。
@@ -26,8 +27,10 @@ const TMP = fileURLToPath(new URL('../../../.office/runtime/tmp/view/', import.m
 const results = [];
 async function check(name, fn) {
     try {
-        await fn();
-        results.push({ name, ok: true });
+        // 用例可以 return 一句说明（比如「本机没装 PyMuPDF，只校验了如实报错」），
+        // 打印时会跟在 PASS 后面，避免把没跑到的分支当成跑过了。
+        const note = await fn();
+        results.push({ name, ok: true, note: typeof note === 'string' ? note : undefined });
     } catch (error) {
         results.push({ name, ok: false, error });
     }
@@ -861,6 +864,19 @@ await check('知识库预览：8–24 MB 的 PDF 自动按页拆分，逐份可�
     ]);
     assert.ok(pdf.length > 8 * 1024 * 1024, '夹具必须超过 8 MB 才走拆分分支：' + pdf.length);
     const before = readdirSync(tmpdir()).filter((name) => name.startsWith('dsh-kb-split-'));
+    // 拆分只走 PyMuPDF（pip install pymupdf）。CI 是无外部依赖的纯 Node 环境，没有它时
+    // 走不到拆分分支——这时仍要钉住「拆不了必须如实说、不假装」，但不假装自己测过拆分。
+    const engines = await pdfEngines();
+    if (!engines.render.includes('fitz')) {
+        const fallback = await memory.kbPreview({ name: '大文档.pdf', data: pdf, splitTargetBytes: 1 });
+        assert.equal(fallback.kind, 'unknown', '拆不了就给 unknown，不能编一份拆好的结果');
+        assert.match(fallback.note, /自动拆分也没成功/);
+        assert.match(fallback.note, /PyMuPDF/);
+        assert.equal(fallback.parts, undefined, '没拆出来就不能带 parts');
+        const left = readdirSync(tmpdir()).filter((name) => name.startsWith('dsh-kb-split-'));
+        assert.deepEqual(left, before, '拆分失败也要收掉临时目录');
+        return '本机没有 PyMuPDF，拆分分支未测（只校验如实报错）';
+    }
     // 目标 1 字节：每页都必须单独成一份，避免 PyMuPDF 的 deflate 把两页压进同一份。
     const preview = await memory.kbPreview({ name: '大文档.pdf', data: pdf, splitTargetBytes: 1 });
     assert.equal(preview.kind, 'split', preview.note);
@@ -1315,7 +1331,7 @@ await check('导出：HEAD 只回头带长度不带正文；记忆关掉时 403'
 
 const failed = results.filter((item) => !item.ok);
 for (const item of results) {
-    console.log(`${item.ok ? 'PASS' : 'FAIL'}  ${item.name}${item.ok ? '' : `\n      ${item.error?.message ?? item.error}`}`);
+    console.log(`${item.ok ? 'PASS' : 'FAIL'}  ${item.name}${item.ok ? (item.note ? `  —— ${item.note}` : '') : `\n      ${item.error?.message ?? item.error}`}`);
 }
 console.log(`view: ${results.length - failed.length}/${results.length} 通过`);
 process.exit(failed.length > 0 ? 1 : 0);
