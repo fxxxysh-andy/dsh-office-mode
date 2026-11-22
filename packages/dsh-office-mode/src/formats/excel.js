@@ -21,6 +21,10 @@ import {
 } from '../engine/kit.js';
 import { isAbsolute, relative, sep } from 'node:path';
 import { DEFAULT_THEME_ID, resolveTheme, shadeOf, toHex } from '../engine/theme.js';
+// 图片魔数嗅探只借这一条既有导出：Excel 只嵌 PNG/JPEG，其它格式（GIF/WebP/SVG…）
+// 由这里判出来 warn 跳过。像素尺寸在下面自己解析（PNG IHDR / JPEG SOF），
+// 不依赖嗅探器是否带回宽高。
+import { sniffImageBytes } from '../image-source.js';
 import {
     CHART_CONTENT_TYPE, DRAWING_CONTENT_TYPE as CHART_DRAWING_CONTENT_TYPE,
     REL_TYPE_CHART as CHART_REL_CHART, REL_TYPE_DRAWING as CHART_REL_DRAWING,
@@ -606,6 +610,119 @@ function describeSource(source) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// 图片（xl/media）：格式嗅探 / 像素尺寸 / 锚点 / 显示尺寸
+// ───────────────────────────────────────────────────────────────────────────
+
+// OOXML 的长度单位是 EMU（English Metric Unit）：1 cm = 360000 EMU，
+// 也是「1 英寸 = 914400」的 1/2.54。图表与图片共用这套换算，改这里就是全改。
+const EMU_PER_CM = 360000;
+
+/** 正数才收：widthCm: 0 / -3 / "abc" 都当没给（继续走等比或原尺寸）。 */
+function positiveNumber(value) {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+/**
+ * 从图片字节里读像素尺寸。
+ *
+ * 为什么不用 sniffImageBytes 带回来的宽高：嗅探器只保证「这是什么格式」，
+ * 尺寸字段在 JPEG 里要靠扫段找 SOF，失败时是 null。这里按格式自己再解析一次，
+ * 解不出来时回落到嗅探结果，仍没有就按 0 处理（调用方据此按 4:3 估算并 warn）。
+ *
+ * @param {Uint8Array} bytes 原始图片字节
+ * @param {{width?: number, height?: number}|undefined} sniffed sniffImageBytes 的结果
+ * @returns {{width: number, height: number}}
+ */
+function imagePixelSize(bytes, sniffed) {
+    const size = { width: 0, height: 0 };
+    const buf = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes ?? []);
+    if (sniffed?.mime === 'image/png' && buf.length >= 24) {
+        // PNG：8 字节签名 + 4 字节长度 + "IHDR" + width/height 各 4 字节大端
+        size.width = ((buf[16] << 24) >>> 0) + (buf[17] << 16) + (buf[18] << 8) + buf[19];
+        size.height = ((buf[20] << 24) >>> 0) + (buf[21] << 16) + (buf[22] << 8) + buf[23];
+    } else if (sniffed?.mime === 'image/jpeg') {
+        // JPEG：从 SOI 往后扫段；SOF0/SOF1/SOF2 等帧头里 height 在前、width 在后。
+        const isSof = (marker) => (marker >= 0xc0 && marker <= 0xc3)
+            || (marker >= 0xc5 && marker <= 0xc7)
+            || (marker >= 0xc9 && marker <= 0xcb)
+            || (marker >= 0xcd && marker <= 0xcf);
+        let i = 2;
+        while (i + 8 < buf.length) {
+            if (buf[i] !== 0xff) { i += 1; continue; }
+            let marker = buf[i + 1];
+            while (marker === 0xff) { i += 1; marker = buf[i + 1]; }
+            // 无长度的标记：TEM、RSTn、SOI、EOI
+            if (marker === 0x01 || marker === 0xd8 || marker === 0xd9 || (marker >= 0xd0 && marker <= 0xd7)) {
+                i += 2;
+                continue;
+            }
+            const length = (buf[i + 2] << 8) | buf[i + 3];
+            if (length < 2) break;
+            if (isSof(marker) && i + 8 < buf.length) {
+                size.height = (buf[i + 5] << 8) | buf[i + 6];
+                size.width = (buf[i + 7] << 8) | buf[i + 8];
+                break;
+            }
+            i += 2 + length;
+        }
+    }
+    if (!(size.width > 0 && size.height > 0) && sniffed?.width > 0 && sniffed?.height > 0) {
+        size.width = sniffed.width;
+        size.height = sniffed.height;
+    }
+    return size;
+}
+
+/**
+ * 锚点：A1 字符串或 {col, row}（都 0 基）。
+ *
+ * 返回 undefined 表示「写错了」，由调用方 warn 后跳过 —— 静默落到 A1 会让人
+ * 以为那是自己指定的位置，比不生成更糟。空值（undefined/null/空串）按默认 A1。
+ */
+function imageAnchorOf(at) {
+    if (at === undefined || at === null) return { col: 0, row: 0 };
+    if (typeof at === 'string') {
+        const text = at.trim();
+        if (text === '') return { col: 0, row: 0 };
+        const ref = parseRef(text);
+        return ref ? { col: ref.col, row: ref.row } : undefined;
+    }
+    if (typeof at === 'object') {
+        return {
+            col: Math.max(0, looseInteger(at.col) ?? 0),
+            row: Math.max(0, looseInteger(at.row) ?? 0),
+        };
+    }
+    return undefined;
+}
+
+/**
+ * 显示尺寸（cm）：给了 widthCm/heightCm 就照办，只给一边按原图比例等比。
+ *
+ * 原图比例来自像素尺寸（px / 96 * 2.54）；像素尺寸未知时按 4:3 估算并返回
+ * estimated=true，让调用方补一条 warning —— 尺寸本来是看图给的，估出来的
+ * 比例会明显不一样，得让人知道。
+ */
+function imageSizeCm(px, opts) {
+    const known = px.width > 0 && px.height > 0;
+    const naturalW = known ? (px.width / 96) * 2.54 : 12;
+    const naturalH = known ? (px.height / 96) * 2.54 : 9;
+    const widthCm = positiveNumber(opts.widthCm);
+    const heightCm = positiveNumber(opts.heightCm);
+    if (widthCm !== undefined && heightCm !== undefined) {
+        return { widthCm, heightCm, estimated: !known };
+    }
+    if (widthCm !== undefined) {
+        return { widthCm, heightCm: (widthCm * naturalH) / naturalW, estimated: !known };
+    }
+    if (heightCm !== undefined) {
+        return { widthCm: (heightCm * naturalW) / naturalH, heightCm, estimated: !known };
+    }
+    return { widthCm: naturalW, heightCm: naturalH, estimated: !known };
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Sheet：一个「虚拟落笔 + 样式 + 布局」的表格
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -637,6 +754,10 @@ class Sheet {
         // 这张表上的原生图表（历史遗留 11-6）：每项 { spec, at }，序列化时变成
         // xl/charts/chartN.xml + xl/drawings/drawingN.xml + 两个 rels。
         this.charts = [];
+        // 这张表上的图片：每项 { path, absolute, bytes, ext, at, cx, cy, alt, name }。
+        // 与图表共用同一个 drawing 部件（Excel 一张表只能挂一个 <drawing>），
+        // 但图片用 oneCellAnchor（锚在格子上、尺寸固定），图表用 twoCellAnchor。
+        this.images = [];
     }
 
     rowIndex(index) {
@@ -1357,6 +1478,69 @@ class Sheet {
         return this;
     }
 
+    /**
+     * 在这张表上嵌一张**图片**（PNG / JPEG）。
+     *
+     * 只支持这两种：OOXML 的 `xl/media` 理论上能装任何东西，但 Excel 对
+     * GIF/WebP/SVG 要么不显示、要么要求额外的扩展声明，与其生成一个「看起来
+     * 有图、打开却空白」的包，不如在这里 warn 掉。其它格式（以及读不到的文件）
+     * 只影响它自己，不影响同表其它图片与图表。
+     *
+     * 尺寸：默认按图片像素换算（px / 96 * 2.54 cm）；widthCm / heightCm 都给
+     * 就是拉伸到该尺寸，只给一个则按原图比例等比。
+     *
+     * 同一路径重复插入时，媒体部件在打包阶段按绝对路径去重（只存一份），
+     * 但每个调用都会保留自己的锚点 —— 一张图可以在一张表里出现多次。
+     *
+     * @param {string} filePath 图片路径（相对 env.root 或绝对路径）
+     * @param {{at?: string|{col?: number, row?: number}, widthCm?: number, heightCm?: number,
+     *   alt?: string, name?: string}} [opts]
+     */
+    image(filePath, opts = {}) {
+        const options = opts ?? {};
+        const target = asString(filePath).trim();
+        if (target === '') {
+            this.wb.warn('excel: image() 的路径为空，已跳过');
+            return this;
+        }
+        // 锚点先校验：位置写错了就没必要再去读文件（读文件也是有成本的）
+        const at = imageAnchorOf(options.at);
+        if (!at) {
+            this.wb.warn(`excel: image() 的锚点「${describeSource(options.at)}」不合法，已跳过`);
+            return this;
+        }
+        let bytes;
+        try {
+            bytes = this.wb.env.readFile(target);
+        } catch {
+            this.wb.warn(`excel: 图片「${target}」读不到，已跳过（表里不会出现这张图）`);
+            return this;
+        }
+        const sniffed = sniffImageBytes(bytes);
+        if (!sniffed || (sniffed.mime !== 'image/png' && sniffed.mime !== 'image/jpeg')) {
+            this.wb.warn(`excel: 图片「${target}」不是 PNG/JPEG，OOXML 只嵌这两种，已跳过`);
+            return this;
+        }
+        const px = imagePixelSize(bytes, sniffed);
+        const size = imageSizeCm(px, options);
+        if (size.estimated) {
+            this.wb.warn(`excel: 读不出图片「${target}」的像素尺寸，显示比例按 4:3 估算`);
+        }
+        this.images.push({
+            path: target,
+            // 去重按绝对路径：同一文件写成 ./a.png 与 a.png 也要认成一张
+            absolute: this.wb.env.resolve(target),
+            bytes,
+            ext: sniffed.ext,
+            at,
+            cx: Math.round(size.widthCm * EMU_PER_CM),
+            cy: Math.round(size.heightCm * EMU_PER_CM),
+            alt: asString(options.alt),
+            name: asString(options.name),
+        });
+        return this;
+    }
+
     // ── 排版计算 ──────────────────────────────────────────────────────────
 
     maxRow() {
@@ -1479,9 +1663,11 @@ class Sheet {
         if (this.merges.length > 0) {
             parts.push(`<mergeCells count="${this.merges.length}">${this.merges.map((ref) => `<mergeCell ref="${ref}"/>`).join('')}</mergeCells>`);
         }
-        // 图表锚在这张表上：`<drawing>` 在 CT_Worksheet 的顺序里紧跟 mergeCells 之后，
+        // 图表与图片锚在这张表上：`<drawing>` 在 CT_Worksheet 的顺序里紧跟 mergeCells 之后，
         // r:id 指向本表自己的 rels（`xl/worksheets/_rels/sheetN.xml.rels` 里的 rId1）。
-        if (this.charts.length > 0) parts.push('<drawing r:id="rId1"/>');
+        // 一张表只能挂一个 <drawing>：图表与图片必须挤进同一个绘图部件，否则
+        // 后一个 <drawing> 会被 Excel 当成重复元素、整张表判「不可读取的内容」。
+        if (this.charts.length > 0 || this.images.length > 0) parts.push('<drawing r:id="rId1"/>');
         parts.push('</worksheet>');
         return parts.join('');
     }
@@ -1677,6 +1863,15 @@ function contentTypesXml(sheetCount, chartParts = {}) {
     for (let i = 1; i <= drawings; i += 1) overrides.push(`/xl/drawings/drawing${i}.xml`);
     for (let i = 1; i <= charts; i += 1) overrides.push(`/xl/charts/chart${i}.xml`);
     overrides.push('/docProps/core.xml', '/docProps/app.xml', '/docProps/custom.xml');
+    // 图片媒体部件用 Default（按扩展名）而不是 Override（按部件名）：
+    // 一张 png 可能对应多个 xl/media/imageN.png，声明一次扩展名即可；
+    // 漏掉这条 Default 时 Excel 打开不报错，图片直接空白/裂图，很难查。
+    const imageExts = [...new Set((Array.isArray(chartParts.images) ? chartParts.images : [])
+        .map((ext) => String(ext).toLowerCase())
+        .filter((ext) => ext === 'png' || ext === 'jpeg'))];
+    const imageDefaults = imageExts.map((ext) => (
+        `<Default Extension="${ext}" ContentType="${ext === 'png' ? 'image/png' : 'image/jpeg'}"/>`
+    )).join('');
     const body = overrides.map((part) => {
         const type = part === '/xl/workbook.xml'
             ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml'
@@ -1698,6 +1893,7 @@ function contentTypesXml(sheetCount, chartParts = {}) {
     return `${XML_HEAD}<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">`
         + '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
         + '<Default Extension="xml" ContentType="application/xml"/>'
+        + imageDefaults
         + `${body}</Types>`;
 }
 
@@ -1708,12 +1904,18 @@ function sheetRelsXml(drawingTarget) {
         + '</Relationships>';
 }
 
-/** 一张绘图的 rels：`xl/drawings/_rels/drawingN.xml.rels`（每个图表一条关系）。 */
-function drawingRelsXml(chartTargets) {
-    const rels = chartTargets.map((target, index) => (
-        `<Relationship Id="rId${index + 1}" Type="${CHART_REL_CHART}" Target="${target}"/>`
+/**
+ * 一张绘图的 rels：`xl/drawings/_rels/drawingN.xml.rels`。
+ *
+ * rels 的顺序就是 rId 的分配顺序（图表在前、图片在后），drawing 里的
+ * chartRelId / blipFill r:embed 必须与这里完全一致。同一张图在一个 drawing
+ * 里出现两次时只登记一条关系，两个锚点共用同一个 rId。
+ */
+function drawingRelsXml(rels) {
+    const body = rels.map((rel, index) => (
+        `<Relationship Id="rId${index + 1}" Type="${rel.type}" Target="${rel.target}"/>`
     )).join('');
-    return `${XML_HEAD}<Relationships xmlns="${NS_PKG_REL}">${rels}</Relationships>`;
+    return `${XML_HEAD}<Relationships xmlns="${NS_PKG_REL}">${body}</Relationships>`;
 }
 
 function rootRelsXml() {
@@ -1926,47 +2128,97 @@ class Workbook {
     }
 
     buildEntries(stats) {
-        // 图表部件先编号：一张表最多一张 drawing，drawing 里按顺序挂它自己的图表。
-        // 编号从 1 起、全局连续（xl/charts/chart1..N、xl/drawings/drawing1..M），
-        // [Content_Types].xml 的 Override 与 rels 的 Target 都用同一套编号。
+        // 图表与图片的部件编号：一张表最多一张 drawing，drawing 里按顺序挂
+        // 它自己的图表（twoCellAnchor）与图片（oneCellAnchor）。
+        // 编号从 1 起、全局连续（xl/charts/chart1..N、xl/drawings/drawing1..M、
+        // xl/media/image1..K），[Content_Types].xml 的 Override/Default 与 rels 的
+        // Target 都用同一套编号。
         const sheetCharts = this.sheets.map((sheet) => sheet.charts ?? []);
-        const drawingCount = sheetCharts.filter((list) => list.length > 0).length;
+        const sheetImages = this.sheets.map((sheet) => sheet.images ?? []);
+        const drawingCount = this.sheets.filter((sheet, index) => (
+            (sheetCharts[index]?.length ?? 0) > 0 || (sheetImages[index]?.length ?? 0) > 0
+        )).length;
         const chartCount = sheetCharts.reduce((sum, list) => sum + list.length, 0);
+        // 媒体部件按绝对路径**全局**去重：同一张图在两张表、或在同一张表里插两次，
+        // 包里都只存一份 xl/media/imageN.ext，各锚点共用同一个 rId 指向它。
+        const mediaByPath = new Map();
+        const mediaParts = [];
+        this.sheets.forEach((sheet) => {
+            for (const image of sheet.images ?? []) {
+                const key = image.absolute || image.path;
+                if (mediaByPath.has(key)) continue;
+                const partName = `image${mediaParts.length + 1}.${image.ext}`;
+                mediaByPath.set(key, partName);
+                mediaParts.push({ partName, bytes: image.bytes, ext: image.ext });
+            }
+        });
         const entries = [
             // [Content_Types].xml 必须排在包首：某些解析器按顺序判断包类型
-            { name: '[Content_Types].xml', data: contentTypesXml(this.sheets.length, { drawings: drawingCount, charts: chartCount }) },
+            {
+                name: '[Content_Types].xml',
+                data: contentTypesXml(this.sheets.length, {
+                    drawings: drawingCount,
+                    charts: chartCount,
+                    images: mediaParts.map((part) => part.ext),
+                }),
+            },
             { name: '_rels/.rels', data: rootRelsXml() },
             { name: 'xl/workbook.xml', data: workbookXml(this.sheets) },
             { name: 'xl/_rels/workbook.xml.rels', data: workbookRelsXml(this.sheets.length) },
             { name: 'xl/styles.xml', data: buildStylesXml(this.styles) },
         ];
+        // 媒体部件是二进制，按原字节进包（zip 自己认得 Uint8Array，不做文本转码）
+        for (const part of mediaParts) entries.push({ name: `xl/media/${part.partName}`, data: part.bytes });
         let drawingIndex = 0;
         let chartIndex = 0;
         this.sheets.forEach((sheet, index) => {
             entries.push({ name: `xl/worksheets/sheet${index + 1}.xml`, data: sheet.toXml() });
             const charts = sheet.charts ?? [];
-            if (charts.length === 0) return;
+            const images = sheet.images ?? [];
+            if (charts.length === 0 && images.length === 0) return;
             drawingIndex += 1;
-            const chartTargets = [];
+            // rels 的顺序决定 rId：先图表、后图片，同一 drawing 内保持稳定。
+            // 图片按部件名复用 rId —— 同一张图插两次不该变成两条关系。
+            const rels = [];
             const frames = [];
+            const pictures = [];
             for (const chart of charts) {
                 chartIndex += 1;
                 entries.push({ name: `xl/charts/chart${chartIndex}.xml`, data: chartSpaceXml(chart.spec) });
-                chartTargets.push(`../charts/chart${chartIndex}.xml`);
+                rels.push({ type: CHART_REL_CHART, target: `../charts/chart${chartIndex}.xml` });
                 frames.push({
-                    chartRelId: `rId${frames.length + 1}`,
+                    chartRelId: `rId${rels.length}`,
                     name: `图表 ${chartIndex}`,
                     id: frames.length + 2,
                     from: chart.from,
                     to: chart.to,
                 });
             }
+            const pictureRelIds = new Map();
+            for (const image of images) {
+                const partName = mediaByPath.get(image.absolute || image.path);
+                let relId = pictureRelIds.get(partName);
+                if (!relId) {
+                    rels.push({ type: `${NS_REL}/image`, target: `../media/${partName}` });
+                    relId = `rId${rels.length}`;
+                    pictureRelIds.set(partName, relId);
+                }
+                pictures.push({
+                    relId,
+                    name: image.name,
+                    id: frames.length + pictures.length + 2,
+                    from: image.at,
+                    cx: image.cx,
+                    cy: image.cy,
+                    alt: image.alt,
+                });
+            }
             entries.push({
                 name: `xl/drawings/drawing${drawingIndex}.xml`,
-                // 一张表上有几个图表就有几个锚点（只锚第一个时 Excel 只显示那一个）
-                data: spreadsheetDrawingXml({ frames }),
+                // 一张表上有几个图表/图片就有几个锚点（只锚第一个时 Excel 只显示那一个）
+                data: spreadsheetDrawingXml({ frames, pictures }),
             });
-            entries.push({ name: `xl/drawings/_rels/drawing${drawingIndex}.xml.rels`, data: drawingRelsXml(chartTargets) });
+            entries.push({ name: `xl/drawings/_rels/drawing${drawingIndex}.xml.rels`, data: drawingRelsXml(rels) });
             entries.push({ name: `xl/worksheets/_rels/sheet${index + 1}.xml.rels`, data: sheetRelsXml(`../drawings/drawing${drawingIndex}.xml`) });
         });
         entries.push({ name: 'docProps/core.xml', data: coreXml({ title: this.title, author: this.author }) });
@@ -2435,6 +2687,7 @@ export const meta = {
             '  sheet.merge(range) / widths({A:12}) / freeze(row, col) / autofilter(range?) / numberFormat(range, fmt)',
             '  sheet.chart({type, title, categories, series:[{name, values}]})  原生图表',
             '    type: bar / column（默认）/ line / pie / area / scatter；数据内联在图表部件里',
+            '  sheet.image(path, {at, widthCm, heightCm, alt})  原生图片（PNG/JPEG；只给一边尺寸按原图等比）',
             '  wb.render() → Uint8Array / wb.save(path?) → report',
         ],
         read: ['read(path, env) → report（perSheet: name/range/rows 前 5 行/formulas）'],
@@ -2470,6 +2723,7 @@ export const meta = {
             '    legend: bottom（默认）/ right / left / top / none；labels: true 显示数据标签；stacked: true 堆叠',
             '    at: {col, row, toCol, toRow} 锚在哪块单元格上（默认 A1 起，8 列 × 15 行）',
             '    数据以 numLit / strLit **内联**在图表部件里：打开即画；改数据要在 Excel 里「编辑数据」',
+            '  sheet.image(path, {at, widthCm, heightCm, alt})  原生图片（PNG/JPEG；只给一边尺寸按原图等比）',
             '  wb.render() → Uint8Array / wb.save(path?) → report',
         ],
         read: ['read(path, env) → report（perSheet: name/range/rows 前 5 行/formulas）'],
@@ -2871,13 +3125,17 @@ export function edit(path, ops, env) {
         if (name === 'docProps/custom.xml') continue;
         carried.push({ name, data });
     }
-    // 图表与绘图部件原样搬运（上面的循环没跳过它们），所以重新生成的 [Content_Types].xml
-    // 必须照样声明它们 —— 少一条 Override，真实 Excel 会判「发现不可读取的内容」。
+    // 图表、绘图与媒体部件原样搬运（上面的循环没跳过它们），所以重新生成的
+    // [Content_Types].xml 必须照样声明它们 —— 少一条 Override/Default，真实 Excel
+    // 会判「发现不可读取的内容」或图片空白。媒体只按扩展名声明（Default）。
     const carriedNames = [...loaded.files.keys()];
     const chartPartCount = carriedNames.filter((name) => /^xl\/charts\/chart\d+\.xml$/.test(name)).length;
     const drawingPartCount = carriedNames.filter((name) => /^xl\/drawings\/drawing\d+\.xml$/.test(name)).length;
+    const imageExts = carriedNames
+        .filter((name) => /^xl\/media\/[^/]+\.(png|jpeg)$/i.test(name))
+        .map((name) => /\.([a-z0-9]+)$/i.exec(name)[1].toLowerCase());
     const outBytes = zip([
-        { name: '[Content_Types].xml', data: contentTypesXml(loaded.sheets.length, { drawings: drawingPartCount, charts: chartPartCount }) },
+        { name: '[Content_Types].xml', data: contentTypesXml(loaded.sheets.length, { drawings: drawingPartCount, charts: chartPartCount, images: imageExts }) },
         ...carried,
         { name: 'xl/workbook.xml', data: workbookXml(loaded.sheets) },
         { name: 'xl/_rels/workbook.xml.rels', data: workbookRelsXml(loaded.sheets.length) },

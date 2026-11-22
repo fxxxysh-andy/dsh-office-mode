@@ -27,19 +27,22 @@ import {
     memoryExists,
     memoryPaths,
     memoryStats,
+    HOT_MEMORY_FILE,
+    readHotMemory,
     renderDigest,
+    renderHotProjection,
     renderMutation,
     renderRead,
     renderSunk,
-    renderRelated,
+    renderStatus,
     resolveTimeWindow,
 } from '../src/memory.js';
 import { migrateMnemon, readMnemonInsights, renderMigration } from '../src/migrate.js';
 import { projectDigest, projectionStateOf, REFRESH_EVERY, resetProjection, sessionIdOf, signalOf } from '../src/projection.js';
 import { buildTools } from '../src/tools.js';
 
-// 测试中间产物统一落在仓库根的 .office/tmp/<suite>/ 下（不再用包内的 test/.tmp）。
-const TMP = fileURLToPath(new URL('../../../.office/tmp/memory/', import.meta.url));
+// 测试中间产物统一落在仓库根的 .office/runtime/tmp/<suite>/ 下（不再用包内的 test/.tmp）。
+const TMP = fileURLToPath(new URL('../../../.office/runtime/tmp/memory/', import.meta.url));
 
 const results = [];
 async function check(name, fn) {
@@ -58,7 +61,10 @@ async function freshRoot(memoryConfig = {}) {
     const root = join(TMP, `case-${caseId}`);
     await rm(root, { recursive: true, force: true });
     await mkdir(root, { recursive: true });
-    return { root, memory: createMemory({ root, memory: memoryConfig }) };
+    // 知识库是单库（第八十八轮）：夹具也要把库指到本 case，否则会写进真实的
+    // $DSH_HOME/.office/kb，用例之间也会互相看见对方的文档。
+    const config = { kbDir: join(TMP, `kb-${caseId}`), ...memoryConfig };
+    return { root, memory: createMemory({ root, memory: config }), memoryConfig: config };
 }
 
 const execAt = (root) => ({ agent: { session: { header: { cwd: root } } } });
@@ -534,17 +540,14 @@ await check('renderDigest：空态给「怎么记」，非空态给偏好、项�
     assert.ok(filled.includes('office_memory'));
 });
 
-await check('renderDigest：给「未变化」形态时省掉正文，但保留用量与台账', async () => {
+await check('renderDigest：热记忆未变化时整段不输出，只贴变化的台账行', async () => {
     const { memory } = await freshRoot();
     await memory.mutate({ action: 'add', target: 'user', content: '偏好：书面化。' });
-    // 造一份**像真实热记忆那样有体积**的内容（本机实测项目层约 10 KB）：
-    // 省略的收益与正文体积成正比 —— 只有两句话时，省略形态的说明行反而更长。
-    // 那个方向也是对的（小到一定程度就不该省），但断言要按真实量级来立。
     for (let index = 0; index < 12; index += 1) {
         await memory.mutate({
             action: 'add', target: 'project',
-            content: `约定 ${index}：`
-                + '这条约定用来把热记忆的正文撑到真实量级，好让「省略正文」的收益能被断言成大小关系而不是感觉。'.repeat(6),
+            content: '约定 ' + index + '：'
+                + '这条约定用来把热记忆的正文撑到真实量级，好让「未变化就不输出」的收益能被断言成大小关系而不是感觉。'.repeat(6),
         });
     }
     await memory.log([{ path: '季度汇报.pptx', format: 'ppt', theme: 'business' }]);
@@ -552,23 +555,21 @@ await check('renderDigest：给「未变化」形态时省掉正文，但保留�
 
     const full = renderDigest(digest, { context: 'help' });
     const omitted = renderDigest(digest, { context: 'help', hot: 'unchanged' });
-    assert.ok(full.length > 2500, `夹具本身要有真实量级：${full.length}`);
-    assert.ok(omitted.length * 4 < full.length, `省略形态应当明显更短：${omitted.length} vs ${full.length}`);
-    assert.ok(!omitted.includes('偏好：书面化'), '省略形态不带热记忆正文');
-    assert.ok(!omitted.includes('约定 3：'), '省略形态不带热记忆正文');
-    assert.ok(omitted.includes('与上一次投影相同'), '要说清为什么没有正文');
-    assert.ok(omitted.includes(String(digest.writeRevision).slice(0, 8)), '要带上 revision，省略才可核对');
-    assert.ok(omitted.includes("office_memory({ action: 'read', layer: 'hot' })"), '要给读全文的入口');
-    // 用量与台账照旧（ledger 形态默认 'full'；第三十六轮起台账也能折叠，见下一组用例）。
-    assert.ok(omitted.includes('用户偏好 1 条'), '用量行要保留');
-    assert.ok(omitted.includes('项目与环境 12 条'), '用量行要保留');
-    assert.ok(omitted.includes('季度汇报.pptx'), '台账部分在 ledger:\'full\' 时照旧给');
-    assert.ok(omitted.includes('主动记录'), '主动记录指引照旧');
+    assert.ok(full.length > 2500, '夹具本身要有真实量级：' + full.length);
+    assert.ok(omitted.length * 4 < full.length, '未变化的热记忆不该占篇幅：' + omitted.length + ' vs ' + full.length);
+    assert.ok(!omitted.includes('偏好：书面化'), '不贴热记忆正文');
+    assert.ok(!omitted.includes('约定 3：'), '不贴热记忆正文');
+    assert.ok(!omitted.includes('与上一次投影相同'), '不再输出「与上次相同」的状态行');
+    assert.ok(!omitted.includes(String(digest.writeRevision).slice(0, 8)), '不再重复 revision');
+    assert.ok(!omitted.includes('用户偏好 ') && !omitted.includes('项目与环境 '), '不重复两个分区的用量行');
+    assert.ok(!omitted.includes('主动记录'), '固定尾巴也省掉');
+    assert.ok(omitted.startsWith('【台账】'), '投影只剩台账段');
+    assert.ok(omitted.includes('季度汇报.pptx'), '台账行照旧给');
 });
 
 // ── 投影：只在变化时贴 ──────────────────────────────────────────────────────
 
-await check('投影：同一会话 writeRevision 不变时只给一行，变了又贴全文', async () => {
+await check('投影：同一会话 writeRevision 不变时不输出，变了又贴全文', async () => {
     resetProjection();
     const { root, memory } = await freshRoot();
     await memory.mutate({ action: 'add', target: 'project', content: '约定：主题用 business。' });
@@ -581,8 +582,7 @@ await check('投影：同一会话 writeRevision 不变时只给一行，变了�
 
     const second = projectDigest(digest, { sessionId: 's-1', context: 'help' });
     assert.equal(second.mode, 'unchanged');
-    assert.ok(!second.text.includes('约定：主题用 business'), '没变就不重复贴正文');
-    assert.ok(second.text.includes(String(digest.writeRevision).slice(0, 8)));
+    assert.equal(second.text, '', '没变就什么都不输出（第七十五轮用户要求）');
 
     // 热记忆变了（写了一次 → writeRevision 变）→ 又贴全文
     await memory.mutate({ action: 'replace', target: 'project', oldText: '主题用 business', content: '约定：主题用 business，标题 28pt。' });
@@ -677,7 +677,7 @@ await check('投影：office_help 第二次调用不再重复贴热记忆正文'
     assert.ok(first.text.includes('另有 1 条与「word」无关'), '折叠行要报条数');
     const second = await help.execute({ topic: 'word' }, exec);
     assert.ok(!second.text.includes('约定：word 文档的投影不要重复贴'), '第二次不该再贴一遍正文');
-    assert.ok(second.text.includes('与上一次投影相同'), '第二次给省略形态');
+    assert.ok(!second.text.includes('与上一次投影相同'), '第二次连「无变化」也不该输出');
     assert.ok(second.text.includes('office.word'), '文档本身照旧完整返回');
 
     // 换一个会话：又要贴全文（它没看过）。
@@ -799,26 +799,28 @@ await check('台账投影：指纹没变就折叠，登记新产物后才重贴'
     const second = projectDigest(await memory.digest(), { sessionId: 's-led' });
     assert.equal(second.reason, 'ledger', '台账指纹变了要贴（热记忆没变也贴）');
     assert.ok(second.text.includes('a.docx'), '新登记的台账行要贴出来');
+    assert.ok(!second.text.includes('约定：一条。'), '热记忆没变就不重复贴它的正文');
+    assert.ok(second.text.startsWith('【台账】'), '投影只剩台账段');
 
     const third = projectDigest(await memory.digest(), { sessionId: 's-led' });
-    assert.equal(third.mode, 'unchanged', '指纹没变，台账与热记忆都折叠');
-    assert.ok(!third.text.includes('a.docx'), '台账行不重复贴');
-    assert.ok(third.text.includes('与上次投影相同'), '折叠要说清并给入口');
-    assert.ok(third.text.includes("office_memory({ action: 'read' })"), '读全文的入口在');
+    assert.equal(third.mode, 'unchanged', '指纹没变，台账与热记忆都不输出');
+    assert.equal(third.text, '', '未变化时不能留状态行');
 });
 
-await check('renderDigest：台账省略形态给一行说明与读取入口，固定尾巴不再重复', async () => {
+await check('renderDigest：台账省略形态整段不输出，热记忆与尾巴照常', async () => {
     const { memory } = await freshRoot();
     await memory.mutate({ action: 'add', target: 'user', content: '偏好：书面化。' });
     await memory.log([{ path: '季度汇报.pptx', format: 'ppt', theme: 'business' }]);
     const digest = await memory.digest({ recentLedger: 2 });
 
     const both = renderDigest(digest, { context: 'help', hot: 'unchanged', ledger: 'unchanged' });
-    assert.ok(!both.includes('季度汇报.pptx'), '台账行不贴');
-    assert.ok(both.includes('最近 1 条与上次投影相同'), '要说清台账为什么没有正文');
-    assert.ok(both.includes("office_memory({ action: 'read', layer: 'ledger' })"), '要给台账的读取入口');
-    assert.ok(!both.includes('主动记录'), '热记忆与台账都省略时，固定尾巴不再重复');
-    assert.ok(!both.includes('完整读取与检索'), '两条尾巴一起省');
+    assert.equal(both, '', '两段都没变化时投影是空串，不留任何状态行');
+
+    const hotOnly = renderDigest(digest, { context: 'help', ledger: 'unchanged' });
+    assert.ok(hotOnly.includes('偏好：书面化'), '热记忆正文照常');
+    assert.ok(!hotOnly.includes('季度汇报.pptx'), '台账行不贴');
+    assert.ok(!hotOnly.includes('【台账】'), '台账整段不出现');
+    assert.ok(hotOnly.includes('主动记录'), '贴了正文就带固定尾巴');
 });
 
 await check('renderMutation：给回执，不回显整份文件', async () => {
@@ -828,6 +830,34 @@ await check('renderMutation：给回执，不回显整份文件', async () => {
     assert.ok(text.includes('记忆已更新'));
     assert.ok(text.includes('新增'));
     assert.ok(!text.includes('# 办公记忆'), '不该把投影整份贴回来');
+    assert.ok(!text.includes('投影已重写'), '投影状态行是 token 税，不再回执');
+    // 改后正文只给短预览：刚写入的整条内容已经在上文里。
+    const long = await memory.mutate({
+        action: 'replace', target: 'project', oldText: '一条约定',
+        content: '一条约定：'.repeat(40),
+    });
+    const receipt = renderMutation(long);
+    assert.ok(receipt.length < 700, `回执不该回显整条正文，实际 ${receipt.length} 字`);
+});
+
+await check('开场记忆：HOT.md 只放最该先照办的一小段，空记忆不落标题', async () => {
+    const { root, memory } = await freshRoot();
+    assert.equal(readHotMemory(root), '', '空记忆不该有开场块');
+    assert.equal(renderHotProjection([]), '', '空条目渲染成空串');
+    await memory.mutate({ action: 'add', target: 'user', content: '偏好：正文先给结论，再给数据与出处。', importance: 'critical' });
+    await memory.mutate({ action: 'add', target: 'user', content: '偏好：'.repeat(40), importance: 'normal' });
+    await memory.mutate({ action: 'add', target: 'project', content: '项目约定：季度汇报统一用 business 主题。', importance: 'critical' });
+    await memory.mutate({ action: 'add', target: 'project', content: '项目约定：这条不够重要，不该进开场。', importance: 'normal' });
+    const paths = memoryPaths(root, {});
+    const file = await readFile(join(paths.dir, HOT_MEMORY_FILE), 'utf8');
+    assert.ok(file.startsWith('【开场记忆·先照办】'), '开场块要有标题');
+    assert.ok(file.includes('正文先给结论'), '关键用户偏好要进开场');
+    assert.ok(!file.includes('季度汇报统一用 business'), '项目层不进开场（多是某一轮的落地事实）');
+    assert.ok(!file.includes('这条不够重要'), '普通项目约定也不该进开场');
+    const longest = Math.max(...file.split('\n').map((line) => line.length));
+    assert.ok(longest <= 100, `长正文要被截短，最长一行 ${longest} 字`);
+    assert.equal(readHotMemory(root), file.trim(), '读函数与落盘内容一致');
+    assert.equal(readHotMemory(''), '', '没有工作目录时返回空串');
 });
 
 // ── 与工具面的接线 ──────────────────────────────────────────────────────────
@@ -859,6 +889,33 @@ await check('office_memory 工具：手工登记台账与查询', async () => {
     assert.ok(out.text.includes('台账已登记 1 条'), out.text);
     out = await tool.execute({ action: 'read', layer: 'ledger', query: '参考稿' }, exec);
     assert.ok(out.text.includes('用户给的参考稿.pptx'), out.text);
+});
+
+await check('office_memory 工具：读侧分区（tags / entities）端到端，类型写错要拒绝', async () => {
+    const { root } = await freshRoot();
+    const tool = buildTools(resolveConfig({ memory: {} })).find((item) => item.name === 'office_memory');
+    const exec = execAt(root);
+
+    await tool.execute({ action: 'add', target: 'project', content: '发布流程：先过评审。', tags: ['发布'] }, exec);
+    await tool.execute({ action: 'add', target: 'project', content: '财务口径：按季度结算。', tags: ['财务'] }, exec);
+
+    const hit = await tool.execute({ action: 'read', layer: 'hot', tags: ['发布'] }, exec);
+    assert.equal(hit.ok, true, hit.text);
+    assert.ok(hit.text.includes('先过评审'), '分区内那条要给出来');
+    assert.ok(!hit.text.includes('按季度结算'), '分区外那条不许出现');
+    assert.ok(hit.text.includes('分区：标签 发布'), '回执要自报分区口径');
+
+    // 过滤器不许静默丢弃（同 since / until 的口径）：写错类型要当场拒绝，而不是当没给。
+    for (const bad of ['发布', 7, { tag: '发布' }]) {
+        const refused = await tool.execute({ action: 'read', tags: bad }, exec);
+        assert.equal(refused.ok, false, `tags=${JSON.stringify(bad)} 应被拒绝`);
+        assert.match(refused.text, /需要一个字符串数组/, refused.text);
+    }
+    const mixed = await tool.execute({ action: 'read', entities: ['发布', 7] }, exec);
+    assert.equal(mixed.ok, false, '数组里混了非字符串也要拒绝');
+    // 被拒绝的调用不占召回配额（它没有产生任何检索）：后面这条带 query 的照旧放行。
+    const after = await tool.execute({ action: 'read', query: '发布' }, exec);
+    assert.equal(after.ok, true, '参数被拒不算用掉配额');
 });
 
 await check('记忆关闭时工具给出可读提示，而不是静默失败', async () => {
@@ -1272,10 +1329,10 @@ await check('插件启动时注册一段静态记忆说明（提示层接住 mne
 
 /** 带隔离全局根的用例目录：绝不碰本机真实的 $DSH_HOME/.office/memory。 */
 async function freshScoped(memoryConfig = {}) {
-    const { root, memory } = await freshRoot();
+    const { root, memoryConfig: baseConfig } = await freshRoot();
     const globalDir = join(TMP, `global-${caseId}`);
     await rm(globalDir, { recursive: true, force: true });
-    const scoped = { ...memoryConfig, globalDir };
+    const scoped = { ...memoryConfig, kbDir: baseConfig.kbDir, globalDir };
     return { root, globalDir, memory: createMemory({ root, memory: scoped }), memoryConfig: scoped };
 }
 
@@ -1344,6 +1401,51 @@ await check('跨根改删：命中在另一个根里的条目时，改的必须�
     assert.equal(removed.previous.id, second.entry.id);
     const left = (await globalOnly.read({ layer: 'hot' })).hot.items.map((item) => item.id).sort();
     assert.deepEqual(left, [first.entry.id], `只该删掉 B，实际剩下 ${JSON.stringify(left)}`);
+});
+
+await check('显式 scope：一条写全局、一条留工作区，读时都在但 origin 不同', async () => {
+    const { root, memoryConfig } = await freshScoped({ scope: 'both' });
+    const memory = createMemory({ root, memory: memoryConfig });
+    const global = await memory.mutate({ action: 'add', target: 'user', content: '跨项目：所有汇报都用 16:9。', scope: 'global' });
+    assert.equal(global.origin, 'global');
+    const local = await memory.mutate({ action: 'add', target: 'user', content: '本项目：汇报先给结论。', scope: 'workspace' });
+    assert.equal(local.origin, 'workspace');
+    const read = await memory.read({ layer: 'hot' });
+    const found = read.hot.items.map((item) => `${item.origin}:${item.text}`).sort();
+    assert.deepEqual(found, [
+        'global:跨项目：所有汇报都用 16:9。',
+        'workspace:本项目：汇报先给结论。',
+    ].sort());
+});
+
+await check('显式 scope：根没开时明确报错，不悄悄写到别处', async () => {
+    const { root, memoryConfig } = await freshScoped({ scope: 'workspace' });
+    const memory = createMemory({ root, memory: memoryConfig });
+    await assert.rejects(
+        () => memory.mutate({ action: 'add', target: 'project', content: '不该落下的条目。', scope: 'global' }),
+        /没有开「全局」记忆根/,
+    );
+    assert.equal((await memory.read({ layer: 'hot' })).hot.items.length, 0, '拒绝之后一条都不该写');
+});
+
+await check('显式 scope：replace / remove 只动指定根，不跨根兜底', async () => {
+    const { root, memoryConfig } = await freshScoped({ scope: 'both' });
+    const memory = createMemory({ root, memory: memoryConfig });
+    const text = '同名约定：每天九点站会。';
+    await memory.mutate({ action: 'add', target: 'project', content: text, scope: 'global' });
+    await memory.mutate({ action: 'add', target: 'project', content: text, scope: 'workspace' });
+    const replaced = await memory.mutate({ action: 'replace', oldText: '每天九点站会', content: '同名约定：每天十点站会。', scope: 'global' });
+    assert.equal(replaced.origin, 'global');
+    const ws = createMemory({ root, memory: { ...memoryConfig, scope: 'workspace' } });
+    assert.ok((await ws.read({ layer: 'hot' })).hot.items.some((item) => item.text.includes('九点')),
+        '工作区那份没被改');
+    const globalOnly = createMemory({ root, memory: { ...memoryConfig, scope: 'global' } });
+    assert.ok((await globalOnly.read({ layer: 'hot' })).hot.items.some((item) => item.text.includes('十点')),
+        '全局那份改了');
+    const removed = await memory.mutate({ action: 'remove', oldText: '每天九点站会', scope: 'workspace' });
+    assert.equal(removed.origin, 'workspace');
+    assert.equal((await globalOnly.read({ layer: 'hot' })).hot.items.filter((item) => item.text.includes('站会')).length, 1,
+        '只删工作区那一份，全局那份还在');
 });
 
 await check('跨项目层：userScope=global 的用户偏好落全局根，换工作目录仍读得到', async () => {
@@ -1427,11 +1529,15 @@ await check('图关系：热记忆下沉进归档后关系仍走得通（id 必�
     assert.equal(walked.nodes.find((node) => node.id === doomed.entry.id).layer, 'archive');
 });
 
-await check('图关系：关掉 links 后 link / related 都明确报错', async () => {
+await check('图关系：旧的 memory.links 设置移除后，内部 link 仍可维护历史数据', async () => {
     const { root, memoryConfig } = await freshScoped({ links: false });
     const memory = createMemory({ root, memory: memoryConfig });
-    await assert.rejects(() => memory.link({ sourceId: 'a', targetId: 'b' }), /图关系已在设置里关掉/);
-    await assert.rejects(() => memory.related({ id: 'a' }), /图关系已在设置里关掉/);
+    // 第九十一轮：工具面/UI 已下线图谱，配置里也没有 links 开关了；残留的 links:false
+    // 不能把内部兼容方法打崩（旧配置残留键必须被安静忽略）。
+    const a = await memory.mutate({ action: 'add', target: 'project', content: '甲' });
+    const b = await memory.mutate({ action: 'add', target: 'project', content: '乙' });
+    const made = await memory.link({ sourceId: a.entry.id, targetId: b.entry.id });
+    assert.equal(made.added, true);
 });
 
 await check('实体视图：只认条目显式声明的 entities，不做抽取', async () => {
@@ -1490,7 +1596,7 @@ await check('召回质量：阈值写反时整组退回默认（不留下自相�
 });
 
 // 第二十四轮放宽的三个名额与候选倍数。钉在这里是为了让「默认值被改动」变成一件显式的事：
-// 依据是实证的（RMM：Oracle 上限 90.2 而实际 70.4，Top-M 5→10 值 +4.6 Recall@5，reranker
+// 依据是实证的（RMM：Oracle 上限 90.2 而实际 70.4，Top-M 5→10 值 +4.6 Recall@5，重排序器
 // 只值 +1.4；RAGChecker：换检索器值 +2.4 F1，名额 k 5→20 值 +1.7）—— 上限由召回决定。
 await check('召回质量：第二十四轮放宽的默认名额与候选倍数（阈值不动）', async () => {
     const q = resolveConfig({ memory: {} }).memory.recallQuality;
@@ -1596,6 +1702,42 @@ await check('每回合配额：0 表示不限制', async () => {
     }
 });
 
+await check('回合扫描有界：缓存 100 条之后涨到 5000 条，最多只回看 QUOTA_MAX_SCAN 条（A-01）', async () => {
+    // 这一条守的是 `quota.js` 开头那句「扫日志是有界的」。第五十六轮之前起点算成
+    // `Math.min(cached.count, events.length - MAX_SCAN)`：缓存 100 条、现在 5000 条、
+    // 新增段里又没有 turn/start 时，会从 4999 一路扫到 100 —— 4900 条，声明当场不成立。
+    // 结果值其实一样（找不到就沿用缓存里的 turn 号），所以只能**数读了几条**：
+    // 用一个 Proxy 给数字下标的读取计数。
+    const { QUOTA_MAX_SCAN, turnKeyOf } = await import('../src/quota.js');
+    let reads = 0;
+    const sessionEvents = (count) => {
+        const list = Array.from({ length: count }, (_, index) => ({ type: 'noop', index }));
+        list[50] = { type: 'turn/start', data: { turn: 3 } };
+        return new Proxy(list, {
+            get(target, key, receiver) {
+                if (typeof key === 'string' && /^\d+$/.test(key)) reads += 1;
+                return Reflect.get(target, key, receiver);
+            },
+        });
+    };
+    let count = 100;
+    const exec = { agent: { session: { id: `quota-bound-${Date.now()}`, ownEvents: () => sessionEvents(count) } } };
+    assert.equal(turnKeyOf(exec).turn, 3, '第一遍扫到第 50 条上的 turn/start');
+
+    count = 5000;
+    reads = 0;
+    assert.equal(turnKeyOf(exec).turn, 3, '新增段里没有 turn/start，就沿用缓存里的回合号');
+    assert.ok(reads <= QUOTA_MAX_SCAN + 8, `最多回看 ${QUOTA_MAX_SCAN} 条，实际读了 ${reads} 条`);
+
+    // 全新的会话（缓存里没有它）从一开始就受同一个上限约束：代价是**只认最近
+    // QUOTA_MAX_SCAN 条里的 turn/start**（更早的读不到 → 回合号算 0）。这是有界的代价，
+    // 照实钉住，免得下一轮为了「更准」把它改回无界扫描。
+    reads = 0;
+    const fresh = { agent: { session: { id: `quota-bound-fresh-${Date.now()}`, ownEvents: () => sessionEvents(5000) } } };
+    assert.equal(turnKeyOf(fresh).turn, 0, '更早的 turn/start 读不到，回合号按 0 算');
+    assert.ok(reads <= QUOTA_MAX_SCAN + 8, `首次扫描也要有界，实际读了 ${reads} 条`);
+});
+
 await check('Pack 导出与导入：整包搬走并幂等合并，重复导入不产生第二份', async () => {
     const { root, memory } = await freshRoot();
     const one = await memory.mutate({ action: 'add', target: 'project', content: '要搬走的项目约定。' });
@@ -1668,39 +1810,51 @@ await check('status：给出各根的计数与层开关', async () => {
     assert.equal(value.stores.find((store) => store.id === 'workspace').hot, 1);
 });
 
-await check('office_memory 工具：link / related / entities / status / export / import 端到端', async () => {
+await check('status 报「可见性」口径（19-7）：根 / 目标 / 分区 / 来源档 / 没做的都在', async () => {
+    const { root, memoryConfig } = await freshScoped({ scope: 'both', userScope: 'global' });
+    const memory = createMemory({ root, memory: memoryConfig });
+    await memory.mutate({ action: 'add', target: 'user', content: '全局的用户偏好。' });
+    await writeFile(join(root, '来源.md'), '# 来源\n\n两家确认。\n\n来源：https://a.example.com/x、https://b.example.org/y\n', 'utf8');
+    const doc = await memory.kbIngest({ path: '来源.md', tier: 'verified' });
+
+    const text = renderStatus(await memory.status());
+    assert.ok(text.includes('可见性：'), text);
+    assert.ok(text.includes('读得到 全局 + 工作区'), '两个根要说出来（顺序就是优先级）');
+    assert.ok(text.includes('分区'), '分区是可见性的一维，要在状态里看得见');
+    assert.ok(text.includes('已验证 1'), `来源档分布要印出来：${text}`);
+    // 「没做的」必须照实写：读的人不该以为背后有一套权限系统。
+    assert.ok(text.includes('没有多用户身份'), text);
+    assert.equal(doc.tier, 'verified', '夹具有效');
+});
+
+await check('office_memory 工具：link / related / entities 已下线，status / export / import 仍可用', async () => {
     const { root } = await freshRoot();
     const config = resolveConfig({ memory: { globalDir: join(TMP, 'global-tool') } });
     const tools = buildTools(config, {});
     const find = (name) => tools.find((tool) => tool.name === name);
     const exec = execAt(root);
+    const memoryTool = find('office_memory');
 
-    const a = await find('office_memory').execute({ action: 'add', target: 'project', content: '甲：模板用 A。', entities: ['模板 A'] }, exec);
-    const b = await find('office_memory').execute({ action: 'add', target: 'project', content: '乙：模板用 A 的原因。' }, exec);
+    const a = await memoryTool.execute({ action: 'add', target: 'project', content: '甲：模板用 A。', entities: ['模板 A'] }, exec);
     assert.match(a.text, /记忆已更新/);
 
-    const ids = (await createMemory({ root, memory: config.memory }).read({ layer: 'hot' })).hot.items.map((item) => item.id);
-    assert.equal(ids.length, 2);
+    // 三个旧图谱动作都已从工具面删除：再调用不会再被当成合法 action。
+    for (const action of ['link', 'related', 'entities']) {
+        await assert.rejects(
+            () => memoryTool.execute({ action, sourceId: 'm-1', targetId: 'm-2', id: 'm-1' }, exec),
+            /只支持|未知|不支持|无效/,
+            `action:${action} 应已下线`,
+        );
+    }
 
-    const linked = await find('office_memory').execute({ action: 'link', sourceId: ids[0], targetId: ids[1], kind: 'supports' }, exec);
-    assert.match(linked.text, /已建立关系/);
-
-    const walked = await find('office_memory').execute({ action: 'related', id: ids[0] }, exec);
-    assert.match(walked.text, /关系遍历/);
-    assert.ok(walked.text.includes(ids[1]), '遍历结果里应出现对面那条');
-
-    const entities = await find('office_memory').execute({ action: 'entities' }, exec);
-    assert.match(entities.text, /实体视图/);
-    assert.ok(entities.text.includes('模板 A'));
-
-    const status = await find('office_memory').execute({ action: 'status' }, exec);
+    const status = await memoryTool.execute({ action: 'status' }, exec);
     assert.match(status.text, /记忆状态/);
 
-    const exported = await find('office_memory').execute({ action: 'export', packPath: 'pack.json' }, exec);
+    const exported = await memoryTool.execute({ action: 'export', packPath: 'pack.json' }, exec);
     assert.match(exported.text, /记忆已导出/);
     assert.ok(existsSync(join(root, 'pack.json')));
 
-    const imported = await find('office_memory').execute({ action: 'import', packPath: 'pack.json' }, exec);
+    const imported = await memoryTool.execute({ action: 'import', packPath: 'pack.json' }, exec);
     assert.match(imported.text, /记忆导入完成/);
     assert.match(imported.text, /热记忆 新增 0 条/);
 
@@ -1961,9 +2115,8 @@ await check('悬空边：related 如实报出且不穿过它（老数据 / 外�
     assert.equal(value.dangling[0].to, 'm-ghost');
     // status 数的是**全库的悬空边条数**（两条边都有一端指着幽灵），与遍历撞到的数不是同一个量
     assert.equal((await memory.status()).dangling, 2);
-    // 渲染里必须出现悬空提示与处理办法
-    const text = renderRelated(value);
-    assert.ok(text.includes('悬空边'), text);
+    // 结果里必须如实报出悬空边与对端 id
+    assert.equal(value.dangling[0].kind, 'related');
 
     await memory.unlink({ id: 'K-1' });
     assert.equal((await memory.danglingRefs()).length, 1, 'K-2 还指着幽灵');

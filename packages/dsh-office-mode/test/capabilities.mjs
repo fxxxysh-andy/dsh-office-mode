@@ -77,10 +77,10 @@ await check('插件注册了 {{office_capabilities}} 变量，求值出来的地
     // 只有 `ctx.get('subagents')` 返回个对象是不够的（复核 F1）。
     const { ctx, variables, tools } = fakeCtx({ subagents: { start: () => {} } });
     apply(ctx, {});
-    assert.ok(tools.length >= 9, `工具面至少要注册九个工具，实际 ${tools.length}`);
+    assert.ok(tools.length >= 8, `工具面至少要注册八个工具，实际 ${tools.length}`);
     const registered = variables.find((item) => item.name === CAPABILITY_VARIABLE);
     assert.ok(registered, `插件必须注册变量 ${CAPABILITY_VARIABLE}（persona 是 complete 段，section 进不来）`);
-    assert.equal(variables.length, 1, '本插件只注册这一个变量（多了就是又一处常驻成本）');
+    assert.equal(variables.length, 2, '本插件注册两个变量：能力地图 + 开场记忆（多了就是又一处常驻成本）');
     const text = registered.provider();
     assert.ok(typeof text === 'string' && text.trim() !== '', '变量求值不能是空串');
     assert.ok(text.includes('本会话能力'), '地图要有标题，模型才知道这一段是什么');
@@ -103,7 +103,7 @@ await check('没有 systemPrompt 服务时不报错，只是不注册变量', as
     const { ctx, variables, tools } = fakeCtx({ withPrompt: false });
     apply(ctx, {});
     assert.equal(variables.length, 0);
-    assert.ok(tools.length >= 9, '其余功能照常');
+    assert.ok(tools.length >= 8, '其余功能照常');
 });
 
 await check('设置改动重建后变量不重复注册（disposer 真的把旧的拆掉了）', async () => {
@@ -135,13 +135,13 @@ await check('设置改动重建后变量不重复注册（disposer 真的把旧�
         logger: {},
     };
     apply(ctx, {});
-    assert.equal(live.size, 1, '激活时注册一次');
+    assert.equal(live.size, 2, '激活时各注册一次');
     const first = live.get(CAPABILITY_VARIABLE);
     handlers[OFFICE_SETTINGS_NS_EVENT]('dsh-office-mode');
-    assert.equal(live.size, 1, 'rebuild 之后仍然只有一个（旧的必须被拆掉）');
+    assert.equal(live.size, 2, 'rebuild 之后仍然只有两个（旧的必须被拆掉）');
     assert.notEqual(live.get(CAPABILITY_VARIABLE), first, '重建要换上新的一份（设置改了要重探）');
     handlers[OFFICE_SETTINGS_NS_EVENT]('dsh-office-mode');
-    assert.equal(live.size, 1);
+    assert.equal(live.size, 2);
 });
 
 // ── 2. 地图只讲工具面讲不了的事 ────────────────────────────────────────────
@@ -212,6 +212,7 @@ await check('最坏情况的地图不超预算（地图跟着 persona 进每一�
         pdf: { render: ['pdftoppm', 'pdftocairo', 'mutool', 'gs'], text: ['pdftotext'] },
         tex: ['latexmk', 'xelatex', 'lualatex'],
         preview: true,
+        convert: { pandoc: true },
         python: 'C:/somewhere/aaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe',
         av: { enabled: true, available: false, ffmpeg: true, ffprobe: true, model: true, vad: false, runtime: true },
     }, { subagents: false });

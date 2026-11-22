@@ -18,10 +18,15 @@
  * 跑法：node test/measure.mjs
  */
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { buildTools } from '../src/tools.js';
 import { resolveConfig } from '../src/config.js';
 import { renderCapabilityMap, syncCapabilities } from '../src/capabilities.js';
+import { measure } from './fixtures/r60-writing-plan/tally.mjs';
 import {
     bytes,
     fingerprintEquals,
@@ -295,6 +300,46 @@ check('顺序扰动：分节顺序与条目顺序不影响工具面与能力地�
     const mapA = renderCapabilityMap(syncCapabilities({ config: general, refresh: true }), { subagents: false });
     const mapB = renderCapabilityMap(syncCapabilities({ config: general, refresh: true }), { subagents: false });
     assert.equal(mapB, mapA, '能力地图是纯函数：连读两次必须逐字相同');
+});
+
+// ── 4. 对照实验的固化（第六十轮 新-24）─────────────────────────────────────
+
+/**
+ * 用户点名的 `新-24`（生成前先给每一部分定篇幅）的收益是**软判据**，第六十轮做了一次
+ * 同题两臂对照实验给「可复算」留证据。这一条守的是那份证据本身：
+ *
+ *   1. **产物没被改过**（sha256）—— 谁顺手润色了两句话，引用的数字就作废；
+ *   2. **数字算得出来**（逐节字符 / 汉字 / 占比 / 极差比 / CV 与 `manifest.json` 一致）；
+ *   3. **边界写在证据里**（n=1、两臂任务书不完全相同）—— 免得下一轮把它读成因果结论。
+ *
+ * 产物与脚本在 `test/fixtures/r60-writing-plan/`（**进版本库**：原先放在 `.office/runtime/tmp/`
+ * 的那一份被并发复核子代理递归删过两次，见该目录的 `任务书.md` §三 与交付档 §四）。
+ */
+const FIXTURE_DIR = fileURLToPath(new URL('./fixtures/r60-writing-plan/', import.meta.url));
+
+check('对照实验的证据固定：产物哈希 + 逐节字数与 manifest 一致（第六十轮 新-24）', () => {
+    const manifest = JSON.parse(readFileSync(join(FIXTURE_DIR, 'manifest.json'), 'utf8'));
+    const lines = [];
+    for (const [arm, expected] of Object.entries(manifest.arms)) {
+        const file = join(FIXTURE_DIR, expected.file);
+        const digest = createHash('sha256').update(readFileSync(file)).digest('hex');
+        assert.equal(digest, expected.sha256,
+            `${arm} 臂的产物变了（sha256 不符）—— 要么是有人改了它，要么是数字该重算：${expected.file}`);
+        const actual = measure(file);
+        assert.equal(actual.bodyChars, expected.bodyChars, `${arm} 臂三节正文之和：${actual.bodyChars} ≠ ${expected.bodyChars}`);
+        assert.equal(actual.bodyHanzi, expected.bodyHanzi, `${arm} 臂三节汉字：${actual.bodyHanzi} ≠ ${expected.bodyHanzi}`);
+        assert.equal(actual.fileChars, expected.fileChars, `${arm} 臂全文非空白字符：${actual.fileChars} ≠ ${expected.fileChars}`);
+        assert.deepEqual(actual.sections, expected.sections, `${arm} 臂逐节字数不一致`);
+        assert.ok(Math.abs(actual.ratio - expected.ratio) < 0.0005, `${arm} 臂极差比 ${actual.ratio} ≠ ${expected.ratio}`);
+        assert.ok(Math.abs(actual.cv - expected.cv) < 0.0005, `${arm} 臂占比 CV ${actual.cv} ≠ ${expected.cv}`);
+        assert.equal(actual.longestTitle, expected.longestTitle, `${arm} 臂最长一节变了`);
+        lines.push(`${arm} ${actual.bodyChars}字符/${actual.bodyHanzi}汉字 CV ${actual.cv.toFixed(4)} 最长「${actual.longestTitle}」`);
+    }
+    // 两条边界必须留在证据里，否则这份材料会被读成因果结论。
+    assert.ok(manifest.caveats.some((text) => text.includes('n=1')), '边界里必须写明 n=1');
+    assert.ok(manifest.caveats.some((text) => text.includes('不完全相同')), '「两臂任务书不完全相同」这条边界不能少');
+    assert.ok(manifest.caveats.some((text) => text.includes('示例锚定')), '「示例锚定」这一未排除的替代解释不能少');
+    return lines.join('；');
 });
 
 // ── 输出 ──────────────────────────────────────────────────────────────────

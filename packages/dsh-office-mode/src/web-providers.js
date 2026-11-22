@@ -22,8 +22,8 @@
  *
  * | id | 通道 | 要不要 Key | 备注 |
  * | --- | --- | --- | --- |
- * | seam | 宿主 web 服务（ctx.web） | 不要 | 首选：宿主自带地址钉死、体积与超时上限 |
- * | anthropic | Anthropic 兼容 + 原生 web_search | 要 | 默认指 DeepSeek 官方；换 baseURL 即可指别的兼容端点 |
+ * | seam | 宿主 web 服务（ctx.web） | 不要 | 宿主自带地址钉死、体积与超时上限 |
+ * | deepseek-api | DeepSeek Search API（直连） | 要 | 第六十五轮：一次请求直接返回来源清单，不跑辅助模型 |
  * | openai | OpenAI 兼容 chat/completions | 要 | 用 `web_search_options`；不支持的端点会明确报「没触发检索」 |
  * | tavily | Tavily Search API | 要 | 专为 Agent 设计的检索 API，返回摘要字段 |
  * | brave | Brave Search API | 要 | 独立索引，隐私口径好 |
@@ -54,7 +54,7 @@ import { asText, messageOf, serviceOf, WebAccessError, withTimeout } from './web
 /** 通道 id（顺序即设置页里的展示顺序）。 */
 export const PROVIDER_IDS = Object.freeze([
     'seam',
-    'anthropic',
+    'deepseek-api',
     'openai',
     'tavily',
     'brave',
@@ -76,10 +76,11 @@ export const PROVIDERS = Object.freeze({
         id: 'seam', label: '宿主 web 服务', family: 'seam', needsKey: false,
         note: '优先用宿主的 ctx.web：它自带公网地址校验、地址钉死、体积与超时上限。',
     },
-    anthropic: {
-        id: 'anthropic', label: 'Anthropic 兼容 + 原生 web_search', family: 'anthropic',
-        needsKey: true, keyEnv: 'DEEPSEEK_API_KEY', endpoint: 'https://api.deepseek.com/anthropic/v1',
-        note: '默认指 DeepSeek 官方端点（要支持原生 web_search 的模型）；填别的兼容端点也能用。',
+    'deepseek-api': {
+        id: 'deepseek-api', label: 'DeepSeek Search API（直连）', family: 'deepseek-api',
+        needsKey: true, keyEnv: 'DEEPSEEK_API_KEY', endpoint: 'https://api.deepseek.com/v1/tools',
+        note: '直连 DeepSeek 的 Search API：一次请求直接返回来源清单（标题 / 链接 / 摘要 / 日期），'
+            + '不跑辅助模型，比 Messages 那条快、也不花模型 token。Key 默认取 DEEPSEEK_API_KEY。',
     },
     openai: {
         id: 'openai', label: 'OpenAI 兼容（chat/completions）', family: 'openai',
@@ -185,14 +186,14 @@ export function providerDefaults(id) {
         apiKey: '',
         apiKeyEnv: meta.keyEnv ?? '',
         baseURL: meta.endpoint ?? '',
-        model: id === 'anthropic' ? 'deepseek-v4-flash' : (id === 'openai' ? 'gpt-4o-mini' : ''),
+        model: id === 'openai' ? 'gpt-4o-mini' : '',
         apiVersion: '2023-06-01',
         maxUses: 5,
         maxTokens: 2048,
         maxResults: id === 'seam' ? 8 : 8,
         // 与 config.js 的 DEFAULT_SEARCH.providers 对齐：兼容端点（要模型跑一轮检索）
         // 给 60 秒，纯检索 API 给 30 秒。
-        timeoutMs: id === 'anthropic' || id === 'openai' ? 60_000 : 30_000,
+        timeoutMs: id === 'openai' ? 60_000 : 30_000,
         userAgent: 'dsh-office-mode/0.1 (+built-in web access)',
     };
 }
@@ -385,39 +386,26 @@ export function normalizeSources(items, maxResults) {
 // ── 各家族的响应映射 ────────────────────────────────────────────────────────
 
 /**
- * Anthropic 兼容响应 → 统一检索结果（第十六轮那段映射，原样搬过来）。
+ * DeepSeek Search API 响应 → 统一检索结果（第六十五轮）。
  *
- * 引用片段来自 text 块里的 citations（DeepSeek 的 web_search_result 条目本身
- * 通常不带 snippet），按 URL 取第一次出现的那条。没有任何 web_search_tool_result
- * 块时报错而不是去猜正文 —— 那说明这次请求根本没触发原生检索。
+ * 响应形状：`results[]`，每条带 title / url / snippet / date，另有 summary、
+ * content、authority 等可选字段。这里只取统一结果用得上的四个；snippet 为空时
+ * 退回 summary（normalizeSources 会把摘要截到 400 字）。
+ *
+ * **空数组算成功**：那是「这个词确实没结果」，不是解析失败 —— 与 Messages
+ * 那条「没有 web_search_tool_result 块就是没触发检索」不同。
  */
-export function mapSearchResponse(body) {
-    const blocks = Array.isArray(body?.content) ? body.content : [];
-    const resultBlocks = blocks.filter((block) => block?.type === 'web_search_tool_result');
-    if (resultBlocks.length === 0) {
-        throw new WebAccessError('检索接口没有返回 web_search_tool_result 块，这次请求没有触发原生检索。', 'OFFICE_WEB_NO_RESULTS');
-    }
-    const snippets = new Map();
-    for (const block of blocks) {
-        if (block?.type !== 'text') continue;
-        for (const cite of block.citations ?? []) {
-            const url = asText(cite?.url);
-            const cited = asText(cite?.cited_text);
-            if (url === '' || cited === '' || snippets.has(url)) continue;
-            snippets.set(url, cited);
-        }
-    }
-    const raw = [];
-    for (const block of resultBlocks) {
-        for (const item of block?.content ?? []) {
-            if (item?.type !== 'web_search_result') continue;
-            const url = asText(item.url);
-            if (url === '') continue;
-            raw.push({ url, title: asText(item.title), snippet: asText(snippets.get(url)), publishedAt: asText(item.page_age) });
-        }
-    }
-    const summary = blocks.filter((block) => block?.type === 'text').map((block) => asText(block.text)).filter((line) => line !== '').join('\n');
-    return { content: summary, sources: normalizeSources(raw, undefined) };
+export function mapDeepSeekApiResponse(body) {
+    const results = Array.isArray(body?.results) ? body.results : [];
+    return {
+        content: '',
+        sources: normalizeSources(results.map((item) => ({
+            url: item?.url,
+            title: item?.title,
+            snippet: item?.snippet ?? item?.summary,
+            publishedAt: item?.date,
+        })), undefined),
+    };
 }
 
 /**
@@ -614,27 +602,20 @@ export async function searchProvider(id, request) {
     }
 
     switch (meta.family) {
-        case 'anthropic': {
-            const body = {
-                model: options.model,
-                max_tokens: options.maxTokens,
-                messages: [{ role: 'user', content: [{ type: 'text', text: `Perform a web search for the query: ${request.query}` }] }],
-                tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: options.maxUses }],
-            };
+        case 'deepseek-api': {
+            // 一次请求直接拿来源清单：count 就是「要几条」，1-50（请求里更小的
+            // maxResults 优先）。need_content 固定 false —— 正文由取正文那条路走，
+            // 搜索阶段不把整页内容搬进上下文。
+            const count = Math.min(50, Math.max(1, maxResults ?? options.maxResults ?? 10));
             const parsed = await requestJson({
                 ...common,
-                url: base + '/messages',
+                url: base + '/search',
                 method: 'POST',
-                what: '检索接口',
-                headers: {
-                    'x-api-key': request.apiKey,
-                    authorization: `Bearer ${request.apiKey}`,
-                    'anthropic-version': options.apiVersion,
-                    'content-type': 'application/json',
-                },
-                body,
+                what: 'DeepSeek 检索接口',
+                headers: { authorization: `Bearer ${request.apiKey}`, 'content-type': 'application/json' },
+                body: { query: request.query, count, need_content: false },
             });
-            const mapped = mapSearchResponse(parsed);
+            const mapped = mapDeepSeekApiResponse(parsed);
             return { ...mapped, sources: normalizeSources(mapped.sources, maxResults) };
         }
         case 'openai': {

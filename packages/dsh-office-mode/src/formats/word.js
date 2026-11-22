@@ -21,7 +21,7 @@ import {
     TWIPS_PER_CM,
 } from '../engine/kit.js';
 import { DEFAULT_THEME_ID, THEMES, resolveTheme, shadeOf, toHex } from '../engine/theme.js';
-import { looksLikeLatex } from './ppt-math.js';
+import { looksLikeLatex, looksLikePlainFormula } from './ppt-math.js';
 
 const W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
 const R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
@@ -1370,28 +1370,36 @@ function renderTable(block, ctx) {
     return `${captionBelow ? '' : captionPara}${tableXml}${captionBelow ? captionPara : ''}${tail}`;
 }
 
-function renderImage(block, ctx) {
-    const { widthCm, caption, alt, source } = block;
-    const cx = Math.round(widthCm * EMU_PER_CM);
-    const cy = block.heightCm ? Math.round(block.heightCm * EMU_PER_CM) : Math.round(cx * 0.6);
-    const relId = block.relId;
-    const drawingId = block.drawingId;
+/**
+ * 内嵌图片的 drawing XML（wp:inline 一段）。
+ *
+ * 单图（renderImage）与图片网格（renderImageGrid）共用这一份：drawing id、
+ * 关系 id、尺寸与替代文本的写法只有一处真相，改一处两边一起变。
+ */
+function drawingRunXml(image) {
+    const cx = Math.round(image.widthCm * EMU_PER_CM);
+    const cy = image.heightCm ? Math.round(image.heightCm * EMU_PER_CM) : Math.round(cx * 0.6);
+    const drawingId = image.drawingId;
     const name = `图片 ${drawingId}`;
     // 署名（source）也进 descr：图注可能被裁掉，替代文本里留着才追得回来源。
-    const description = [alt ?? caption ?? '', source ? `来源：${source}` : ''].filter((part) => part !== '').join('；');
-    const drawing = '<w:r><w:drawing>'
+    const description = [image.alt ?? image.caption ?? '', image.source ? `来源：${image.source}` : ''].filter((part) => part !== '').join('；');
+    return '<w:r><w:drawing>'
         + '<wp:inline distT="0" distB="0" distL="0" distR="0">'
         + `<wp:extent cx="${cx}" cy="${cy}"/>`
         + '<wp:effectExtent l="0" t="0" r="0" b="0"/>'
         + `<wp:docPr id="${drawingId}" name="${escapeXml(name)}" descr="${escapeXml(description)}"/>`
         + '<wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>'
         + `<a:graphic><a:graphicData uri="${PIC_NS}">`
-        + `<pic:pic><pic:nvPicPr><pic:cNvPr id="${drawingId}" name="${escapeXml(block.fileName)}"/><pic:cNvPicPr/></pic:nvPicPr>`
-        + `<pic:blipFill><a:blip r:embed="${relId}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>`
+        + `<pic:pic><pic:nvPicPr><pic:cNvPr id="${drawingId}" name="${escapeXml(image.fileName)}"/><pic:cNvPicPr/></pic:nvPicPr>`
+        + `<pic:blipFill><a:blip r:embed="${image.relId}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>`
         + `<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm>`
         + '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic>'
         + '</a:graphicData></a:graphic></wp:inline></w:drawing></w:r>';
-    const imagePara = `<w:p>${pPrXml({ align: 'center', spacing: '<w:spacing w:before="120" w:after="60" w:line="240" w:lineRule="auto"/>' })}${drawing}</w:p>`;
+}
+
+function renderImage(block, ctx) {
+    const { caption, source } = block;
+    const imagePara = `<w:p>${pPrXml({ align: 'center', spacing: '<w:spacing w:before="120" w:after="60" w:line="240" w:lineRule="auto"/>' })}${drawingRunXml(block)}</w:p>`;
     if (!caption && !source) return imagePara;
     const parts = [imagePara];
     if (caption) {
@@ -1402,6 +1410,64 @@ function renderImage(block, ctx) {
         parts.push(`<w:p>${pPrXml({ styleId: 'Caption', align: 'center' })}${runXml(`来源：${source}`, { size: Math.max(7, STYLE_INFO.Caption.size - 1), color: ctx.ink.muted }, ctx)}</w:p>`);
     }
     return parts.join('');
+}
+
+/**
+ * 图片网格（imageGrid）：用一张无框表格排出 columns 列的等宽图片矩阵。
+ *
+ * 为什么用表格：Word 的段落流没有「并排」概念，图片要并排只能进表格。
+ * 为什么显式写 <w:tblBorders> 全 nil：表格样式可能被主题或用户模板改成有边框，
+ * 显式 nil 才是真的无框，也免得读文件的人以为这几张图是「表格数据」。
+ * 列间隙用单元格左右边距各半个 gap 实现 —— 相邻两格之间的空白正好是 gapCm，
+ * 图片本身按（格宽 - gap）缩放，永远不溢出格宽；末行不足的格子补空段落，
+ * 让每一行的 w:tc 数都等于 columns（栅格规整，Word 不会替我们补出奇怪的列）。
+ */
+function renderImageGrid(block, ctx) {
+    const { columns, cellTw, gapTw } = block;
+    const gapLeft = Math.round(gapTw / 2);
+    const gapRight = gapTw - gapLeft;
+    const nilBorder = (side) => borderXml(side, { val: 'nil', sz: 0, color: 'auto' });
+    const tblPr = '<w:tblPr>'
+        + `<w:tblW w:w="${cellTw * columns}" w:type="dxa"/>`
+        + `<w:tblBorders>${['top', 'left', 'bottom', 'right', 'insideH', 'insideV'].map(nilBorder).join('')}</w:tblBorders>`
+        + '<w:tblLayout w:type="fixed"/>'
+        + '<w:tblCellMar>'
+        + '<w:top w:w="0" w:type="dxa"/>'
+        + `<w:left w:w="${gapLeft}" w:type="dxa"/>`
+        + '<w:bottom w:w="0" w:type="dxa"/>'
+        + `<w:right w:w="${gapRight}" w:type="dxa"/>`
+        + '</w:tblCellMar>'
+        + '<w:tblLook w:val="0000" w:firstRow="0" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="1" w:noVBand="1"/>'
+        + '</w:tblPr>';
+    const grid = `<w:tblGrid>${Array.from({ length: columns }, () => `<w:gridCol w:w="${cellTw}"/>`).join('')}</w:tblGrid>`;
+    const cellPr = `<w:tcPr><w:tcW w:w="${cellTw}" w:type="dxa"/><w:vAlign w:val="top"/></w:tcPr>`;
+    const cellXml = (cell) => {
+        if (!cell) return `<w:tc>${cellPr}<w:p/></w:tc>`;
+        const parts = [];
+        if (cell.available) {
+            parts.push(`<w:p>${pPrXml({ align: 'center', spacing: '<w:spacing w:before="0" w:after="60" w:line="240" w:lineRule="auto"/>' })}${drawingRunXml(cell)}</w:p>`);
+        } else {
+            // 缺图/非 PNG·JPEG：留一行文字占位，整篇照常生成（一张图不该毁掉一份文档）
+            const label = cell.target === '' ? '（路径为空）' : cell.target;
+            parts.push(`<w:p>${pPrXml({ align: 'center' })}${runXml(`图片不可用：${label}`, { size: STYLE_INFO.Caption.size, color: ctx.ink.muted }, ctx)}</w:p>`);
+        }
+        if (cell.caption) {
+            parts.push(`<w:p>${pPrXml({ styleId: 'Caption' })}${runXml(cell.caption, { size: STYLE_INFO.Caption.size, color: ctx.ink.muted }, ctx)}</w:p>`);
+        }
+        if (cell.source) {
+            parts.push(`<w:p>${pPrXml({ styleId: 'Caption', align: 'center' })}${runXml(`来源：${cell.source}`, { size: Math.max(7, STYLE_INFO.Caption.size - 1), color: ctx.ink.muted }, ctx)}</w:p>`);
+        }
+        return `<w:tc>${cellPr}${parts.join('')}</w:tc>`;
+    };
+    const rows = [];
+    for (let start = 0; start < block.cells.length; start += columns) {
+        const cells = block.cells.slice(start, start + columns);
+        while (cells.length < columns) cells.push(null);
+        rows.push(`<w:tr>${cells.map(cellXml).join('')}</w:tr>`);
+    }
+    const table = `<w:tbl>${tblPr}${grid}${rows.join('')}</w:tbl>`;
+    // 表后补一个 4pt 空段：与 renderTable 保持一致的收尾
+    return table + `<w:p>${pPrXml({ spacing: '<w:spacing w:before="0" w:after="80" w:line="240" w:lineRule="exact"/>' })}</w:p>`;
 }
 
 function pageFieldRuns(template, ctx, opts = {}) {
@@ -1572,6 +1638,8 @@ function renderBlock(block, ctx) {
             return renderFormula(block, ctx);
         case 'image':
             return renderImage(block, ctx);
+        case 'imageGrid':
+            return renderImageGrid(block, ctx);
         case 'pageBreak':
             return `<w:p>${pPrXml({ spacing: '<w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="exact"/>' })}<w:r><w:br w:type="page"/></w:r></w:p>`;
         case 'spacer': {
@@ -1688,7 +1756,7 @@ function analyzeDocument(documentXml, { reportStrayLatex = true } = {}) {
     const stats = {
         paragraphs: 0, bodyParagraphs: 0, headings: 0, lists: 0, listItems: 0,
         quotes: 0, codeBlocks: 0, tables: 0, images: 0, words: 0, chars: 0,
-        formulas: 0, formulaErrors: 0, pagesEstimate: 1, pageSize: page.label, contentWidthCm: Number((contentTw / TWIPS_PER_CM).toFixed(2)),
+        formulas: 0, formulaErrors: 0, plainFormulas: 0, pagesEstimate: 1, pageSize: page.label, contentWidthCm: Number((contentTw / TWIPS_PER_CM).toFixed(2)),
     };
     const outline = [];
     const warnings = [];
@@ -1734,6 +1802,22 @@ function analyzeDocument(documentXml, { reportStrayLatex = true } = {}) {
                     const sample = (mathText === '' ? text : mathText).trim().slice(0, 32);
                     warnings.push(`第 ${stats.paragraphs} 段有疑似未解析的 LaTeX 文本（「${sample}」）：`
                         + '公式里的未知命令会按纯文本原样输出，这几处要么改成支持的命令，要么写成普通文字');
+                }
+            }
+            // 短公式兜底（第五十八轮 新-23）：公式**压根没进 math 通道**时上面那条判据看不见它
+            // —— looksLikeLatex 要求文本里至少有一个 `\命令`，而 `r=q·r0` 一个反斜杠都没有。
+            // 这条**不受 reportStrayLatex 约束**：没有解析器会替它报（什么都没解析过），
+            // 创建路径也必须当场响，否则「写成了文字」在写侧完全静默。
+            // 判据只看 `text`（paragraphChunks 只收 w:t，本来就不含 m:t），所以**同段里有公式
+            // 也照样检查明文那一半** —— 从前写的 `mathText === ''` 门过宽（复核 P2-2）：
+            // `[{math:'r=qr_0'}, {text:' 其中 r=q·r0 是近似'}]` 这种混排段落会整段漏掉。
+            if (text.trim() !== '' && !suspect && looksLikePlainFormula(text)) {
+                stats.plainFormulas += 1;
+                if (stats.plainFormulas <= 3) {
+                    warnings.push(`第 ${stats.paragraphs} 段有看着像公式的普通文本（「${text.trim().slice(0, 32)}」）：`
+                        + "短公式同样要走 math 通道 —— 行内写 builder.para([{math:'r=qr_0'}])，"
+                        + '独立成行写 builder.formula(latex)，不要写成 r=q·r0 这样的纯文本；'
+                        + '确实要当文字用可以忽略这条');
                 }
             }
             const blockMath = !!descendant(node, 'm:oMathPara');
@@ -1898,6 +1982,22 @@ function analyzeDocument(documentXml, { reportStrayLatex = true } = {}) {
         }
         if (node.name === 'w:tbl') {
             stats.tables += 1;
+            // 表格单元格里的短公式（第五十八轮 新-23，复核 P2-1）：上面按段落扫的那条路
+            // 只走 w:body 的直接子 w:p，w:tc 里的段落一个都到不了 —— 而 PPT 侧是按文本节点
+            // 计的（表格单元格照样算），两边口径必须对齐，否则「同名同口径」那句话不成立。
+            // 这里只判、只计数：单元格段落不计进 stats.paragraphs（那是正文段落的计数）。
+            for (const cellPara of descendants(node, 'w:p')) {
+                const cellText = paragraphChunks(cellPara)
+                    .filter((chunk) => chunk.kind === 'text').map((chunk) => chunk.value).join('').trim();
+                if (cellText === '' || descendants(cellPara, 'm:oMath').length > 0) continue;
+                if (!looksLikePlainFormula(cellText)) continue;
+                stats.plainFormulas += 1;
+                if (stats.plainFormulas <= 3) {
+                    warnings.push(`第 ${stats.tables} 个表格的单元格里有看着像公式的普通文本（「${cellText.slice(0, 32)}」）：`
+                        + "短公式同样要走 math 通道 —— 单元格写成 {math:'r=qr_0'}，"
+                        + '不要写成 r=q·r0 这样的纯文本；确实要当文字用可以忽略这条');
+                }
+            }
             const grid = children(node, 'w:tblGrid')[0];
             const cols = grid ? children(grid, 'w:gridCol').map((col) => asNumber(attr(col, 'w:w'), 0)) : [];
             const rows = children(node, 'w:tr');
@@ -2012,6 +2112,74 @@ function createContext({ theme, page, footer, header, title, author, subject, cr
     return ctx;
 }
 
+/**
+ * 载入一张图并登记进包：关系 id、drawing id、word/media 文件名都在这里一次性发放。
+ *
+ * 单图（image）与图片网格（images）共用这一份登记逻辑，区别只有一个宽度上限：
+ * 单图最多到版心，网格最多到格宽（够不着就等比放大铺满 —— 网格的视觉基线
+ * 是「每格一样大」，参差不齐的多图排版反而不像一组）。
+ *
+ * 尺寸口径与 image() 一直以来的算法一致：96dpi 把像素换算成厘米，宽度取
+ * min(自然宽, 上限)，高度按原始比例；像素尺寸读不出来时按 4:3 估算。
+ *
+ * 失败不抛：返回 { ok: false, reason }，是整块跳过（单图）还是留文字占位
+ * （网格）由调用方决定 —— 读图失败不该让一份文档整体生不出来。
+ */
+function loadImage(ctx, target, opts = {}) {
+    const wanted = asString(target);
+    if (wanted === '') return { ok: false, reason: '路径为空' };
+    let bytes;
+    try {
+        bytes = ctx.env.readFile(wanted);
+    } catch {
+        return { ok: false, reason: '读不到文件' };
+    }
+    const info = sniffImage(bytes);
+    if (!info) return { ok: false, reason: '不是 PNG/JPEG，OOXML 只嵌入这两种' };
+    const maxWidthCm = asNumber(opts.maxWidthCm, 0) > 0 ? asNumber(opts.maxWidthCm, 0) : ctx.contentTw / TWIPS_PER_CM;
+    const pixelSizeMissing = !info.width || !info.height;
+    const natural = pixelSizeMissing ? 12 : (info.width / 96) * 2.54;
+    const naturalHeight = pixelSizeMissing ? 9 : (info.height / 96) * 2.54;
+    let widthCm = asNumber(opts.widthCm, 0);
+    if (!(widthCm > 0)) widthCm = Math.min(natural, maxWidthCm);
+    const clamped = widthCm > maxWidthCm;
+    if (clamped) widthCm = maxWidthCm;
+    const heightCm = natural > 0 ? (widthCm * naturalHeight) / natural : widthCm * 0.75;
+    ctx.drawingSeq += 1;
+    ctx.relSeq += 1;
+    const fileName = `image${ctx.media.length + 1}.${info.ext}`;
+    const relId = `rId${ctx.relSeq}`;
+    ctx.media.push({ fileName, ext: info.ext, data: bytes, relId });
+    return {
+        ok: true,
+        target: wanted,
+        fileName,
+        relId,
+        drawingId: ctx.drawingSeq,
+        widthCm,
+        heightCm,
+        pixelSizeMissing,
+        clamped,
+        maxWidthCm,
+    };
+}
+
+/**
+ * 构建期立刻双写一条警告。
+ *
+ * renderPackage 也会把 ctx.warnings 双写进 env.warn，但那是 render() 时的事，
+ * 且靠 reportedWarnings 去重；缺图属于「用户给了素材却没用上」，要在 builder
+ * 阶段就出现在 office_run 的 warnings 里。先登记进同一个集合，render 时就不会再写一遍。
+ */
+function warnNow(ctx, message) {
+    ctx.warnings.push(message);
+    if (typeof ctx.env?.warn !== 'function') return;
+    ctx.reportedWarnings ??= new Set();
+    if (ctx.reportedWarnings.has(message)) return;
+    ctx.reportedWarnings.add(message);
+    ctx.env.warn(`word：${message}`);
+}
+
 export function create(spec = {}, env = {}) {
     if (typeof env.writeFile !== 'function') throw new Error('word.create: 需要 createEnv() 提供的 env（含 writeFile）');
     const options = spec ?? {};
@@ -2099,41 +2267,24 @@ export function create(spec = {}, env = {}) {
         image(imagePath, opts = {}) {
             const target = asString(imagePath);
             if (target === '') { ctx.warnings.push('image(): 路径为空，已跳过'); return this; }
-            let bytes;
-            try {
-                bytes = env.readFile(target);
-            } catch {
-                ctx.warnings.push(`图片 ${target} 读不到，已跳过（Word 里不会出现这张图）`);
+            const loaded = loadImage(ctx, target, { widthCm: asNumber(opts.widthCm, 0) });
+            if (!loaded.ok) {
+                ctx.warnings.push(loaded.reason === '读不到文件'
+                    ? `图片 ${target} 读不到，已跳过（Word 里不会出现这张图）`
+                    : `图片 ${target} 不是 PNG/JPEG，OOXML 只嵌入这两种，已跳过`);
                 return this;
             }
-            const info = sniffImage(bytes);
-            if (!info) {
-                ctx.warnings.push(`图片 ${target} 不是 PNG/JPEG，OOXML 只嵌入这两种，已跳过`);
-                return this;
+            if (loaded.pixelSizeMissing) ctx.warnings.push(`无法读取 ${target} 的像素尺寸，按 4:3 估算显示尺寸`);
+            if (loaded.clamped) {
+                ctx.warnings.push(`图片 ${target} 宽度 ${asNumber(opts.widthCm, 0).toFixed(2)}cm 超出版心 ${loaded.maxWidthCm.toFixed(2)}cm，已等比缩到版心宽度`);
             }
-            if (!info.width || !info.height) ctx.warnings.push(`无法读取 ${target} 的像素尺寸，按 4:3 估算显示尺寸`);
-            const natural = info.width && info.height ? (info.width / 96) * 2.54 : 12;
-            const naturalHeight = info.width && info.height ? (info.height / 96) * 2.54 : 9;
-            const contentCm = ctx.contentTw / TWIPS_PER_CM;
-            let widthCm = asNumber(opts.widthCm, 0);
-            if (!(widthCm > 0)) widthCm = Math.min(natural, contentCm);
-            if (widthCm > contentCm) {
-                ctx.warnings.push(`图片 ${target} 宽度 ${widthCm.toFixed(2)}cm 超出版心 ${contentCm.toFixed(2)}cm，已等比缩到版心宽度`);
-                widthCm = contentCm;
-            }
-            const heightCm = natural > 0 ? (widthCm * naturalHeight) / natural : widthCm * 0.75;
-            ctx.drawingSeq += 1;
-            ctx.relSeq += 1;
-            const fileName = `image${ctx.media.length + 1}.${info.ext}`;
-            const relId = `rId${ctx.relSeq}`;
-            ctx.media.push({ fileName, ext: info.ext, data: bytes, relId });
             ctx.blocks.push({
                 type: 'image',
-                fileName,
-                relId,
-                drawingId: ctx.drawingSeq,
-                widthCm,
-                heightCm,
+                fileName: loaded.fileName,
+                relId: loaded.relId,
+                drawingId: loaded.drawingId,
+                widthCm: loaded.widthCm,
+                heightCm: loaded.heightCm,
                 caption: opts.caption ? asString(opts.caption) : '',
                 alt: opts.alt ? asString(opts.alt) : asString(opts.caption, target),
                 // 来源/署名（历史遗留 1-2「配图无来源」）：给了就渲染成图注下面的一行小字，
@@ -2141,7 +2292,94 @@ export function create(spec = {}, env = {}) {
                 // 返回的 credit 即可。
                 source: opts.source ? asString(opts.source) : '',
             });
-            env.note?.(`嵌入图片 ${target} → word/media/${fileName}（${widthCm.toFixed(2)}×${heightCm.toFixed(2)}cm）`);
+            env.note?.(`嵌入图片 ${target} → word/media/${loaded.fileName}（${loaded.widthCm.toFixed(2)}×${loaded.heightCm.toFixed(2)}cm）`);
+            return this;
+        },
+        /**
+         * 图片网格：把多张图排成 columns 列的等框矩阵，每格 = 图 + 可选图注 + 可选来源。
+         *
+         * items（必须是数组）：['a.png', 'b.jpg'] 或 [{path, caption, alt, source}, …]
+         * opts:
+         *   columns 2 | 3（默认 2）：一列本来就不需要网格，4 列在中文版心里每格过窄，
+         *           所以只认这两档；其它值按 2 列排版并告警 —— 非法输入一律「warning 不抛」。
+         *   gapCm   图与图之间的空白，默认 0.4cm，夹在 0–2cm。
+         *   widthCm 整组宽度，默认版心宽；超出版心会自动缩到版心并告警。
+         *
+         * 缺图/非 PNG·JPEG 不中断整篇：该格留一行「图片不可用：<path>」文字占位，
+         * 其余格子照常排 —— 配图素材常常是外部给的，一张缺图不该毁掉一份文档。
+         */
+        images(items, opts = {}) {
+            const list = asArray(items);
+            if (list.length === 0) {
+                ctx.warnings.push('images(): 没有传入任何图片，已跳过');
+                return this;
+            }
+            const rawColumns = opts.columns === undefined || opts.columns === null || opts.columns === ''
+                ? 2
+                : Math.round(asNumber(opts.columns, 2));
+            let columns = rawColumns;
+            if (columns !== 2 && columns !== 3) {
+                ctx.warnings.push(`images(): 只支持 2 或 3 列，已按 2 列排版（收到 ${asString(opts.columns)}）`);
+                columns = 2;
+            }
+            const wantedGap = asNumber(opts.gapCm, 0.4);
+            const gapCm = Math.min(2, Math.max(0, wantedGap));
+            if (gapCm !== wantedGap) {
+                ctx.warnings.push(`images(): gapCm ${wantedGap}cm 超出 0–2，已按 ${gapCm}cm 处理`);
+            }
+            const contentCm = ctx.contentTw / TWIPS_PER_CM;
+            const wantedTotal = asNumber(opts.widthCm, 0);
+            let totalCm = wantedTotal > 0 ? wantedTotal : contentCm;
+            if (totalCm > contentCm) {
+                ctx.warnings.push(`images(): widthCm ${totalCm.toFixed(2)}cm 超出版心 ${contentCm.toFixed(2)}cm，已缩到版心宽度`);
+                totalCm = contentCm;
+            }
+            // 没指定 widthCm 时直接用版心 twips：cm 往返换算会多出 1 twip，表格就顶出版心
+            const totalTw = wantedTotal > 0 ? Math.round(totalCm * TWIPS_PER_CM) : ctx.contentTw;
+            // 表宽与列宽必须自洽：tblW = cellTw × columns，否则固定列宽布局下最后一列会被挤歪
+            const cellTw = Math.max(1, Math.round(totalTw / columns));
+            let gapTw = Math.round(gapCm * TWIPS_PER_CM);
+            // 被 widthCm 压得很窄时，两侧边距可能比整格还宽 —— 先保图片有宽度
+            if (gapTw >= cellTw) gapTw = 0;
+            const imageCm = Math.max(0.2, (cellTw - gapTw) / TWIPS_PER_CM);
+
+            const cells = list.map((raw, index) => {
+                const item = raw !== null && typeof raw === 'object' ? raw : { path: raw };
+                const target = asString(item.path);
+                const caption = asString(item.caption);
+                const source = asString(item.source);
+                const alt = asString(item.alt) || caption || target;
+                const loaded = loadImage(ctx, target, { maxWidthCm: imageCm, widthCm: imageCm });
+                if (!loaded.ok) {
+                    const where = target === '' ? `第 ${index + 1} 张未给 path` : `「${target}」`;
+                    warnNow(ctx, `图片网格${where}：${loaded.reason}，已在该格留文字占位「图片不可用：${target}」`);
+                    return { available: false, target, caption, source, alt };
+                }
+                if (loaded.pixelSizeMissing) ctx.warnings.push(`无法读取 ${target} 的像素尺寸，按 4:3 估算显示尺寸`);
+                return {
+                    available: true,
+                    target,
+                    fileName: loaded.fileName,
+                    relId: loaded.relId,
+                    drawingId: loaded.drawingId,
+                    widthCm: loaded.widthCm,
+                    heightCm: loaded.heightCm,
+                    caption,
+                    source,
+                    alt,
+                };
+            });
+
+            ctx.blocks.push({
+                type: 'imageGrid',
+                columns,
+                gapTw,
+                cellTw,
+                widthCm: (cellTw * columns) / TWIPS_PER_CM,
+                cells,
+            });
+            const embedded = cells.filter((cell) => cell.available).length;
+            env.note?.(`图片网格 ${cells.length} 张 → ${embedded} 张嵌入 word/media（${columns} 列 ${Math.ceil(cells.length / columns)} 行，格宽 ${(cellTw / TWIPS_PER_CM).toFixed(2)}cm、间隙 ${(gapTw / TWIPS_PER_CM).toFixed(2)}cm）`);
             return this;
         },
         pageBreak() {
@@ -2548,7 +2786,9 @@ export const meta = {
             "    columns: ['季度', {title:'营收', width:5, align:'right'}]",
             "    rows 单元格: '文本' 或 {text, colspan, rowspan, align, bold, italic, fill, color, size}",
             '  builder.para([{math:\'x^2\'}]) 行内公式 / builder.formula(latex, {align, number, size}) 块级公式',
+            '    短公式（r=qr_0、F=ma、E=mc^2）同样走公式通道，别写成 r=q·r0 这样的纯文本',
             '  builder.image(path, {widthCm, caption, alt, source})   内嵌 PNG/JPEG，超版心自动等比缩放',
+            '  builder.images(items, {columns:2|3, gapCm, widthCm})   多图无框网格：每格图+题注+来源，缺图留文字占位',
             '  builder.pageBreak() / builder.spacer(cm) / builder.toc()   目录（H1–H3 条目与页码预渲染进 TOC 域）',
             '  opts: {bold, italic, underline, color, size, font, align, indent, spaceBefore, spaceAfter, lineSpacing}',
             '  builder.render() → Uint8Array / builder.save(path?) → report',
@@ -2568,6 +2808,10 @@ export const meta = {
             '  builder.heading(text, level=1, opts)         标题 1–3 级，带大纲级别（导航窗格/目录可用）',
             '  builder.para(text, opts)                     正文；text 可为 string 或 [{text,bold,italic,color,size}]',
             '  builder.para([{math:\'x^2\'}])               行内公式与普通 run 混排（LaTeX 子集 → OMML）',
+            '    短公式同样走公式通道：r=qr_0 要写 {math:\'r=qr_0\'}，不要写成 r=q·r0 这样的纯文本 ——',
+            '    短公式最容易下意识写成文字，而纯文本的公式在 Word 里既不是公式也不能再编辑；',
+            '    这样的文本会进 warnings 与 stats.plainFormulas（写侧与读侧同名同口径；',
+            '    Word 按段落与表格单元格计，PPT 按文本节点计）',
             '  builder.bullets(items, opts)                 无序列表（1.5 倍行距，自动缩进分级）',
             '  builder.steps(items, opts)                   有序列表（1. / 1.1. / 1.1.1.）',
             '  builder.quote(text, opts)                    引用块（左侧强调色竖线；主题有底色时才有浅底）',
@@ -2581,6 +2825,9 @@ export const meta = {
             '  builder.image(path, {widthCm, caption, alt, source}) 内嵌 PNG/JPEG，超版心自动等比缩放',
             '    source 是署名（通常传 office.image.fetch 的 credit）：图注下面多一行小字「来源：…」，',
             '    同时进替代文本；配图必须能追到来源，正式稿别省这一项',
+            '  builder.images(items, {columns:2|3, gapCm:0.4, widthCm:12})  多图并排网格（无框表格）',
+            "    items: ['a.png', {path:'b.png', caption:'图 2', alt, source}]；每格按格宽等比缩放，题注/来源同 image()",
+            '    末行不足补空格子；columns 只认 2/3（其它回落 2），gapCm 夹 0–2cm；缺图该格留「图片不可用：<path>」并告警',
             '  builder.pageBreak() / builder.spacer(cm) / builder.toc()',
             '    toc() 生成 TOC 域，并把 H1–H3 的条目与页码**预渲染**进域的缓存结果：打开即见完整目录、',
             '    条目可点击跳转（标题上有书签），且不带任何「打开时更新域」标记 —— 那类标记会让 Word 弹',
@@ -2588,7 +2835,7 @@ export const meta = {
             '  opts: {bold, italic, underline, color, size, font, align, indent, spaceBefore, spaceAfter, lineSpacing}',
             '  builder.render() → Uint8Array（纯函数，不写盘）；builder.save(path?) → report',
         ],
-        read: ['read(path, env) → report（stats/outline/warnings 全部来自真实解析 word/document.xml；stats.formulas 为 m:oMath 个数）'],
+        read: ['read(path, env) → report（stats/outline/warnings 全部来自真实解析 word/document.xml；stats.formulas 为 m:oMath 个数，stats.plainFormulas 为看着像公式却写成普通文本的条数 —— 按段落与表格单元格计）'],
         edit: [
             'edit(path, ops, env) → report + {applied, skipped, changes}，一次调用只写一次盘',
             '  [{find, replace, all=true}]                   跨 run 文本替换（默认替换全部命中，all:false 只替换第一处）',

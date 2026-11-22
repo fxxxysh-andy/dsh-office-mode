@@ -18,17 +18,17 @@
  *
  *      **残余风险要如实说**：这个计数是「按次数」的近似，不是「投影还在不在」
  *      的精确判断。如果在第 3 次调用之前恰好发生了压缩、把第一次那份全文裁掉了，
- *      那么第 4 到第 12 次之间模型手里没有热记忆（只看到「与上一次投影相同」，
- *      以及一行「要看：office_memory({ action: 'read', layer: 'hot' })」）。
+ *      那么第 4 到第 12 次之间模型手里没有热记忆，也看不到任何占位说明
+ *      （第七十九轮起未变化的部分整段不输出；读取入口在 persona 里）。
  *      精确做法是去会话日志里找上一次投影还在不在（压缩会把旧结果换成占位符），
  *      但那要依赖 `ownEvents()` 里工具结果事件的具体形状 —— 猜错的后果是这条守卫
  *      **静默失效**（要么永不触发、要么次次触发），比现在这个有界的近似更糟。
  *      所以这里选了「简单且一定生效」的那个，并把边界写在这里。
  *
- *   2. **台账部分照旧每次都贴**。台账最近几条是「这次交付之后新增了什么」的
+ *   2. **台账只在登记变化时贴**。台账最近几条是「这次交付之后新增了什么」的
  *      直接反馈，而它**不**体现在热记忆的 revision 里（revision 只由热记忆条目
- *      算出来）—— 把它一起省掉会让 office_run 之后看不到刚登记的那条。
- *      省的是热记忆的正文，不是整个投影。
+ *      算出来）—— 指纹没变就整段不输出；指纹变了只贴台账行，不重复热记忆的
+ *      标题与用量（第七十九轮：未变化的部分是前缀税）。
  *
  *   3. **状态按会话记，且是有界的**。会话之间互不影响（一个会话贴过不代表另一个
  *      看过）；Map 只保留最近 `MAX_SESSIONS` 个会话，长跑进程不会因此涨内存。
@@ -180,9 +180,9 @@ function evict() {
  *     **按信号筛**，无关条目折叠成一行（带条数与读取入口）。连续 `REFRESH_EVERY` 次
  *     没变 → 强制重贴**不筛的**全文 —— 心跳的职责是完整性（防宿主压缩把先前那份裁掉），
  *     所以这一份故意不筛。
- *   · **台账近况**：用自己的 `ledgerRevision`（最近几条的指纹）判断，变了就贴，
- *     没变也折叠成一行。台账不体现在热记忆的 `writeRevision` 里，但它同样只在登记新产物
- *     时才变 —— 两次交付之间反复贴同样三行，付的是纯重复的钱。
+ *   · **台账近况**：用自己的 `ledgerRevision`（最近几条的指纹）判断，变了只贴台账行，
+ *     没变整段不输出。台账不体现在热记忆的 `writeRevision` 里，但它同样只在登记新产物
+ *     时才变 —— 两次交付之间反复贴同样几行，付的是纯重复的钱。
  *   · **读全文的入口**：任何折叠行都必须带 `office_memory` 的读取调用 —— 折叠是
  *     「把选择权交回给模型」，不是「替模型决定它不需要」。
  *
@@ -209,8 +209,16 @@ export function projectDigest(digest, { sessionId = '', context = 'help', signal
     const signalKey = terms === null ? '' : String(signal?.key ?? terms.join(','));
     if (id === '') {
         // 拿不到会话身份：不假装「刚贴过」。信号照样筛（它与谁是会话无关）。
+        // 预算**照传**（第五十六轮修正 A-02）：去重与成本预算是两件事 ——「不知道这是哪个
+        // 会话、所以不能按会话去重」不等于「可以不受配置的字节预算约束」。从前这个分支
+        // 漏传 budget，于是没有会话身份的调用会贴出全额（与同一个 digest 在正常分支下的
+        // 成本差一大截），而这条差异在设置页上完全看不出来。
         return {
-            text: renderDigest(digest, { context, signal: terms === null ? null : { label: signalKey, terms } }),
+            text: renderDigest(digest, {
+                context,
+                signal: terms === null ? null : { label: signalKey, terms },
+                budget,
+            }),
             mode: 'full',
             reason: 'no-session',
         };
@@ -292,8 +300,11 @@ export function projectDigest(digest, { sessionId = '', context = 'help', signal
         });
         return { text, mode: 'full', reason: 'changed', bytes: report.bytes, printed: report.printedIds.length };
     }
+    // 完全未变化就不输出：用户明确要求「说无变化就别输出」，而这一行每次调用
+    // 都会被追加到 office_help / office_run 的反馈里，成了纯粹的 token 税。
+    // 需要看的时候再 read（persona 里写着入口）。
     return {
-        text: renderDigest(digest, { context, hot: 'unchanged', ledger: 'unchanged' }),
+        text: '',
         mode: 'unchanged',
         reason: 'unchanged',
         bytes: undefined,

@@ -5,7 +5,7 @@
  *   - 复检报告里有真实 stats/outline
  *   - 缓存默认保留（跨调用复用），显式 keepCache:false 才清空
  *
- * 产物留在 <仓库根>/.office/tmp/e2e/ 供 validate-com.vbs 用真实 Office 再验一遍。
+ * 产物留在 <仓库根>/.office/runtime/tmp/e2e/ 供 validate-com.vbs 用真实 Office 再验一遍。
  *
  * 跑法：node test/e2e.mjs [--keep]
  */
@@ -19,9 +19,9 @@ import { executeRun } from '../src/run.js';
 import { renderRun } from '../src/tools.js';
 import { unzip } from '../src/engine/zip.js';
 
-// 测试中间产物统一落在仓库根的 .office/tmp/<suite>/ 下：与插件运行期的中间产物
+// 测试中间产物统一落在仓库根的 .office/runtime/tmp/<suite>/ 下：与插件运行期的中间产物
 // 同处一棵 .office/ 树，而不是在包里另开一个 .tmp。
-const outDir = fileURLToPath(new URL('../../../.office/tmp/e2e/', import.meta.url));
+const outDir = fileURLToPath(new URL('../../../.office/runtime/tmp/e2e/', import.meta.url));
 rmSync(outDir, { recursive: true, force: true });
 mkdirSync(outDir, { recursive: true });
 
@@ -123,7 +123,7 @@ if (result.otherFiles.length !== 1) problems.push(`其他写入应为 1 个（�
 // 2026-09-23 起缓存默认保留：中间产物跨调用复用（PDF 页面图那条路靠它）。
 if (result.cache.clearedAfter !== false) problems.push('默认不该清空缓存');
 if (result.cache.kept !== 1) problems.push(`缓存里应保留 1 个中间文件，实际 ${result.cache.kept}`);
-if (!existsSync(join(outDir, '.office', 'cache', 'intermediate.json'))) problems.push('中间产物没有留在缓存里');
+if (!existsSync(join(outDir, '.office', 'runtime', 'cache', 'intermediate.json'))) problems.push('中间产物没有留在缓存里');
 if (result.returned?.unmatched !== 1) problems.push('未命中替换没有正确返回');
 
 // 三层记忆的台账：三个 Office 产物应各登记一条，非 Office 的会议纪要.md 不进台账。
@@ -145,11 +145,11 @@ const cleared = await executeRun({
     keepCache: false,
 }, exec, config);
 if (cleared.cache.clearedAfter !== true) problems.push('keepCache:false 没有清空缓存');
-if (existsSync(join(outDir, '.office', 'cache'))) problems.push('.office/cache 目录在 keepCache:false 之后仍然存在');
+if (existsSync(join(outDir, '.office', 'runtime', 'cache'))) problems.push('.office/runtime/cache 目录在 keepCache:false 之后仍然存在');
 if (cleared.returned !== 1) problems.push('清空前脚本应当看得见缓存里的中间文件');
 
 // .office/ 是插件自己该有的东西（缓存 + 三层记忆），不是「预期外的文件」：
-// 它必须**只有这一个**目录名，工作目录根上不该再冒出 .office/cache / .office/memory。
+// 它必须**只有这一个**目录名，工作目录根上不该再冒出 .office/runtime/cache / .office/memory。
 const leftovers = readdirSync(outDir).filter((name) => !expected.includes(name) && name !== '会议纪要.md' && name !== '.office');
 if (leftovers.length > 0) problems.push(`工作目录有预期外的文件：${leftovers.join('、')}`);
 

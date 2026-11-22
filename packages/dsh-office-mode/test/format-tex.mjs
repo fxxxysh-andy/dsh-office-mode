@@ -3,7 +3,7 @@
  *
  * 跑法：`node test/format-tex.mjs`（默认连真实编译一起测，约 1 分钟）；
  * `node test/format-tex.mjs --no-compile` 只测生成/读取/编辑，不碰 TeX。
- * 加 `--keep` 保留 .office/tmp/tex/ 里的产物（用于人工打开 PDF 核对版式）。
+ * 加 `--keep` 保留 .office/runtime/tmp/tex/ 里的产物（用于人工打开 PDF 核对版式）。
  *
  * 这里刻意覆盖三件容易出错的事：
  *   1. 生成的项目要能真的被 xelatex 编出 PDF（含 bibtex 与两遍以上编译）；
@@ -24,7 +24,7 @@ import { pdfInfo } from '../src/pdf.js';
 
 const KEEP = process.argv.includes('--keep');
 const NO_COMPILE = process.argv.includes('--no-compile');
-const ROOT = fileURLToPath(new URL('../../../.office/tmp/tex/', import.meta.url));
+const ROOT = fileURLToPath(new URL('../../../.office/runtime/tmp/tex/', import.meta.url));
 const TEMPLATE = fileURLToPath(new URL('../../../thuthesis-v7.7.1/', import.meta.url));
 /** 工作区里有没有 thuthesis 模板：没有时模板块的断言自动降级（改用 TeX Live 自带的版本）。 */
 const HAS_TEMPLATE = existsSync(`${TEMPLATE}thuthesis.cls`);
@@ -42,13 +42,13 @@ function checkEqual(actual, expected, label) {
 }
 
 const config = resolveConfig({
-    cacheDir: '.office/cache',
+    cacheDir: '.office/runtime/cache',
     texTemplateDir: TEMPLATE,
     defaultTheme: 'plain',
 });
 // 测试用的 env：与 office_run 里那一份同形（root + 主题 + config）。
 const env = createEnv({ root: ROOT, themeResolver: () => ({ theme: {} }), config });
-const cache = createCache({ root: ROOT, dir: '.office/cache' });
+const cache = createCache({ root: ROOT, dir: '.office/runtime/cache' });
 
 /** 取第一段 `\thusetup{...}` 的正文（用于断言「里面没有空行」）。 */
 function firstSetupBlock(text) {
@@ -353,7 +353,7 @@ if (NO_COMPILE) {
 /* ── 9. 端到端：走 office_run 的真实路径（vm 沙箱 → SDK → 复检） ────────── */
 
 if (!NO_COMPILE && HAS_TEMPLATE) {
-    const E2E = fileURLToPath(new URL('../../../.office/tmp/tex/e2e/', import.meta.url));
+    const E2E = fileURLToPath(new URL('../../../.office/runtime/tmp/tex/e2e/', import.meta.url));
     const exec = { agent: { session: { header: { cwd: E2E } } } };
     const result = await executeRun({
         purpose: 'LaTeX 论文端到端',
@@ -380,7 +380,7 @@ return {
   escaped: office.tex.escape('100% & a_1'),
 };
 `,
-    }, exec, resolveConfig({ cacheDir: '.office/cache', texTemplateDir: TEMPLATE, defaultTheme: 'plain' }));
+    }, exec, resolveConfig({ cacheDir: '.office/runtime/cache', texTemplateDir: TEMPLATE, defaultTheme: 'plain' }));
 
     checkEqual(result.ok, true, 'office_run 应当成功', JSON.stringify(result.error));
     checkEqual(result.returned?.ok, true, '脚本里的 compile 应当成功', JSON.stringify(result.returned?.errors));
@@ -402,12 +402,12 @@ return {
 /* ── 结果 ───────────────────────────────────────────────────────────────── */
 
 if (!KEEP) {
-    // .office/tmp 与其它引擎共用，只能删自己产出的目录。
+    // .office/runtime/tmp 与其它引擎共用，只能删自己产出的目录。
     env.remove('thesis');
     env.remove('broken');
     env.remove('bachelor');
-    env.remove('.office/cache');
-    console.log('已清理本次产物（保留 .office/tmp 下其它文件）');
+    env.remove('.office/runtime/cache');
+    console.log('已清理本次产物（保留 .office/runtime/tmp 下其它文件）');
 } else {
     console.log(`保留了产物：${ROOT}`);
 }

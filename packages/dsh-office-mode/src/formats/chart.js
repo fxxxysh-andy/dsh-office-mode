@@ -278,27 +278,43 @@ export function chartSpaceXml(raw) {
 }
 
 /**
- * Excel 的绘图容器（`xl/drawings/drawingN.xml`）：把图表锚在一个单元格区间上。
+ * Excel 的绘图容器（`xl/drawings/drawingN.xml`）：把图表与图片锚在单元格上。
  *
- * 用 twoCellAnchor：随行列缩放（图会跟着表格走），这也是 Excel 自己插图表时的默认。
+ * 图表用 twoCellAnchor：随行列缩放（图会跟着表格走），这也是 Excel 自己插图表时的默认。
+ * 图片用 oneCellAnchor：只给左上角单元格 + 固定 EMU 尺寸，插进去多大就多大，
+ * 拖动表格不会把图拉变形（与 Excel「移动但不缩放」的默认行为一致）。
  *
  * **一张表上有几个图表就要有几个锚点**：绘图 rels 里声明了 N 条 chart 关系、
  * drawing 里却只锚一个，Excel 只显示那一个（本轮实测：同表两个图表时
  * `ChartObjects.Count` 报 1 —— 第二个图表部件在包里、没有任何东西引用它）。
+ * 图片同理：每个 `<xdr:oneCellAnchor>` 一个 `<xdr:pic>`。
  *
- * @param {{frames?: Array<object>, chartRelId?: string, name?: string, id?: number,
- *   from?: {col: number, row: number}, to?: {col: number, row: number}}} options
- *   `frames` 给多个锚点；不给时按单个锚点处理（单图表的老写法仍然可用）。
+ * @param {{frames?: Array<object>, pictures?: Array<object>, chartRelId?: string,
+ *   name?: string, id?: number, from?: {col: number, row: number},
+ *   to?: {col: number, row: number}}} options
+ *   `frames` 给图表锚点、`pictures` 给图片锚点；只给 chartRelId 时按单个图表锚点处理
+ *   （单图表的老写法仍然可用）。
  */
 export function spreadsheetDrawingXml(options) {
-    const frames = Array.isArray(options?.frames) ? options.frames : [options ?? {}];
+    const pictures = Array.isArray(options?.pictures) ? options.pictures : [];
+    // 老写法（{chartRelId, ...}）继续按「一个图表锚点」处理；显式给 frames: [] 时
+    // 保持「空数组 = 调用方 bug」的语义，只有 pictures 非空才允许 frames 为空。
+    const frames = Array.isArray(options?.frames)
+        ? options.frames
+        : (options?.chartRelId !== undefined || pictures.length === 0 ? [options ?? {}] : []);
     // 空 frames 是调用方的 bug（一张绘图里什么都没有）：给一句可执行的错，
     // 而不是产出一个 r:id="undefined" 的坏部件。
-    if (frames.length === 0) throw chartError('spreadsheetDrawingXml：frames 不能是空数组（一张绘图至少要锚一个图表）。');
+    if (frames.length === 0 && pictures.length === 0) {
+        throw chartError('spreadsheetDrawingXml：frames 不能是空数组（一张绘图至少要锚一个图表或图片）。');
+    }
     for (const frame of frames) {
         if (asText(frame?.chartRelId) === '') throw chartError('spreadsheetDrawingXml：每个 frame 都要给 chartRelId。');
     }
-    const body = frames.map((frame, index) => twoCellAnchorXml(frame, index)).join('');
+    for (const picture of pictures) {
+        if (asText(picture?.relId) === '') throw chartError('spreadsheetDrawingXml：每个 picture 都要给 relId。');
+    }
+    const body = frames.map((frame, index) => twoCellAnchorXml(frame, index)).join('')
+        + pictures.map((picture, index) => oneCellAnchorXml(picture, index, frames.length)).join('');
     return XML_HEAD
         + `<xdr:wsDr xmlns:xdr="${NS_SPREADSHEET_DRAWING}" xmlns:a="${NS_DRAWINGML}">`
         + body
@@ -323,6 +339,49 @@ function twoCellAnchorXml(frame, index) {
         + '</a:graphicData></a:graphic></xdr:graphicFrame>'
         + '<xdr:clientData/>'
         + '</xdr:twoCellAnchor>';
+}
+
+/**
+ * 一个 oneCellAnchor（图片锚在 from 单元格上，尺寸由 ext 的 EMU 固定）。
+ *
+ * 顺序按 CT_OneCellAnchor：from → ext → pic → clientData；ext 与 pic/spPr 里的
+ * a:ext 必须是同一组 EMU 值，否则 Excel 会按图片原始像素重排（尺寸悄悄变掉）。
+ *
+ * @param {{relId: string, name?: string, id?: number, alt?: string,
+ *   from?: {col?: number, row?: number}, cx?: number, cy?: number}} picture
+ * @param {number} index 图片在 pictures 里的序号（回退 name 用）
+ * @param {number} [idOffset] 同一 drawing 里前面已有几个锚点（图表占用的 id 段）
+ */
+function oneCellAnchorXml(picture, index, idOffset = 0) {
+    const from = picture?.from ?? { col: 0, row: 0 };
+    const col = Math.max(0, Math.trunc(Number(from.col) || 0));
+    const row = Math.max(0, Math.trunc(Number(from.row) || 0));
+    const cx = Math.max(0, Math.round(Number(picture?.cx) || 0));
+    const cy = Math.max(0, Math.round(Number(picture?.cy) || 0));
+    const id = Number.isFinite(Number(picture?.id)) ? Math.trunc(Number(picture.id)) : idOffset + index + 2;
+    const name = asText(picture?.name) || `图片 ${index + 1}`;
+    const alt = asText(picture?.alt);
+    // descr 是读屏与「图片裁掉后」唯一还能看到的一段字；没给 alt 就不写，
+    // 不编造文件名（那会让人以为图里画的是那个东西）。
+    const descr = alt === '' ? '' : ` descr="${escapeXml(alt)}"`;
+    return '<xdr:oneCellAnchor>'
+        + `<xdr:from><xdr:col>${col}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${row}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>`
+        + `<xdr:ext cx="${cx}" cy="${cy}"/>`
+        + '<xdr:pic><xdr:nvPicPr>'
+        + `<xdr:cNvPr id="${id}" name="${escapeXml(name)}"${descr}/>`
+        + '<xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr>'
+        + '</xdr:nvPicPr>'
+        + '<xdr:blipFill>'
+        + `<a:blip xmlns:r="${NS_RELATIONSHIPS}" r:embed="${escapeXml(asText(picture.relId))}"/>`
+        + '<a:stretch><a:fillRect/></a:stretch>'
+        + '</xdr:blipFill>'
+        + '<xdr:spPr>'
+        + `<a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm>`
+        + '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
+        + '</xdr:spPr>'
+        + '</xdr:pic>'
+        + '<xdr:clientData/>'
+        + '</xdr:oneCellAnchor>';
 }
 
 /**

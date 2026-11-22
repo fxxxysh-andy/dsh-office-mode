@@ -24,6 +24,7 @@ import { existsSync } from 'node:fs';
 import { basename } from 'node:path';
 
 import { probeAvSync } from './av.js';
+import { probeConvertEngines } from './convert.js';
 import { findPdfExecutable, probePdfEngines } from './pdf.js';
 import { previewKitAvailable } from './preview.js';
 import { probeTexEngines } from './tex.js';
@@ -41,8 +42,10 @@ export const CAPABILITY_VARIABLE = 'office_capabilities';
  * 这一份是从 persona 的「工具」一节里省出来的额度里花的）。
  *
  * 第四十七轮复核实测最坏情况 **489 B**（引擎满 + 音视频「部分缺件」+ 派工走长的那一支 +
- * 解释器文件名顶到 16 字符上限），所以预算收到 520 —— 留 31 B 余量，涨一点就红。
+ * 解释器文件名顶到 16 字符上限），所以预算收到 520 —— 当时留 31 B 余量，涨一点就红。
  * 原来的 640 要涨 30% 才报警，等于没守（复核 瑕疵 1）。
+ * **第五十三轮实测 505 B**（多了「互转 pandoc」一句 / +16 B）：余量只剩 **15 B**，
+ * 往这张地图里再加词之前先减（persona 的「渲染后」预算 16,300 B 同期也只剩 32 B）。
  */
 export const CAPABILITY_MAP_BUDGET_BYTES = 520;
 
@@ -96,6 +99,10 @@ export function syncCapabilities(options = {}) {
         pdf: { render, text },
         tex: latex,
         preview: previewKitAvailable() === true,
+        // 文档互转（md / docx / tex ↔ PDF 与彼此）只有 pandoc 一条外部依赖：
+        // 前面那几条引擎都是「出某种格式」的，pandoc 是「换一种格式」的，缺了它
+        // 模型会以为手上的 docx 能直接转成 md —— 所以这一条也要进地图。
+        convert: { pandoc: probeConvertEngines(refresh).pandoc !== undefined },
         python: python ?? null,
         // 音视频那半交给 av 通道自己的同步判据（probeAvSync）：地图与 office.av.check
         // 必须说同一件事 —— 只看 ffmpeg 会漏掉 ffprobe / 模型 / VAD / 运行时，
@@ -164,6 +171,9 @@ function engineSentence(snapshot) {
     const tex = listOf(snapshot.tex);
     if (tex.length > 0) parts.push('LaTeX ' + shorten(tex));
     if (snapshot.preview === true) parts.push('预览 LibreOffice');
+    // 「互转」那半只说一个词：pandoc 在不在决定 md / docx / tex 能不能互相转，
+    // 而 PDF 的其余路线（TeX / LibreOffice）已经在前面两句里报过了。
+    if (snapshot.convert?.pandoc === true) parts.push('互转 pandoc');
     if (hasPython(snapshot)) parts.push('Python ' + pythonLabel(snapshot.python));
     // 音视频那半用 av 通道自己的同步判据（`probeAvSync`）：**五样齐**才算可用
     // （ffmpeg / ffprobe / SenseVoice 权重 + 词表 / Silero VAD / sherpa-onnx 运行时），

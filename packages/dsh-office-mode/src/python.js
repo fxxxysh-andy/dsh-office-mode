@@ -19,7 +19,7 @@
  *     PYTHONIOENCODING=utf-8。
  *   - **MPLBACKEND=Agg**：没有显示器的环境里 matplotlib 默认后端会报错，
  *     这里直接把后端钉成 Agg，脚本里不必自己写 matplotlib.use()。
- *   - **产物只认缓存目录**：脚本写出的图/表按修改时间收集，落在 .office/cache
+ *   - **产物只认缓存目录**：脚本写出的图/表按修改时间收集，落在 .office/runtime/cache
  *     下（跨调用保留、按 TTL 清理）。要当交付物的文本仍走 office.files.write。
  *   - **行号不漂移**：脚本原样落盘、用 runpy 执行，异常回溯里的行号就是用户
  *     写的行号 —— 不在前面拼任何前导代码。

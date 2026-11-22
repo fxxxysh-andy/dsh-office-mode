@@ -9,7 +9,7 @@
  */
 import vm from 'node:vm';
 import { createCache } from './engine/cache.js';
-import { createEnv } from './engine/kit.js';
+import { createEnv, displayPath } from './engine/kit.js';
 import { resolveTheme } from './engine/theme.js';
 import { createMemory } from './memory.js';
 import { projectDigest, sessionIdOf, signalOf } from './projection.js';
@@ -18,6 +18,9 @@ import { buildSdk, isOfficeFile } from './sdk.js';
 
 /** 包装脚本时插入的行数：`(async () => {` 占一行。 */
 const WRAPPER_LINES = 1;
+
+/** 内联脚本在 vm 里的文件名（错误行号按它换算）。 */
+const INLINE_SCRIPT_NAME = 'office-script.js';
 
 function safeJson(value, depth = 0) {
     if (value === undefined) return null;
@@ -29,6 +32,10 @@ function safeJson(value, depth = 0) {
     if (type === 'bigint') return `${String(value)}n`;
     if (type === 'function') return '[function]';
     if (type === 'symbol') return String(value);
+    // 二进制（office.files.readBytes 的返回值）：按索引展开会变成几十个数字键，
+    // 对模型零信息。只报字节数。（`ArrayBuffer.isView` 跨 realm 也认。）
+    if (ArrayBuffer.isView(value)) return `[二进制 ${value.byteLength} 字节]`;
+    if (Object.prototype.toString.call(value) === '[object ArrayBuffer]') return `[二进制 ${value.byteLength} 字节]`;
     if (depth >= 4) return '[深度截断]';
     if (Array.isArray(value)) {
         const head = Array.from(value.slice(0, 40), (item) => safeJson(item, depth + 1));
@@ -60,6 +67,7 @@ function jsonSafe(value) {
     const type = typeof value;
     if (type === 'function' || type === 'symbol') return null;
     if (type !== 'object') return value;
+    if (ArrayBuffer.isView(value)) return `[二进制 ${value.byteLength} 字节]`;
     // 必须用 Array.from 而不是 value.map()：脚本跑在 vm 里，vm 数组的
     // map() 返回的仍是 vm realm 的数组，宿主侧 deepStrictEqual 会因为
     // 原型不同而判定不相等。Array.from 走的是宿主 Array，出来就是宿主数组。
@@ -82,10 +90,14 @@ function isErrorLike(value) {
 }
 
 /** 把 v8 的错误位置从包装后的行号换算回脚本自身的行号。 */
-function cleanError(error) {
+function cleanError(error, filename = INLINE_SCRIPT_NAME) {
     const raw = isErrorLike(error) ? error : new Error(String(error));
     const stack = typeof raw.stack === 'string' ? raw.stack : '';
-    const match = /office-script\.js:(\d+):(\d+)/.exec(stack);
+    const escaped = filename.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // 列号是**可选**的：语法错误（编译期）的栈帧只有 `文件:行`，运行期错误才有 `文件:行:列`。
+    // 只认带列号的那种写法会让「脚本文件里写错一个字符」这类最常见的失败拿不到行号
+    // （回执只剩 `脚本第 null 行` 那一类退化，2026-10-04 实测）。
+    const match = new RegExp(`${escaped}:(\\d+)(?::(\\d+))?`).exec(stack);
     const line = match ? Math.max(1, Number.parseInt(match[1], 10) - WRAPPER_LINES) : undefined;
     const frames = stack
         .split('\n')
@@ -96,15 +108,21 @@ function cleanError(error) {
         name: typeof raw.name === 'string' && raw.name !== '' ? raw.name : 'Error',
         message: typeof raw.message === 'string' ? raw.message : String(raw),
         line,
-        column: match ? Number.parseInt(match[2], 10) : undefined,
+        column: match && match[2] !== undefined ? Number.parseInt(match[2], 10) : undefined,
         stack: frames,
     };
 }
 
-/** 在受限上下文里执行脚本。没有 process / require / fs / 网络 / 定时器。 */
-function runInVm(source, office, timeoutMs) {
+/**
+ * 在受限上下文里执行脚本。没有 process / require / fs / 网络 / 定时器。
+ *
+ * `options.args` 会成为脚本里的全局 `args`（`新-7`：跨调用复用同一段脚本时，
+ * 参数从外面给，脚本本身不必改）；`options.filename` 决定错误行号按哪个文件名换算。
+ */
+function runInVm(source, office, timeoutMs, options = {}) {
     const sandbox = {
         office,
+        args: {},
         console: {
             log: office.log,
             info: office.log,
@@ -117,8 +135,20 @@ function runInVm(source, office, timeoutMs) {
         name: 'office-mode',
         codeGeneration: { strings: false, wasm: false },
     });
+    // `args` 必须是 **vm realm 自己的对象**：直接塞宿主对象等于给脚本一个
+    // `args.constructor.constructor('return process')()` 的把手 —— `codeGeneration:{strings:false}`
+    // 只挡 vm 自己那套 `eval` / `new Function`，挡不住宿主对象的构造器链（2026-10-04 实测）。
+    // 走一遍 JSON 往返最省事，而 `args` 本来就只承诺 JSON 值（调用方已先验过可序列化）。
+    if (options.args !== undefined) {
+        try {
+            vm.runInContext(`args = (${JSON.stringify(options.args)})`, context);
+        } catch {
+            // 极端形状（循环引用等）在调用方已经记过警告；这里保持空对象，不让它变成激活失败。
+            vm.runInContext('args = {}', context);
+        }
+    }
     const wrapped = `(async () => {\n${source}\n})()`;
-    const compiled = new vm.Script(wrapped, { filename: 'office-script.js' });
+    const compiled = new vm.Script(wrapped, { filename: options.filename ?? INLINE_SCRIPT_NAME });
     return compiled.runInContext(context, { timeout: timeoutMs });
 }
 
@@ -186,10 +216,18 @@ function warningsNoteOf(warnings) {
  */
 export async function executeRun(rawArgs, exec, config) {
     const args = rawArgs !== null && typeof rawArgs === 'object' ? rawArgs : {};
-    const script = typeof args.script === 'string' ? args.script : '';
-    if (script.trim() === '') throw new Error('office_run：script 不能为空。先用 office_help 查写法。');
-    if (script.length > config.maxScriptChars) {
-        throw new Error(`office_run：script 太长（${script.length} 字符，上限 ${config.maxScriptChars}）。请拆成多次或减少注释。`);
+    const inline = typeof args.script === 'string' ? args.script : '';
+    const scriptFile = typeof args.scriptFile === 'string' ? args.scriptFile.trim() : '';
+    // 两种来源都给了是**歧义**，不猜：猜错的那次调用会跑出一份与用户预期无关的结果，
+    // 而两边都写了的调用方本来就没想清楚。（`新-7` 的入口就是 scriptFile。）
+    if (inline.trim() !== '' && scriptFile !== '') {
+        throw new Error('office_run：script 与 scriptFile 只能给一个 —— scriptFile 是「同一段脚本跨调用复用」的入口。');
+    }
+    if (inline.trim() === '' && scriptFile === '') {
+        throw new Error('office_run：script 或 scriptFile 必须给一个。先用 office_help 查写法。');
+    }
+    if (inline.length > config.maxScriptChars) {
+        throw new Error(`office_run：script 太长（${inline.length} 字符，上限 ${config.maxScriptChars}）。请拆成多次或减少注释。`);
     }
 
     const cwd = exec?.agent?.session?.header?.cwd ?? process.cwd();
@@ -210,6 +248,50 @@ export async function executeRun(rawArgs, exec, config) {
         config,
     });
 
+    // 脚本来源：内联那段，或从工作目录读一份 .js（`新-7` 的「持久化脚本、复用」）。
+    // 走 env.readText 而不是自己读盘：这样脚本文件也会被登记成「这次读过什么」，
+    // 台账的 source 因此能回答「这份产物是拿哪段脚本构建的」。
+    let script = inline;
+    let scriptLabel;
+    if (scriptFile !== '') {
+        let text;
+        try {
+            text = env.readText(scriptFile);
+        } catch (error) {
+            throw new Error(`office_run：读不到脚本文件 ${scriptFile}（${error.message}）。`
+                + '先用 office.files.write 把脚本落成 .js，或改用 script 内联。');
+        }
+        if (text.trim() === '') throw new Error(`office_run：脚本文件 ${scriptFile} 是空的。`);
+        // 二进制当脚本读会得到一句 `Invalid or unexpected token`（光标停在一堆乱码里），
+        // 模型据此只能猜。UTF-8 里的空字节解码后就是 U+0000，用它当判据与 office.files.read 同口径。
+        if (text.includes('\u0000')) {
+            throw new Error(`office_run：脚本文件 ${scriptFile} 看着是二进制文件，不是 JavaScript 源码；`
+                + '要跑脚本请给它一份 .js 文本（office.files.write 落盘）。');
+        }
+        if (text.length > config.maxScriptChars) {
+            throw new Error(`office_run：脚本文件 ${scriptFile} 太长（${text.length} 字符，上限 ${config.maxScriptChars}）。请拆成多次或减少注释。`);
+        }
+        script = text;
+        scriptLabel = displayPath(cwd, env.resolve(scriptFile));
+    }
+    // 传给脚本的参数（全局 `args`）：只在是**可序列化的普通对象**时采用，其它形状
+    // 按「没给」处理并落一条警告 —— 静默变成 `{}` 会让脚本取到 undefined 却毫无信号
+    // （第五十一轮独立复核的一条）。
+    let scriptArgs = {};
+    if (args.args !== undefined && args.args !== null) {
+        const value = args.args;
+        if (typeof value !== 'object' || Array.isArray(value)) {
+            env.warn(`args 不是对象（${Array.isArray(value) ? '数组' : typeof value}），已按 {} 处理；要传参数请给一个对象。`);
+        } else {
+            try {
+                JSON.stringify(value);
+                scriptArgs = value;
+            } catch (error) {
+                env.warn(`args 无法序列化（${error instanceof Error ? error.message : String(error)}），已按 {} 处理。`);
+            }
+        }
+    }
+
     const sdk = await buildSdk({ env, cache, config });
     const started = Date.now();
     let returned;
@@ -217,9 +299,12 @@ export async function executeRun(rawArgs, exec, config) {
 
     try {
         exec?.signal?.throwIfAborted();
-        returned = await runInVm(script, sdk.office, config.scriptTimeoutMs);
+        returned = await runInVm(script, sdk.office, config.scriptTimeoutMs, {
+            filename: scriptLabel ?? INLINE_SCRIPT_NAME,
+            args: scriptArgs,
+        });
     } catch (error) {
-        failure = cleanError(error);
+        failure = cleanError(error, scriptLabel ?? INLINE_SCRIPT_NAME);
     }
 
     const writes = collectWrites(env.writes);
@@ -311,6 +396,8 @@ export async function executeRun(rawArgs, exec, config) {
         elapsedMs: Date.now() - started,
     };
     if (typeof args.purpose === 'string' && args.purpose.trim() !== '') result.purpose = args.purpose.trim();
+    // 脚本来自文件时把它报出来：失败时模型才知道该去改哪一份（行号是**那份文件**里的行号）。
+    if (scriptLabel !== undefined) result.scriptFile = scriptLabel;
     if (failure !== undefined) result.error = failure;
 
     // ── 记忆：把这次写出的文件登记进台账，并把热记忆带回反馈 ──────────────
@@ -373,12 +460,10 @@ export async function executeRun(rawArgs, exec, config) {
                             // 投影预算（第四十八轮 P0-2）：0 / 未配置 = 不限
                             budget: config?.memory?.projectionBudgetBytes,
                         });
-                        return {
-                            digest: projected.mode === 'full'
-                                ? projected.text
-                                : '📒 热记忆与最近台账与上次投影相同（要看：office_memory({ action: \'read\' })）。',
-                            digestMode: projected.mode,
-                        };
+                        // 未变化就不带 digest 字段：反馈里不再为「和上次一样」付一行 token。
+                        return projected.mode === 'full'
+                            ? { digest: projected.text, digestMode: projected.mode }
+                            : {};
                     })()
                     : {}),
             };

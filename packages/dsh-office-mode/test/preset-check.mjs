@@ -25,6 +25,15 @@ import {
     renderPersona,
 } from './persona-shape.mjs';
 import { CAPABILITY_MAP_BUDGET_BYTES, CAPABILITY_VARIABLE, renderCapabilityMap } from '../src/capabilities.js';
+import { HOT_MEMORY_MAX_BYTES, HOT_MEMORY_VARIABLE, renderHotProjection } from '../src/memory.js';
+import { OFFICE_DEV_TOOLS } from '../src/preset-guard.js';
+import {
+    PRESET_PLUGINS_PATH,
+    PRESET_RESTORE_PATH,
+    parseProfileOverrides,
+    readPresetPlugins,
+    resolvePresetTargets,
+} from '../src/preset-plugins.js';
 import { NO_SUBAGENTS_HINT } from '../src/search.js';
 import { WEB_FAILURE_KINDS } from '../src/web.js';
 
@@ -58,6 +67,7 @@ const PERSONA_SECTIONS = [
     '算与画',
     '音频与视频',
     '内容',
+    '写作',
     '检索',
     '演示文稿要多走一步',
     '记忆',
@@ -65,7 +75,7 @@ const PERSONA_SECTIONS = [
     '工具',
 ];
 
-/** 「工具」一节的字节上界：一句路由 + 一个变量引用（实测 453 B，留一点余量）。 */
+/** 「工具」一节的字节上界：一句路由 + 一个变量引用（实测 357 B，留一点余量）。 */
 const TOOL_MAP_SECTION_BUDGET_BYTES = 620;
 
 /**
@@ -77,13 +87,53 @@ const TOOL_MAP_SECTION_BUDGET_BYTES = 620;
  *   - 解释器给一个**超长**文件名（地图里会被截到 16 字符，否则最坏情况没有上界）；
  *   - 派工走「没有 subagents」那一支（那句话更长）。
  */
+const WORST_HOT_MEMORY = renderHotProjection(Array.from({ length: 4 }, () => ({
+    target: 'user',
+    importance: 'critical',
+    content: '甲'.repeat(90),
+})));
+
 const WORST_CAPABILITY_MAP = renderCapabilityMap({
     pdf: { render: ['pdftoppm', 'pdftocairo', 'mutool', 'gs'], text: ['pdftotext'] },
     tex: ['latexmk', 'xelatex', 'lualatex'],
     preview: true,
+    convert: { pandoc: true },
     python: 'C:/somewhere/aaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe',
     av: { enabled: true, available: false, ffmpeg: true, ffprobe: true, model: true, vad: false, runtime: true },
 }, { subagents: false });
+
+/**
+ * 守卫清单与 preset 禁用行的对照表（第五十四轮 新-15①）。
+ *
+ * 左边是 preset 里 `disabled: true` 的行 id，右边是那一行关掉的能力在**工具面**上的名字
+ * （**空数组** = 那一行不注册工具：`workflow-ptc` 只是 PTC 运行期的一行，`command-goal`
+ * 注册的是斜杠命令）。两条断言都用它，且都是**双向**的（复核 P2-2 的修法）：
+ *   1. 右边摊平后必须与 `OFFICE_DEV_TOOLS` **互为子集** —— 少一个名字（preset 声明要关
+ *      却没掩）或多一个名字（掩了 preset 没声明要关的能力）都会红；
+ *   2. preset 里**每一条** disabled 行的 id 都必须在这张表里有出处 —— 新增一条禁用行
+ *      而没登记进表，也会红。
+ * 单方向的 `includes` 检查两种反例都放得过去（复核实测：把 `todo_write` 从两处一起删、
+ * 或往清单里塞两个 preset 从没声明过的名字，当时都是全绿）。
+ */
+const GUARD_PRESET_ROWS = [
+    ['tool-bash', ['bash']],
+    ['tool-pwsh', ['pwsh']],
+    ['tool-jobs', ['job_list', 'job_output', 'job_kill']],
+    ['tool-workflow', ['workflow']],
+    ['workflow-ptc', []],
+    ['tool-ralph', ['ralph']],
+    ['tool-subagent', ['subagent']],
+    ['tool-subagent-fork', ['subagent_fork']],
+    ['tool-subagent-control', ['interrupt_agent', 'send_message']],
+    ['tool-subagent-list-agents', ['list_agents']],
+    ['tool-todo', ['todo_write']],
+    ['tool-skill', ['skill']],
+    ['tool-goal', ['create_goal', 'get_goal', 'update_goal']],
+    ['command-goal', []],
+    ['tool-plugin-manager', ['plugin_manager']],
+    ['ui-task-board', ['task_board_list', 'task_board_get', 'task_board_create', 'task_board_update',
+        'task_board_set_parent', 'task_board_run', 'task_board_manage', 'task_board_schedule']],
+];
 
 const here = dirname(fileURLToPath(import.meta.url));
 // 默认检查仓库里的 preset bundle；用 --dir 可以检查别处的副本。
@@ -313,6 +363,11 @@ if (existsSync(compositionPath)) {
                 );
                 const officeRow = rows.find((row) => row?.id === 'persona');
                 record('persona 行存在且 complete', officeRow?.config?.complete === true, '');
+                record(
+                    'persona 行没有 suffix 段（{{cwd}} 从没注册，complete 一改 false 就会让每次装配失败）',
+                    officeRow?.config?.suffix === undefined,
+                    '第六十七轮删掉的死配置：宿主没有注册 cwd，suffix 只在 complete: false 时才渲染',
+                );
                 // 若将来出现「非办公型」的 preset（例如纯检索助手），它不生成文档、也不派活，
                 // 所以「办公约定」「协作约定」这两项对它不适用。按 persona 里认领的
                 // 职责判断，而不是按目录名 —— 目录可以复制改名，职责文本不会。
@@ -388,6 +443,23 @@ if (existsSync(compositionPath)) {
                         'persona 里写了跨来源矛盾的处理纪律',
                         personaPrefix.includes('不一致时两种都写出来') && personaPrefix.includes('不要替用户选一种'),
                         '两个来源说法冲突时要并列写出，不要替用户选一种：这条要在唯一系统提示里，不能只在提纲里',
+                    );
+                    // 第四十八轮之后的 persona 字节已经贴边（预算 16,300 B），所以
+                    // 「写稿先定篇幅」（第六十轮 新-24）**故意只落在 office_help('guide')**：
+                    // 这一条不是「每次请求都必须阻止的失败」，而是动笔前查一次就够的写法约定。
+                    // 这一条与 injection-budget 里那条正向断言是一对：那边查 guide 有，
+                    // 这边查 persona 没有 —— 免得后人「顺手」把它抄进 persona 顶爆预算。
+                    // 前置断言（复核 P3-5）：`personaPrefix` 取不到时是空串，而「不含篇幅」
+                    // 对空串恒真 —— 不拦这一句的话，读不到 persona 也会让这条绿着过去。
+                    record(
+                        '（前置）persona 的 prefix 读得到，非空断言才有意义',
+                        personaPrefix !== '',
+                        '取不到 prefix 时下面那条「不写篇幅」会空过',
+                    );
+                    record(
+                        'persona 不写篇幅约定（新-24 只落 office_help(guide)）',
+                        !personaPrefix.includes('篇幅'),
+                        'persona 字节贴边；写法约定放 office_help(guide)，默认层已给一句话',
                     );
                     // ── 第十八轮 P0-2～P0-6（第三十八轮补进 persona）──────────────────
                     //
@@ -518,7 +590,7 @@ if (existsSync(compositionPath)) {
                         'P2-4：把「哪件事找谁」压成一句；工具的参数与清单由工具面和插件注入承担',
                     );
                     const personaVars = personaVariables(personaPrefix);
-                    const knownVars = ['cwd', CAPABILITY_VARIABLE];
+                    const knownVars = [CAPABILITY_VARIABLE, HOT_MEMORY_VARIABLE];
                     const unknownVars = personaVars.filter((name) => !knownVars.includes(name));
                     record(
                         `persona 引用的变量都是宿主或插件注册过的（${personaVars.join(' / ')}）`,
@@ -533,15 +605,29 @@ if (existsSync(compositionPath)) {
                         'persona 是 complete 段：插件注册的 section 进不来，实际能力只能走 {{变量}} 注入',
                     );
                     record(
+                        `persona 引用了开场记忆变量 {{${HOT_MEMORY_VARIABLE}}}（第七十五轮）`,
+                        personaVars.includes(HOT_MEMORY_VARIABLE),
+                        '新会话要第一轮就看到一部分热记忆，不能等模型调 office_memory',
+                    );
+                    record(
                         `能力地图在最坏情况下不超预算（${bytes(WORST_CAPABILITY_MAP)} / ${CAPABILITY_MAP_BUDGET_BYTES}）`,
                         bytes(WORST_CAPABILITY_MAP) <= CAPABILITY_MAP_BUDGET_BYTES,
                         '地图跟着 persona 进每一次请求：引擎清单封顶，超出就要先减再改预算',
                     );
-                    const renderedPersona = renderPersona(personaPrefix, WORST_CAPABILITY_MAP);
+                    // 第七十七轮：把开场记忆也按最坏情况渲进去。旧断言只换了能力地图，
+                    // {{office_hot_memory}} 仍是 21 B 占位符，于是真实 919 B 的注入
+                    // 完全在预算之外（实测：真实 HOT.md 767 B → 15,358 B；最坏 919 B
+                    // → 15,509 B，只剩 791 B 余量）。
+                    const renderedPersona = renderPersona(personaPrefix, WORST_CAPABILITY_MAP, { hot: WORST_HOT_MEMORY });
                     record(
-                        `渲染后的 persona 在预算内（${bytes(renderedPersona)} / ${PERSONA_BUDGET_BYTES}）`,
+                        `渲染后的 persona 在预算内（含最坏开场记忆 ${bytes(renderedPersona)} / ${PERSONA_BUDGET_BYTES}）`,
                         bytes(renderedPersona) <= PERSONA_BUDGET_BYTES,
-                        '注入文本也算常驻成本：按最坏能力地图钉，别只看 preset 文件里的字节',
+                        '注入文本也算常驻成本：按最坏能力地图 + 最坏开场记忆钉，别只看 preset 文件里的字节',
+                    );
+                    record(
+                        `开场记忆最坏投影不超自身上限（${bytes(WORST_HOT_MEMORY)} / ${HOT_MEMORY_MAX_BYTES} B）`,
+                        bytes(WORST_HOT_MEMORY) <= HOT_MEMORY_MAX_BYTES,
+                        '4 条 critical、每条 70 个中文字符是渲染器的上界；超了说明截断或条数上限被放宽',
                     );
                 }
                 record('没有误关 present', !rows.some((row) => row?.id === 'present' && row?.disabled === true), '');
@@ -633,6 +719,42 @@ if (existsSync(compositionPath)) {
                     );
                 }
 
+                // 工具面守卫的清单与 preset 的禁用行不许脱节（第五十四轮 新-15①）。
+                //
+                // `src/preset-guard.js` 的 `OFFICE_DEV_TOOLS` 是「打开守卫时要在办公会话里
+                // 真正掩掉的那批宿主工具」，它存在的理由是 preset 里那些 `disabled: true`
+                // 行**运行期不生效**（第五十轮实测：profile 层行对所有 preset 可见）。
+                // 三条断言，**全是双向的**（复核 P2-2）：
+                //   ① 对照表摊平的名字与 OFFICE_DEV_TOOLS 互为子集（少一个 = preset 声明要关
+                //      却没掩；多一个 = 掩了 preset 没声明要关的能力）；
+                //   ② preset 里每条 disabled 行 id 都要在对照表里有出处（新增禁用行没登记会红）；
+                //   ③ 对照表里的行 id 都要真的在 preset 里 disabled（改了行的生效状态会红）。
+                const guardTools = GUARD_PRESET_ROWS.flatMap(([, names]) => names);
+                const missingInList = guardTools.filter((name) => !OFFICE_DEV_TOOLS.includes(name));
+                const extraInList = OFFICE_DEV_TOOLS.filter((name) => !guardTools.includes(name));
+                record(
+                    '守卫清单与 preset 对照表互为子集（新-15①）',
+                    missingInList.length === 0 && extraInList.length === 0,
+                    missingInList.length > 0
+                        ? `preset 声明要关、却没进掩码清单：${missingInList.join('、')}`
+                        : extraInList.length > 0 ? `掩码清单里有 preset 没声明要关的能力：${extraInList.join('、')}` : '',
+                );
+                const disabledIds = rows.filter((row) => row?.disabled === true && typeof row?.id === 'string').map((row) => row.id);
+                const unregistered = disabledIds.filter((id) => !GUARD_PRESET_ROWS.some(([rowId]) => rowId === id));
+                record(
+                    'preset 里每一条禁用行都在守卫对照表里有出处',
+                    unregistered.length === 0,
+                    unregistered.length === 0 ? `核对 ${disabledIds.length} 条` : `没登记的禁用行：${unregistered.join('、')}`,
+                );
+                const guardRowsMissing = GUARD_PRESET_ROWS
+                    .filter(([id]) => !rows.some((row) => row?.id === id && row?.disabled === true))
+                    .map(([id]) => id);
+                record(
+                    'preset 里仍然写着守卫清单对应的禁用行（行 id 一条不许少）',
+                    guardRowsMissing.length === 0,
+                    guardRowsMissing.length === 0 ? '' : `preset 里找不到这些禁用行：${guardRowsMissing.join('、')}`,
+                );
+
                 // Agent Teams 是「按 profile 实际写法」核对的一项，不是「关掉即可」的一项。
                 // 2026-09-22 先把它关掉、随后按用户要求补回：真正的坑是两头都不报错——
                 //   1) 写 disabled 行的 id 拼错 → 静默失效，工具照旧在；
@@ -676,6 +798,57 @@ if (existsSync(compositionPath)) {
             }
         }
     }
+}
+
+// ── 「办公模式插件」那一格与它的两处文件（第六十三轮 新-21） ──────────────
+//
+// 这一格是**唯一**会改 preset 文件的入口（GET/POST `/office-preset/plugins`，见
+// src/preset-plugins.js）。两条最容易静默漂掉的接缝在这里做**两向**核对：
+//   ① 界面列出的行集合 = preset 真源里的插件行集合（同序同 id）——
+//      右边那份用**独立扫法**（缩进正好 10 空格的 `- id:` 行）算出来，不借路由的解析器；
+//   ② 界面那一格里的两条路径字面量 = 服务端导出的常量（两侧各写一遍，最容易改一处忘一处）。
+{
+    const targets = resolvePresetTargets({});
+    record(
+        '预设位置可发现（profile 的 link: 指回本仓的 preset bundle）',
+        targets.ok === true,
+        targets.ok === true ? targets.presetPatch : targets.error,
+    );
+    if (targets.ok === true) {
+        const listed = readPresetPlugins(targets);
+        const scanned = readFileSync(targets.presetPatch, 'utf8').split('\n')
+            .map((line) => /^ {10}-\s+id:\s*(\S+)\s*$/.exec(line))
+            .filter((match) => match !== null)
+            .map((match) => match[1]);
+        const listedIds = listed.ok === true ? listed.rows.map((row) => row.id) : [];
+        record(
+            '设置页列出的插件行 = preset 真源里的插件行（同序同 id）',
+            listed.ok === true && JSON.stringify(listedIds) === JSON.stringify(scanned),
+            `列出 ${listedIds.length} 行 / 独立扫出 ${scanned.length} 行`,
+        );
+        const profileText = targets.profilePatch === null ? '' : readFileSync(targets.profilePatch, 'utf8');
+        const overridden = new Set(parseProfileOverrides(profileText).filter((item) => !item.insert).map((item) => item.id));
+        const mismatched = listed.ok === true
+            ? listed.rows.filter((row) => row.profileOverridden !== overridden.has(row.id)).map((row) => row.id)
+            : ['（列表读不出来）'];
+        record(
+            '「profile 侧有覆盖行」的标注与 profile 补丁逐行一致',
+            mismatched.length === 0,
+            mismatched.join('、'),
+        );
+    }
+    const clientSource = readFileSync(resolve(here, '..', 'lib', 'client.js'), 'utf8');
+    record(
+        '界面那一格的两条端点常量 = 服务端导出的路径',
+        clientSource.includes(`const PRESET_PLUGINS_PATH = "${PRESET_PLUGINS_PATH}"`)
+        && clientSource.includes(`const PRESET_RESTORE_PATH = "${PRESET_RESTORE_PATH}"`),
+        `${PRESET_PLUGINS_PATH} / ${PRESET_RESTORE_PATH}`,
+    );
+    record(
+        '设置页有「办公模式插件」这一组（分组 id = plugins，排在第一位）',
+        clientSource.includes('key: "plugins", id: "plugins"') && clientSource.includes('"办公模式插件"'),
+        '',
+    );
 }
 
 const failed = results.filter((item) => !item.ok);

@@ -13,6 +13,7 @@
  */
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { auditCitations, renderCitationAudit, urlsInText } from './citation.js';
 import { parseFindings, renderFindings } from './findings.js';
 import { hintOnce, sessionIdOf } from './projection.js';
 import { buildBrief, CONTENT_TYPES, contentType, guessContentType, materializeQueries, PLATFORM_SITE_HINTS } from './search-routes.js';
@@ -109,7 +110,7 @@ export async function writeBrief(root, topic, typeId, audience, briefText, outpu
     const slug = String(topic).trim().replace(/[\\/:*?"<>|\s]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'search';
     const target = resolve(root, (asText(outputDir) || DEFAULT_SEARCH_DIR) + '/' + slug + '/brief.md');
     await mkdir(dirname(target), { recursive: true });
-    const header = ['<!-- office_search_brief：本文件由 dsh-office-mode 生成，供子代理读取 -->', '', '# 检索提纲', '', ''];
+    const header = ['<!-- office_search_dispatch：本文件由 dsh-office-mode 生成，供子代理读取 -->', '', '# 检索提纲', '', ''];
     await writeFile(target, header.join('\n') + brief + '\n', 'utf8');
     return target;
 }
@@ -344,7 +345,7 @@ export function resetToolGapMemo() {
  * 2026-09-23 那一轮模型自己就是这么救回来的（开发期的专题笔记里有复现记录）。
  */
 export const NO_SUBAGENTS_HINT = '当前组合里没有 subagents 服务，检索派工起不了子代理。'
-    + 'office_search_brief 出的提纲仍然能用，两条替代路径：'
+    + '落盘的提纲（brief.md）仍然能用，两条替代路径：'
     + '① 降级到 Agent Teams：按提纲里的渠道逐个 spawn_teammate（一个渠道一个成员），'
     + '任务书写清「负责哪个渠道、材料写进哪个结果文件、每条结论必须带来源 URL」，'
     + '成员写完再用 office_parse_findings 读回摘要；'
@@ -428,7 +429,7 @@ export function channelQueries(channel, topic) {
  * @returns {{ok: boolean, engine: string, sources: number, queries: number, path: string}}
  */
 export async function runChannelBuiltin(channel, topic, job, access, config, signal) {
-    const settings = config?.search?.builtin ?? {};
+    const settings = config?.search?.fetch ?? {};
     const maxResults = Number.isFinite(settings.maxResults) ? settings.maxResults : 8;
     const fetchPages = Number.isFinite(settings.fetchPages) ? settings.fetchPages : 2;
     const queries = channelQueries(channel, topic);
@@ -673,18 +674,38 @@ export async function dispatchSearch(rawArgs, exec, config, ctx) {
     const signal = exec?.signal ?? new AbortController().signal;
     const args = rawArgs !== null && typeof rawArgs === 'object' ? rawArgs : {};
 
-    const briefPath = resolveInWorkspace(root, args.briefPath);
+    // 提纲的两条来路（第七十轮把 office_search_brief 并进了这里）：
+    //   · topic —— 现场按分流定表生成一份并落盘（brief.md 照旧可审计、可复用）；
+    //   · briefPath —— 复用已有提纲（上一轮落盘的，或人工改过渠道清单的）。
+    let briefPath;
     let briefText;
-    try {
-        briefText = await readFile(briefPath, 'utf8');
-    } catch (error) {
-        const shownBrief = displayPath(root, briefPath);
+    let briefWritten = false;
+    const askedBrief = typeof args.briefPath === 'string' ? args.briefPath.trim() : '';
+    if (askedBrief !== '') {
+        briefPath = resolveInWorkspace(root, askedBrief);
+        try {
+            briefText = await readFile(briefPath, 'utf8');
+        } catch (error) {
+            const shownBrief = displayPath(root, briefPath);
+            throw new Error(stepError({
+                step: 'office_search_dispatch 读提纲',
+                what: '读不到提纲文件 ' + shownBrief + '：' + (error?.message ?? error),
+                next: '相对会话工作目录解析；要换主题重查就直接给 topic，它会自动出一份新提纲',
+                shape: 'office_search_dispatch({ topic: "要查的主题" })  //  复用已有提纲则 { briefPath: "<路径>", outputPaths: [...] }',
+            }));
+        }
+    } else if (typeof args.topic === 'string' && args.topic.trim() !== '') {
+        const typeId = typeof args.type === 'string' && args.type.trim() !== '' ? args.type : undefined;
+        const built = buildBrief(args.topic, typeId, { audience: args.audience });
+        briefPath = await writeBrief(root, built.topic, built.type.id, args.audience, built.text, config?.search?.outputDir);
+        briefText = built.text;
+        briefWritten = true;
+    } else {
         throw new Error(stepError({
-            step: 'office_search_dispatch 读提纲',
-            what: '读不到提纲文件 ' + shownBrief + '：' + (error?.message ?? error),
-            next: '先 office_search_brief({ topic }) 出提纲，再用它返回的 briefPath 原样传过来（相对会话工作目录解析）',
-            shape: 'office_search_brief({ topic: "要查的主题" })  →  '
-                + 'office_search_dispatch({ briefPath: "<它返回的 briefPath>", outputPaths: ["<结果文件 1>", "…"] })',
+            step: 'office_search_dispatch 收参数',
+            what: '缺提纲来源：要么给 topic（自动出提纲并落盘再执行），要么给 briefPath（复用已有提纲重跑）',
+            next: '常规用法只给 topic 一项就够；briefPath 用于上一轮出过提纲、想改渠道或重跑时',
+            shape: 'office_search_dispatch({ topic: "某地化工厂爆炸" })',
         }));
     }
 
@@ -694,19 +715,15 @@ export async function dispatchSearch(rawArgs, exec, config, ctx) {
     const type = contentType(typeId.trim()) ?? guessContentType(topic);
     const shownBrief = displayPath(root, briefPath);
 
-    const outputs = Array.isArray(args.outputPaths) ? args.outputPaths.filter((p) => String(p ?? '').trim() !== '') : [];
+    // 结果文件清单：outputPaths 优先（files 是 brief 时代的老参数名，兼容），
+    // 都不给就按渠道数自动生成 —— 只带 topic 的一次调用也能整链跑完。
+    const rawOutputs = Array.isArray(args.outputPaths) ? args.outputPaths : (Array.isArray(args.files) ? args.files : []);
+    const outputs = rawOutputs.filter((p) => String(p ?? '').trim() !== '');
     if (outputs.length === 0) {
-        throw new Error(stepError({
-            step: 'office_search_dispatch 收参数',
-            what: 'outputPaths 不能为空：它是「每个渠道一个结果文件」的那份路径清单',
-            next: '先 office_search_brief 出提纲，把它反馈里「建议的结果文件」原样传过来（个数见 brief.md 末尾那行「渠道数」）',
-            shape: 'office_search_dispatch({ briefPath: "' + shownBrief + '", '
-                + 'outputPaths: [".office/search/<主题>/01-channel.md", "…"] })',
-        }));
-    }
-    if (outputs.length !== type.channels.length) {
+        outputs.push(...defaultOutputPaths(topic, type.channels.length, config?.search?.outputDir));
+    } else if (outputs.length !== type.channels.length) {
         // 差异是算出来的：个数、渠道名、以及**正好这么多条**的建议路径 —— 照抄即可。
-        const suggested = defaultOutputPaths(topic, type.channels.length);
+        const suggested = defaultOutputPaths(topic, type.channels.length, config?.search?.outputDir);
         throw new Error(stepError({
             step: 'office_search_dispatch 收参数',
             what: 'outputPaths 有 ' + outputs.length + ' 个，但提纲「' + type.name + '」有 '
@@ -865,6 +882,9 @@ export async function dispatchSearch(rawArgs, exec, config, ctx) {
         emptyChannels: emptyCount,
         missingFiles: missingCount,
         topic,
+        // 提纲的落点（topic 直入时刚写的），renderDispatch 拿它告诉模型文件在哪。
+        brief: shownBrief,
+        briefWritten,
         // 装配期就已知的工具缺口（子代理那条路为什么没走），由 renderDispatch 统一说一次。
         toolGap: Array.isArray(toolGap) && toolGap.length > 0 ? toolGap : undefined,
         // 会话身份给 renderDispatch 判「长指引说过没有」（见 projection.js）。
@@ -900,6 +920,11 @@ export function renderDispatch(value) {
         + (emptyCount > 0 ? '，其中 ' + emptyCount + ' 个空手而归（文件里没有来源 URL）' : '')
         + (missingCount > 0 ? '，' + missingCount + ' 个没写出结果文件' : '')
         + '（' + value.topic + '）'];
+
+    // topic 直入时提纲是这一轮刚写的：报出落点，模型才知道去哪改渠道、下一轮怎么复用。
+    if (value.briefWritten) {
+        lines.push('提纲已写入：' + value.brief + '（渠道清单与固定要求都在文件里；要改渠道重跑就传 briefPath）');
+    }
 
     // 组合里缺检索工具：**只说一次**。在此之前这串 tools.restrict() 原文会贴在每一个
     // 渠道行上（7 个渠道 7 遍），而它其实是装配期就确定的事实、不是失败 —— 而且那串
@@ -1050,11 +1075,98 @@ export async function parseResultFiles(rawArgs, exec, resultLimit) {
         if (source !== undefined && source.file !== undefined) finding.file = source.file;
     }
 
+    // 引用审计（第五十七轮 19-8 的 P2-9）：给了 `draft` 就把**已落盘的产物正文**拿
+    // 来逐句对账。材料是刚落盘的这几份结果文件，所以「正文里的地址对不对得上材料」
+    // 是硬判据，不是估分。审计的边界（correctness 算不出、只认能对账的引用）写在
+    // src/citation.js 的文件头，回执里也照实带一句口径。
+    //
+    // draft 的参数形状**不许静默丢弃**（与 since / tags 同一条纪律）：给了非字符串、
+    // 或给了一个收敛为空的串，都要当场拒绝 —— 静默当「没给」会让调用方以为审过了。
+    if (args.draft !== undefined && args.draft !== null && typeof args.draft !== 'string') {
+        throw new Error(stepError({
+            step: 'office_parse_findings 收参数',
+            what: `draft 需要一个字符串（产物正文的路径），收到的是 ${Array.isArray(args.draft) ? 'array' : typeof args.draft}`,
+            next: '把它写成相对工作目录的路径，或直接省略这个参数（省略 = 不做引用审计）',
+            shape: 'office_parse_findings({ paths: [...], draft: "docs/正文.md" })',
+        }));
+    }
+    const draft = typeof args.draft === 'string' ? args.draft.trim() : '';
+    if (typeof args.draft === 'string' && draft === '') {
+        throw new Error(stepError({
+            step: 'office_parse_findings 收参数',
+            what: 'draft 给了却是空的（收敛之后没有字符）—— 空路径没法当正文读',
+            next: '要么写清产物正文的路径，要么把这个参数整个去掉（去掉 = 不做引用审计）',
+            shape: 'office_parse_findings({ paths: [...], draft: "docs/正文.md" })',
+        }));
+    }
+    let text = renderFindings(combined);
+    let audit = null;
+    if (draft !== '') {
+        const absolute = resolveInWorkspace(root, draft);
+        const shown = displayPath(root, absolute);
+        if (/\.(?:docx|xlsx|pptx|doc|xls|ppt|pdf|odt|ods|odp)$/i.test(shown)) {
+            throw new Error(stepError({
+                step: 'office_parse_findings 读 draft',
+                what: `draft 收到的是 Office / PDF / ODF 文件（${shown}）—— 本插件的 read() 只给结构与统计，读不到这些容器里的正文`,
+                next: '三条路任选：① 把写文档用的那份 Markdown / 文本源传进来（office.files.write 落盘的那一份）；'
+                    + '② office.convert.file({ path, to:"md" }) 先把它转成 Markdown 再传（docx / odt 走 pandoc）；'
+                    + '③ PDF 先 office.pdf.text({ path, out }) 抽成文本再传',
+                shape: 'office_parse_findings({ paths: [...], draft: "docs/正文.md" })',
+            }));
+        }
+        let draftText;
+        try {
+            draftText = await readFile(absolute, 'utf8');
+        } catch (error) {
+            throw new Error(stepError({
+                step: 'office_parse_findings 读 draft',
+                what: `产物正文读不到（${shown}）：${String((error && error.message) || error)}`,
+                next: '先确认文件真的落盘了，再把它相对工作目录的路径传过来',
+                shape: 'office_parse_findings({ paths: [...], draft: "docs/正文.md" })',
+            }));
+        }
+        // 编码哨兵：扩展名是文本、内容却不是 UTF-8（GBK 稿子、或被改名成 .txt 的二进制）
+        // 读进来是一片乱码 —— 那时判不出事实句，审计会报成「通过」，比报错更糟。
+        if (draftText.includes('\u0000')) {
+            throw new Error(stepError({
+                step: 'office_parse_findings 读 draft',
+                what: `产物正文不是 UTF-8 文本（${shown} 里读到了空字节，多半是二进制文件改了扩展名）`,
+                next: '把 Markdown / 纯文本那一份传进来；二进制或 Office 文档先按上一条的三个办法转成文本',
+                shape: 'office_parse_findings({ paths: [...], draft: "docs/正文.md" })',
+            }));
+        }
+        // 对账用的地址集合 = **材料里出现过的全部地址**：既包括解析出来的结论行
+        // （`- 结论 (URL)`），也包括结果文件正文里任何地方写下的地址。取超集只会
+        // 少报假红 —— 材料写在散文行、表格行里是子代理的常见写法，只认列表项会把
+        // 「正文引了材料里真有的地址」判成「编的」（独立复核 P2）。
+        const materialUrls = [...new Set([
+            ...allFindings.flatMap((finding) => finding.urls ?? []),
+            ...read.flatMap((item) => urlsInText(item.text)),
+        ])];
+        audit = auditCitations({ text: draftText, materialUrls, label: shown });
+        if (missing.length > 0) {
+            audit.notes.unshift(`${missing.length} 份结果文件没读到（${missing.join('；')}），`
+                + '它们的地址不在本次对账集合里 —— 先确认路径，再重跑这一步。');
+        }
+        text = `${text}\n\n${renderCitationAudit(audit)}`;
+        // 「没判出可核的东西」与「真的过了」必须分开说（独立复核 P2）：notes 里写着
+        // 「这不是引用都齐了」，末尾却印「通过」，模型最认的就是最后一行。
+        text += audit.verdict === 'pass'
+            ? '\n（引用审计通过：正文里的事实句都有出处，写下的地址都能在本次材料里逐字对上。）'
+            : audit.verdict === 'empty'
+                ? '\n（引用审计**没判出可核的东西**：没有可判的事实句、或正文里没有地址 —— '
+                    + '这不是「引用都齐了」，先按上面的口径确认正文是不是真的在讲外部事实。）'
+                : '\n（引用审计**未过**：先照上面点名的句子与地址改正文，改完再跑一次这一步 —— '
+                    + '没通过的正文不要当成定稿交出去。）';
+    }
+
     return {
-        ok: true,
+        // `empty` 不算失败（它照实说「没验证到什么」），只有 `fix` 才是断言没过。
+        ok: audit === null || audit.verdict !== 'fix',
         files: read.map((item) => item.path),
         missing,
         result: combined,
-        text: renderFindings(combined),
+        audit,
+        text,
     };
 }

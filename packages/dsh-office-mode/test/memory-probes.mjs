@@ -30,7 +30,7 @@ import assert from 'node:assert/strict';
 import { kbRankChunks, kbTerms, kbTokens } from '../src/kb.js';
 import { createMemory, memoryPaths } from '../src/memory.js';
 
-const TMP = fileURLToPath(new URL('../../../.office/tmp/memory-probes/', import.meta.url));
+const TMP = fileURLToPath(new URL('../../../.office/runtime/tmp/memory-probes/', import.meta.url));
 
 const results = [];
 async function check(name, fn) {
@@ -246,8 +246,9 @@ await check('B3 增益：同族两版并存时最新版在前（24-4 落地后�
     let stale = 0;
     for (const family of families) {
         const r = await memory.read({ layer: 'hot', query: family.query });
-        // 只看同族这两条：热记忆的读取**不分查询排序**，整层按「重要度 → updatedAt 升序」
-        // 给出来（`read` 的 hot 分支），所以整层的第一条是全局最旧的，拿它当度量是错的。
+        // 只看同族这两条：热记忆的读取**不按查询重排**（query 只做过滤，见第五十四轮复核 P1-4
+        // 把「命中强度当主键」改回来的那段注释），整层按「重要度 → 最近写入在前」（`read` 的
+        // hot 分支），所以同族那两条不一定排在最前面 —— 拿 items[0] 当度量是错的。
         const items = r.hot.items.filter((item) => item.id === family.oldId || item.id === family.newId);
         assert.equal(items.length, 2, `两版都应在结果里（${family.name} 只有 ${items.length} 条）`);
         if (items[0].id === family.newId) engine += 1;
@@ -414,7 +415,8 @@ async function seedKb(root, memory) {
     for (const [path, text] of KB_DOCS) {
         const absolute = join(root, ...path.split('/'));
         await mkdir(dirname(absolute), { recursive: true });
-        await writeFile(absolute, text, 'utf8');
+        // 入库评估闸（P1-4b）：`tier:'verified'` 的文档要自带 ≥2 个独立来源。
+        await writeFile(absolute, `${text}\n\n来源：https://news-a.example.com/report、https://news-b.example.org/report\n`, 'utf8');
         await memory.kbIngest({ path, tier: 'verified' });
     }
 }

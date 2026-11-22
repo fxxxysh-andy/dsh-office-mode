@@ -24,7 +24,8 @@
  *   - **多根**：`scope` 决定记忆落在工作区、全局还是两者（跨项目层）；`userScope`
  *     让 USER 侧偏好单独常驻全局，换工作目录不必重记。
  *   - **层拓扑开关**：热记忆 / 台账 / 归档每层可单独关掉，关掉不删数据。
- *   - **图关系**：`links.jsonl` 存双向类型化关系（link / related / 实体视图）。
+ *   - **图关系（第九十一轮已下线）**：`links.jsonl` 只作历史数据兼容保留，
+ *     不再有工具入口与界面；导入 / 导出 / 墓碑维护仍会带上它。
  *     归档时**保留条目 id**，否则下沉之后关系就断了 —— 这是本轮修掉的一个隐患。
  *   - **召回质量**：strict-v1 按「命中词占比」把结果分成高 / 中 / 未知三档，
  *     低于下限的丢掉，中与未知各给一个名额上限。
@@ -40,11 +41,19 @@
  * @module dsh-office-mode/memory
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, statSync } from 'node:fs';
-import { mkdir, readFile, rename, readdir, rm, stat, writeFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
-import { basename, dirname, isAbsolute, join, posix, relative, sep } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { mkdir, mkdtemp, readFile, rename, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
+import { basename, dirname, extname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 
+import { createGallery, createPillowThumbnailer, galleryRootDir } from './gallery.js';
+import { pdfSplit } from './pdf.js';
+import { extractKbSource, isExtractableKbPath, KB_EXTRACT_MAX_BYTES } from './kb-extract.js';
+import { openKbDb } from './kb-db.js';
+import { OCR_SUPPORTED_EXTENSIONS } from './ocr.js';
+import { canUseRemoteEmbedding, embedTexts, embeddingRouteOf } from './kb-embed.js';
+import { ensureLocalEmbedding, localEmbeddingStatus, LOCAL_EMBEDDING_MODEL, normalizeLocalEmbeddingConfig } from './kb-local-embed.js';
+import { canUseSelector, normalizeSelectorConfig, selectWithLlm } from './kb-selector.js';
 import {
     KB_HIT_PREVIEW,
     KB_LIST_LIMIT,
@@ -58,24 +67,52 @@ import {
     chunkCharsFor,
     chunkHeaderOf,
     chunkIdOf,
+    chunkOverlapFor,
     chunkRelOf,
     chunkSelfConsistent,
     docIdOf,
     kbCountsOf,
+    kbFolderInScope,
+    kbFolderTree,
     kbHash,
     kbLiveIdsOf,
+    kbPathsAt,
     kbPathsFor,
     kbRankChunks,
     kbTierOf,
     kbTerms,
     normalizeKbChunk,
+    normalizeKbFolder,
     normalizeManifestRow,
+    overlapChunks,
     scoreText,
     splitDocument,
     spanText,
     strictTierOf,
     strictestTier,
 } from './kb.js';
+import { createKbFolder, mergeKbFolders, readKbFolders } from './kb-folders.js';
+import {
+    createHostGenerator,
+    createOpenAiGenerator,
+    dropKbLlmJob,
+    estimateKbLlmJob,
+    kbLlmJobKeyOf,
+    kbLlmProfile,
+    kbLlmReady,
+    mapSummariesToChunks,
+    normalizeKbLlmConfig,
+    readKbLlmJob,
+    runKbLlmJob,
+    writeKbLlmJob,
+} from './kb-llm.js';
+import {
+    archiveDocHash,
+    globalNamespaceMarkerPath,
+    inspectArchiveScope,
+    kbArchiveFolder,
+    withArchiveScope,
+} from './memory-archive-scope.js';
 
 /** 存储格式版本；将来改结构时用它做迁移判断。 */
 export const MEMORY_VERSION = 1;
@@ -122,14 +159,16 @@ export const ARCHIVE_POINTER_ID = 'pointer:archive';
 export const MEMORY_TARGETS = ['user', 'project'];
 /**
  * office_memory 认识的全部动作（供文档与设置页列清单；实际校验在各自的分支里）。
- * read 只读；add/replace/remove 改热记忆；log 登记台账；link/unlink/related/entities
- * 管图关系与实体；status 给汇总；export/import 是备份与迁移；migrate 从 mnemon 搬；
- * kb-ingest / kb-search / kb-list / kb-read / kb-drop 是知识库（第四棵树，检索是词法的）。
+ * read 只读；recall 是**统一入口**（先查记忆层，门控判不够答再下探 kb，第五十七轮
+ * P2-8）；add/replace/remove 改热记忆；log 登记台账；status 给汇总；export/import
+ * 是备份与迁移；migrate 从 mnemon 搬；
+ * kb-ingest / kb-search / kb-list / kb-tree / kb-read / kb-drop 是知识库（第四棵树，检索是词法的）。
  */
 export const MEMORY_ACTIONS = [
-    'read', 'add', 'replace', 'remove', 'log', 'status', 'sunk', 'link', 'unlink', 'related', 'entities',
-    'kb-ingest', 'kb-search', 'kb-list', 'kb-read', 'kb-drop',
-    'export', 'import', 'migrate',
+    'read', 'recall', 'add', 'replace', 'remove', 'log', 'status', 'sunk',
+    'kb-ingest', 'kb-search', 'kb-list', 'kb-tree', 'kb-read', 'kb-drop',
+    'kb-update', 'kb-edit', 'kb-link', 'kb-related', 'kb-summarize', 'kb-summaries',
+    'gallery', 'export', 'import', 'migrate',
 ];
 /** 重要度：critical 优先保留，low 最先被下沉。 */
 export const MEMORY_IMPORTANCE = ['critical', 'normal', 'low'];
@@ -158,7 +197,7 @@ export const DEFAULT_RECALL_QUALITY = {
     lowScoreThreshold: 0.25,
     highScoreThreshold: 0.6,
     // 下面三个名额上限在第二十四轮放宽（3/4/2 → 5/6/4）。理由是实证的：**上限由召回决定、
-    // 不由排序决定** —— RMM 的 Oracle 检索上限 Acc 90.2 而实际 70.4，加 reranker 只给
+    // 不由排序决定** —— RMM 的 Oracle 检索上限 Acc 90.2 而实际 70.4，加一层重排序只给
     // +1.4 Recall@5，把 Top-M 从 5 放到 10 却给 +4.6；RAGChecker 里换检索器只值 +2.4 F1，
     // 而把名额 k 从 5 放宽到 20 值 +1.7 F1。所以「低分档直接丢弃」比「排序不精」更伤。
     // 放宽只影响候选与采纳的条数，真正的字符开销仍由 READ_LIMITS 的额度封住。
@@ -172,7 +211,7 @@ export const DEFAULT_RECALL_QUALITY = {
  *   recallPerTurn       一个回合里第一次带 query 的记忆检索
  *   recallRefinePerTurn 同一回合里后续的换词细化（mnemon 是「一次初查 + 一次细化」）
  *   kbSearchPerTurn     一个回合里的 kb（来源原文）检索次数
- *   relatedPerTurn      一个回合里的图关系遍历
+ *   relatedPerTurn      一个回合里的知识库块关系遍历（kb-related）
  * 0 = 该类不限制。
  *
  * kb 检索单独给一类（第二十四轮 24-11）：它与记忆检索的语料与代价都不同 ——
@@ -239,7 +278,7 @@ export const READ_LIMITS = {
      * 一层，一层就能把 4,000 字吃干净 —— 台账与归档随后拿到的剩余额度是 0，`admit()` 直接
      * `break`，于是**恒定返回 0 条**（哪怕命中 20/54 条），而渲染还把它印成「（空）」。
      * 台账与归档正是带 query 的检索层，「找上次那份东西」因此在默认调用上完全失效。
-     * （第二十四轮实测：`.office/tmp/memory-r24/probe-budget.mjs`。）
+     * （第二十四轮实测：`.office/runtime/tmp/memory-r24/probe-budget.mjs`。）
      *
      * 改成每层一份有界额度后：① 任何一层都不会被别人饿死；② 总量仍有上界（三层额度之和），
      * 不会变成无界注入；③ 单层读取（`layer:'hot'` 等）仍独占 `totalChars`。
@@ -261,8 +300,6 @@ export const MEMORY_PROMPT_HINT = `工作目录里有一份三层办公记忆（
 热记忆记用户偏好与项目约定，台账记这个目录里产出过的交付物，归档是下沉的旧条目。
 动手前用 office_memory({ action: 'read' }) 看一眼；用户纠正你、说明偏好或要求
 「记住」时，用 office_memory({ action: 'add', target: 'user' | 'project', content }) 记一条。
-条目之间可以建关系：office_memory({ action: 'link', sourceId, targetId, kind })，
-沿关系找相邻条目用 action:'related'，看实体用 action:'entities'。
 office_run 写出的文档会自动登记进台账，不用手工补。`;
 
 function asText(value) {
@@ -298,6 +335,13 @@ function oneOf(value, allowed, fallback) {
 
 function boundedInt(value, fallback, min, max) {
     const n = typeof value === 'number' ? Math.trunc(value) : Number.parseInt(String(value), 10);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(max, Math.max(min, n));
+}
+
+/** 浮点参数收敛（权重这类 0–1 的值）：NaN / 非数字落回默认。 */
+function boundedNumber(value, fallback, min, max) {
+    const n = typeof value === 'number' ? value : Number.parseFloat(String(value));
     if (!Number.isFinite(n)) return fallback;
     return Math.min(max, Math.max(min, n));
 }
@@ -339,10 +383,20 @@ function pathsForDir(dir) {
  * 解析记忆目录。目录可以给相对路径（相对会话工作目录）或绝对路径。
  * @returns {{dir: string, memory: string, ledger: string, archive: string, user: string, project: string, index: string, links: string, tombstones: string}}
  */
-export function memoryPaths(root, memoryConfig = {}) {
+export function memoryPaths(root, memoryConfig = {}, options = {}) {
     const configured = asText(memoryConfig.dir) || DEFAULT_MEMORY_DIR;
     const dir = isAbsolute(configured) ? configured : join(root, configured);
-    return pathsForDir(dir);
+    const paths = pathsForDir(dir);
+    // 归档落点按**真实工作区**判定：默认目录在工作区内时沿用原路径；配到工作区外
+    // 或与全局层重合时，新写落到 archive/workspaces/<workspaceKey>，旧档只读保留。
+    const scope = inspectArchiveScope({
+        root,
+        memory: memoryConfig,
+        store: 'workspace',
+        memoryDir: dir,
+        globalDir: asText(options.globalDir),
+    });
+    return withArchiveScope(paths, scope);
 }
 
 /**
@@ -374,9 +428,39 @@ export function globalMemoryDir(memoryConfig = {}) {
     return current;
 }
 
-/** 全局层的文件位置。 */
-export function globalMemoryPaths(memoryConfig = {}) {
-    return pathsForDir(globalMemoryDir(memoryConfig));
+/**
+ * 知识库的**唯一根目录**（第八十八轮：不再分全局库 / 工作区库）。
+ *
+ * 知识库在这台机器上只有一个：它装的是外部原文与抽出来的块，不属于某个项目，
+ * 也不该因为换工作目录就变成另一座库。默认落在全局记忆目录的兄弟 `.office/kb`；
+ * 配了 `memory.kbDir` 就按配置走（相对路径按用户主目录解析 —— 数据目录跟着
+ * 工作目录搬家，等于把库藏进某个项目里）。
+ */
+export function kbRootDir(memoryConfig = {}) {
+    const configured = asText(memoryConfig.kbDir);
+    if (configured !== '') return isAbsolute(configured) ? configured : join(homedir(), configured);
+    return join(dirname(globalMemoryDir(memoryConfig)), 'kb');
+}
+
+/**
+ * 全局层的文件位置。
+ *
+ * 知识库是单库（第八十八轮）：`paths.kb` 在任何记忆根上都指向同一个
+ * `kbRootDir()`。热记忆 / 台账 / 归档仍是 global 与 workspace 两层，知识库不再分。
+ */
+export function globalMemoryPaths(memoryConfig = {}, options = {}) {
+    const paths = pathsForDir(globalMemoryDir(memoryConfig));
+    paths.kb = kbPathsAt(kbRootDir(memoryConfig));
+    // 全局落点必须与「这次从哪个工作区调用」无关：候选碰撞来自配置里的
+    // memory.dir（绝对路径时）以及调用方显式给的 archive 目录；一旦
+    // archive/global/scope.json 存在，就固定沿用 archive/global。
+    const scope = inspectArchiveScope({
+        memory: memoryConfig,
+        store: 'global',
+        memoryDir: paths.dir,
+        otherArchiveDirs: Array.isArray(options.otherArchiveDirs) ? options.otherArchiveDirs : [],
+    });
+    return withArchiveScope(paths, scope);
 }
 
 /** 把绝对路径渲染成相对会话工作目录的写法（给出目录外路径时原样返回）。 */
@@ -758,6 +842,24 @@ function kbTitleOf(text, relPath) {
     return basename(relPath) || relPath;
 }
 
+/**
+ * OCR 旁挂笔记的旧路径（第 91–100 轮）：`upload-XXXX.ocr.md` 曾是 OCR 正文的落点。
+ * 第 101 轮起正文写回源文件文档，这条路径只用来**找出要一并收掉的旧笔记**。
+ * 隐藏文件（`.foo`）与本来就是 `.ocr.md` 的路径不产生第二个名字 —— 否则同一份
+ * 笔记会在「收旧笔记」时被当成另一份文档再算一遍。
+ */
+function legacyOcrNoteOf(displayPath) {
+    const normalized = String(displayPath ?? '').replace(/\\/g, '/');
+    const at = normalized.lastIndexOf('/');
+    const dir = at === -1 ? '' : normalized.slice(0, at + 1);
+    const base = at === -1 ? normalized : normalized.slice(at + 1);
+    if (base.endsWith('.ocr.md')) return '';
+    const dot = base.lastIndexOf('.');
+    const stem = dot > 0 ? base.slice(0, dot) : base;
+    if (stem === '' || stem.startsWith('.')) return '';
+    return `${dir}${stem}.ocr.md`;
+}
+
 /** 索引里的**指针块**：条目 id 留在索引里，`liveIds` 这类只要 id 的调用就不必读正文。 */
 function pointerBlock(block) {
     const items = asArray(block.items);
@@ -1121,6 +1223,62 @@ export function renderProjection(target, entries, { limit, used }) {
     return `${lines.join('\n')}\n`;
 }
 
+/** 开场记忆变量名（preset 的 persona 用 `{{office_hot_memory}}` 引用）。 */
+export const HOT_MEMORY_VARIABLE = 'office_hot_memory';
+/**
+ * 开场记忆投影的字节上限：4 条 critical、每条 70 个中文字符就是渲染器的上界
+ * （实测 919 B）。守门按这个上限钉，不要按「本机恰好存了什么」钉。
+ */
+export const HOT_MEMORY_MAX_BYTES = 1100;
+/** 开场记忆投影文件名（与 USER.md / MEMORY.md 同目录，gitignore 范围内）。 */
+export const HOT_MEMORY_FILE = 'HOT.md';
+
+/**
+ * 渲染「开场记忆」短投影：只放**最该先照办**的一小段，完整条目仍走 office_memory。
+ *
+ * 为什么不是整份热记忆：新会话第一条请求就把它放进 system prompt，它会被每一轮
+ * 重发；8 条完整偏好约 3.8 KB，等于每次请求都多付一份。这里按「用户偏好优先、
+ * 项目只取 critical、每条 70 字」压到 1.1 KB 以内，剩下的让模型按需 read。
+ *
+ * 空记忆返回空串：变量插值后不留标题行，persona 预算与视觉都不被空块占位。
+ */
+export function renderHotProjection(entries, { maxBytes = HOT_MEMORY_MAX_BYTES } = {}) {
+    const ranked = (list) => asArray(list)
+        .slice()
+        .sort((a, b) => (IMPORTANCE_RANK[a.importance] ?? 1) - (IMPORTANCE_RANK[b.importance] ?? 1));
+    // 只放**用户偏好**：项目层 critical 多是「某一轮的落地事实」，跨会话注入会变成
+    // 噪声；项目约定仍走 office_help 的按话题投影与 office_memory read。
+    const picked = ranked(asArray(entries).filter((entry) => entry.target === 'user')).slice(0, 4);
+    if (picked.length === 0) return '';
+    const lines = ['【开场记忆·先照办】'];
+    let used = byteLength(lines[0]) + 1;
+    for (const entry of picked) {
+        const text = truncate(String(entry.content ?? '').replace(/\s*\n\s*/g, ' '), 70);
+        const line = `- [${entry.importance}] ${text}`;
+        const cost = byteLength(line) + 1;
+        if (used + cost > maxBytes) break;
+        lines.push(line);
+        used += cost;
+    }
+    if (lines.length === 1) return '';
+    return `${lines.join('\n')}\n`;
+}
+
+/**
+ * 读开场记忆投影（同步）。
+ *
+ * system prompt 的变量 provider 是同步求值的，不能在这里 await digest；所以走
+ * 写入时落盘的 HOT.md。文件不存在（还没写过任何记忆）就返回空串。
+ */
+export function readHotMemory(root, memoryConfig = {}) {
+    if (typeof root !== 'string' || root === '') return '';
+    try {
+        return readFileSync(join(memoryPaths(root, memoryConfig).dir, HOT_MEMORY_FILE), 'utf8').trim();
+    } catch {
+        return '';
+    }
+}
+
 async function writeProjections(paths, entries, memoryConfig) {
     const userLimit = memoryConfig.userLimitBytes;
     const projectLimit = memoryConfig.projectLimitBytes;
@@ -1128,6 +1286,10 @@ async function writeProjections(paths, entries, memoryConfig) {
     const projectUsage = targetUsage(entries, 'project');
     await writeAtomic(paths.user, renderProjection('user', entries.filter((entry) => entry.target === 'user'), { limit: userLimit, used: userUsage.used }));
     await writeAtomic(paths.project, renderProjection('project', entries.filter((entry) => entry.target === 'project'), { limit: projectLimit, used: projectUsage.used }));
+    // 开场记忆（第七十五轮之后）：给 system prompt 变量读的**短投影**。
+    // 放在这里而不是启动时现算，是因为它必须跟 memory.json 同一次写入落盘；
+    // 缺了它，新会话会退回「等模型调 office_help 才看到记忆」的旧路径。
+    await writeAtomic(join(paths.dir, HOT_MEMORY_FILE), renderHotProjection(entries));
     return {
         user: { ...userUsage, limit: userLimit, markdownPath: paths.user },
         project: { ...projectUsage, limit: projectLimit, markdownPath: paths.project },
@@ -1204,6 +1366,8 @@ function blockKey(block) {
  */
 async function appendArchive(paths, blocks, memoryConfig) {
     if (blocks.length === 0) return [];
+    const scope = paths.archiveScope;
+    if (scope?.canWrite === false) throw new Error('当前工作区无法定位，拒绝写入归档。');
     await mkdir(paths.archive, { recursive: true });
     const index = await loadArchiveIndex(paths);
     // 先把每一卷的正文读回来（新格式在 .jsonl，老格式内联在索引里）：写回时索引里的
@@ -1263,7 +1427,11 @@ async function appendArchive(paths, blocks, memoryConfig) {
     // at 完全相同，按它排序等于按写入顺序裁剪，剪掉哪一个是不确定的。
     const keep = memoryConfig.archiveKeep;
     index.digests.sort((left, right) => String(left.month).localeCompare(String(right.month)) || (left.volume - right.volume));
-    const dropped = index.digests.length > keep ? index.digests.splice(0, index.digests.length - keep) : [];
+    // 共用 archive 里，封顶删除要同时判断兄弟命名空间的条目是否还活着；在拿到
+    // 可核实的所有权之前，跳过删除而不是拿共享 links/tombstones 去赌。索引会超过
+    // archiveKeep，status 会明确报「保留上限已跳过」。
+    const retentionSafe = scope === undefined || scope.retentionSafe !== false;
+    const dropped = retentionSafe && index.digests.length > keep ? index.digests.splice(0, index.digests.length - keep) : [];
     // 删之前先把正文摘出来：`loaded` 是这次写入的真源，接下来两步（判死、落盘）都要用它。
     const droppedRows = new Map(dropped.map((digest) => [digest, loaded.get(digest)?.blocks ?? []]));
     for (const digest of dropped) loaded.delete(digest);
@@ -1327,6 +1495,10 @@ async function appendArchive(paths, blocks, memoryConfig) {
         await rm(join(paths.archive, basename(asText(digest.file))), { force: true });
         await rm(join(paths.archive, basename(asText(digest.itemFile))), { force: true });
     }
+    // 只有走到这里才是一次真正落定的命名空间归档写入：块非空、可写、正文与索引
+    // 都已成功。空写（blocks.length === 0）在函数开头就返回，不可写会提前抛错，
+    // 中途失败也到不了这一行 —— 因此不会在读路径或失败路径上留下 marker。
+    ensureGlobalArchiveMarker({ paths });
     return created;
 }
 
@@ -1415,9 +1587,92 @@ function archiveItemText(item) {
     return [item.path, item.purpose].filter(Boolean).join(' —— ');
 }
 
+// ── 来源证据面与入库评估闸（第五十四轮 19-8 的 P1-4b） ───────────────────────
+
+/**
+ * 正文里的 http(s) 地址：末尾与中间的中英文标点都不算 URL 的一部分。
+ *
+ * 中文顿号 / 句号 / 引号必须排除 —— 实测（本轮的探针）：`https://a.com/x、https://b.org/y。`
+ * 在只排 ASCII 标点的写法下会被当成**一个** URL（host 只剩 a.com），于是「两个独立来源」
+ * 被数成「一个」，这道门就会把有证据的文档拦下来。宁可把边界写宽一点。
+ */
+const SOURCE_URL = /https?:\/\/[^\s<>"'）)】\]，,；;、。！？：」』《》【】]+/g;
+
+/**
+ * 现算一份文档的**来源证据面**：它自己给出了几个**独立来源**。
+ *
+ * 「独立」= URL 的 **hostname** 不同（同一站点的两个页面算一个来源），且这个 hostname
+ * 看起来是个真实主机名。四条形状判据（独立复核 P2-1 补的）：
+ *   1. 至少含一个点 —— `https://a`、`https://占位一` 这类单标签「主机名」不算来源；
+ *   2. 去掉开头的 `www.` 再比 —— `www.a.com` 与 `a.com` 是同一个站点；
+ *   3. `new URL()` 解不出 hostname 的（`https://%%/x`）不算；
+ *   4. 大小写归一到小写。
+ *
+ * **这道门是形状门，不是真伪门**：它挡得住「声明两份独立来源、正文里一份都没有」这种
+ * 自相矛盾，挡不住刻意伪造（真要更严得引入公共后缀表与抓取回验，那是另一条线）。
+ * 所以文档与回执里说的是「**可核对的地址**」，不是「证据确凿」。
+ *
+ * @param {string} text 文档正文
+ * @returns {{urls: number, hosts: string[]}} URL 条数与去重后的 hostname（小写、保序）
+ */
+export function sourceEvidenceOf(text) {
+    const urls = [];
+    const hosts = [];
+    for (const match of String(text ?? '').matchAll(SOURCE_URL)) {
+        const raw = match[0].replace(/[.,;:、。！？】）]+$/, '');
+        urls.push(raw);
+        let host = '';
+        try {
+            host = new URL(raw).hostname.toLowerCase().replace(/^www\./, '');
+        } catch {
+            continue;
+        }
+        if (host === '' || !host.includes('.')) continue;
+        if (!hosts.includes(host)) hosts.push(host);
+    }
+    return { urls: urls.length, hosts };
+}
+
+/** 入库评估闸的档位标签（回执与报错共用一套说法，免得两处各说各的）。 */
+const EVIDENCE_HINT = {
+    unverified: "tier:'unverified'（待核：只能 kb-read 逐字读，不得作为结论、也不得写进热记忆的依据）",
+    user: "tier:'user'（用户自己给的材料，不需要引擎核对来源）",
+};
+
+/**
+ * `verified` 的入库评估闸：声明 ≥2 独立来源，就得在正文里数得出来。
+ *
+ * 为什么要有它：`tier` 从前是**纯声明** —— `kb-ingest({tier:'verified'})` 只要拼写正确
+ * 就过，而 verified 是「能进热记忆当依据」的那一档（`assertRefsTrusted` 只放 verified / user）。
+ * 于是「单源未核实」与「两份独立来源确认过」在库里长得一模一样，硬规则的下游门形同虚设。
+ * 这道门把它变成**可核对的**：数不出两个独立 host 就不许写 verified。
+ *
+ * 三种档位里只有 verified 需要证据：user 是「用户自己给的」（引擎无从核对，也不该假装
+ * 核过），unverified 是「我承认它没核实」—— 两者都如实，不需要门。
+ *
+ * @param {{tier: string, path: string, evidence: {urls: number, hosts: string[]}}} input
+ */
+function assertIngestEvidence({ tier, path, evidence }) {
+    if (tier !== 'verified' || evidence.hosts.length >= 2) return;
+    // 「没有 URL」与「有 URL 但一个都解不出 hostname」是两件事（复核 P3-1 的修法）：
+    // 后者说明地址写坏了（`https://%%/x`、`https://` 后面什么都没有），
+    // 一律说成「一个来源都没有」会让调用方以为正文里真的没写来源。
+    const found = evidence.hosts.length > 0
+        ? `正文里只有 ${evidence.hosts.length} 个独立来源：${evidence.hosts.join('、')}`
+        : evidence.urls === 0
+            ? '正文里一个 http(s) 地址都没有'
+            : `正文里有 ${evidence.urls} 个 http(s) 地址，但一个都解不出主机名（地址写坏了？）`;
+    throw new Error(`入库评估闸拦下了「${path}」：声明 ${tierTag('verified')} 需要 ≥2 个独立来源，`
+        + `而${found}。三种下一步，照抄一条：`
+        + `① 承认它没核实 —— ${EVIDENCE_HINT.unverified}；`
+        + `② 材料是用户给的 —— ${EVIDENCE_HINT.user}；`
+        + '③ 把第二份独立来源的地址写进正文（主机名不同才算第二份，同一站点的两个页面算一份），再入库。'
+        + '（这道门只管「声明与正文对不对得上」这一次调用：内容与档位都没变的幂等重入不再判，'
+        + '所以库里那些在门之前入库的文档不会被追溯拦下。）');
+}
+
 /** 关键词命中数（大小写不敏感的整串包含），用来排序与过滤。 */
-function matchScore(text, terms) {
-    const haystack = String(text).toLowerCase();
+function matchScore(text, terms) {    const haystack = String(text).toLowerCase();
     let score = 0;
     for (const term of terms) {
         if (term !== '' && haystack.includes(term)) score += 1;
@@ -1433,6 +1688,85 @@ function matchScore(text, terms) {
  */
 function entrySignalText(entry) {
     return `${entry.content} ${asArray(entry.entities).join(' ')} ${asArray(entry.tags).join(' ')}`;
+}
+
+// ── 读侧分区（第五十四轮 新-12） ─────────────────────────────────────────────
+
+/**
+ * 一条内容**声明过的归类字段** —— 分区判据只认显式声明，不认正文。
+ *
+ * 这正是 `新-12` 要修的那件事：`tags` / `entities` 从前只参与**匹配**（正文里出现
+ * 也算），不参与**隔离**；于是「一个工作目录一份记忆、里面混装多主题」时，
+ * 想只看某一类条目没有硬入口，只能靠关键词碰运气。
+ *
+ * 三层各自的归类字段不同，这不是特例而是事实：
+ *   - 热记忆与归档条目：`tags` / `entities`（写条目时声明的）；
+ *   - 台账行：只有 `theme`（登记时的主题 id），所以把它当作那一行的标签；
+ *     而台账**没有实体**，给 `entities` 做分区时它一律不满足 —— 渲染里会如实
+ *     报「台账本次 0 条」，不装作「台账里没有这类东西」。
+ */
+function partitionFieldsOf(item, kind = '') {
+    if (kind === 'ledger') {
+        const theme = asText(item.theme);
+        return { tags: theme === '' ? [] : [theme], entities: [] };
+    }
+    return { tags: asArray(item.tags), entities: asArray(item.entities) };
+}
+
+/** 分区键归一：去首尾空白 + 小写（ASCII 大小写不敏感；中文不受影响）。 */
+function partitionKeyOf(value) {
+    return asText(value).toLowerCase();
+}
+
+/**
+ * 把 `read` 收到的 `tags` / `entities` 收成一份分区键。
+ *
+ * **给了就一定要看懂**：非数组、数组里有非字符串 —— 当场抛错。静默忽略过滤器会把
+ * 「没过滤」说成「这类条目没有」，这是本项目一贯拒绝的那类谎（同 `since` / `until`）。
+ * 不给（undefined / null）= 空分区 = 老行为（不过滤）。
+ *
+ * @param {unknown} tags 标签数组
+ * @param {unknown} entities 实体数组
+ * @returns {{tags: string[], entities: string[]}} 归一后的分区键
+ */
+export function partitionFilterOf(tags, entities) {
+    const one = (value, where) => {
+        if (value === undefined || value === null) return [];
+        if (!Array.isArray(value)) {
+            throw new Error(`${where} 需要一个字符串数组（如 ['发布流程']），收到的是 ${typeof value}。`);
+        }
+        for (const item of value) {
+            if (typeof item !== 'string') throw new Error(`${where} 里每一项都必须是字符串，收到 ${typeof item}。`);
+        }
+        const keys = [...new Set(stringList(value, 24).map(partitionKeyOf).filter((item) => item !== ''))];
+        // 给了非空数组却归一不出任何分区键 = 给的是空白（`['']` / `['  ']`）。
+        // **这不等于「没给分区」**（复核 P3-2）：静默当没给，回执里连「分区：」那行都不会印，
+        // 读的人会把「没过滤」当成「这一类只有这些」。所以当场拒绝，并说清空数组才是「不过滤」。
+        if (keys.length === 0 && value.length > 0) {
+            throw new Error(`${where} 里只有空白：分区键不能是空串。要「不过滤」就传空数组 []，别传 ['']。`);
+        }
+        return keys;
+    };
+    return { tags: one(tags, 'tags'), entities: one(entities, 'entities') };
+}
+
+/** 空分区 = 不过滤（老行为）；非空 = 硬隔离。 */
+export function partitionIsEmpty(partition) {
+    const value = partition ?? { tags: [], entities: [] };
+    return asArray(value.tags).length === 0 && asArray(value.entities).length === 0;
+}
+
+/**
+ * 这条内容在不在分区里：**给出来的每一个**标签与实体都要在它声明过的字段里出现。
+ *
+ * 是「合取」而不是「析取」：分区是一把钥匙，不是一个检索词表 ——
+ * `tags:['发布','模板']` 问的是「同时属于这两个分区的那一批」。
+ */
+export function inPartition(declared, partition) {
+    if (partitionIsEmpty(partition)) return true;
+    const has = (values, wanted) => stringList(values, 64).map(partitionKeyOf).includes(wanted);
+    return asArray(partition.tags).every((tag) => has(declared?.tags, tag))
+        && asArray(partition.entities).every((entity) => has(declared?.entities, entity));
 }
 
 // ── recency 弱先验（第二十四轮 24-4） ────────────────────────────────────────
@@ -1796,6 +2130,46 @@ export function applyRecallQuality(candidates, { quality, limit, termCount }) {
     return { items, dropped, medium, unknown };
 }
 
+// ── 统一入口路由的门控（第五十七轮 19-8 的 P2-8） ────────────────────────────
+
+/**
+ * 「记忆够答吗」的判据 —— 四档，**可核对**，不是感觉。
+ *
+ * 为什么要有它：记忆三层与知识库是两条分开的检索路径（`read` / `kb-search`），
+ * 谁先用、什么时候下沉，从前完全交给模型临场决定。而记忆层装的是**约束**
+ * （用户偏好、项目约定、交付物台账），不是候选文档集 —— 查询词对不上就是真的
+ * 没有，继续换词只是在付配额。Adaptive-RAG 的口径是「简单问只查记忆层」，
+ * Self-RAG 的口径是「先判检索够不够，不够再下探」；两者落到这里就是下面这四档。
+ *
+ * 判据只看两件**现算得出来**的事实：命中条目的词表覆盖了查询词的几成、
+ * 命中里最高的重要度是什么。不做语义判断 —— 这是「可核对」的代价，也是它的
+ * 价值：同样的输入永远给同样的分档，测试钉得住它。
+ *
+ * 顺序即优先级：
+ *   `empty`   命中 0 条 —— 记忆里没有这件事；
+ *   `partial` 查询词没被命中条目的词表全覆盖 —— 有一半问题记忆答不了；
+ *   `weak`    词全覆盖、但没有一条约束级 —— 有相关内容，却没有「必须 / 永远」可依；
+ *   `enough`  词全覆盖 + 至少一条 critical —— 停在记忆层。
+ *
+ * 注意：`enough` 是**门控结论**，不是「记忆能答对」。它的意义是「不必再下沉到
+ * 来源原文」；真答得对不对，仍由读到的条目内容决定。
+ */
+export function gateVerdictOf({ terms = [], covered = 0, hits = 0, topImportance = '' } = {}) {
+    const total = Array.isArray(terms) ? terms.length : 0;
+    if (hits <= 0) return 'empty';
+    if (covered < total) return 'partial';
+    if (topImportance !== 'critical') return 'weak';
+    return 'enough';
+}
+
+/** 四档的中文说法（回执与测试共用一份，不各写各的）。 */
+export const GATE_VERDICT_TEXT = {
+    empty: '记忆层一条都没命中',
+    partial: '查询词在记忆里对不上',
+    weak: '命中的没有约束级条目',
+    enough: '记忆层够答',
+};
+
 // ── 有界读取 ────────────────────────────────────────────────────────────────
 
 /**
@@ -1842,7 +2216,7 @@ function admit(items, { resultLimit, itemChars, totalChars, limits }) {
 
 /**
  * 把 memory 配置补全成运行期用的那一份（缺省永远可用）。
- * @returns {{dir, userLimitBytes, projectLimitBytes, ledgerLimit, archiveKeep, autoLedger, layers, scope, globalDir, userScope, links, autoCapture, recallQuality, quota}}
+ * @returns {{dir, userLimitBytes, projectLimitBytes, ledgerLimit, archiveKeep, autoLedger, layers, scope, globalDir, userScope, autoCapture, recallQuality, quota}}
  */
 export function resolveMemoryConfig(memory = {}) {
     const raw = memory !== null && typeof memory === 'object' ? memory : {};
@@ -1865,6 +2239,36 @@ export function resolveMemoryConfig(memory = {}) {
     for (const [name, fallback] of Object.entries(DEFAULT_QUOTA)) {
         quota[name] = boundedInt(rawQuota[name], fallback, 0, 50);
     }
+    // 知识库检索参数（第八十五轮）：坏值一律落回默认，空配置永远可用。
+    const rawEmbedding = raw.embedding !== null && typeof raw.embedding === 'object' ? raw.embedding : {};
+    const embedding = {
+        mode: oneOf(rawEmbedding.mode, ['auto', 'remote', 'local', 'off'], 'auto'),
+        baseURL: asText(rawEmbedding.baseURL),
+        model: asText(rawEmbedding.model),
+        apiKey: asText(rawEmbedding.apiKey),
+        apiKeyEnv: asText(rawEmbedding.apiKeyEnv),
+        dimensions: boundedInt(rawEmbedding.dimensions, 0, 0, 4096),
+        batchSize: boundedInt(rawEmbedding.batchSize, 16, 1, 64),
+        timeoutMs: boundedInt(rawEmbedding.timeoutMs, 15_000, 1_000, 120_000),
+    };
+    // 本机推理（第一百零三轮）：createMemory 是测试与探针的直接入口，这里也要收口，
+    // 否则只改 config.js 的那一份会漏掉它们。
+    embedding.local = normalizeLocalEmbeddingConfig(rawEmbedding.local);
+    const selector = normalizeSelectorConfig(raw.selector);
+    const rawAnn = raw.ann !== null && typeof raw.ann === 'object' ? raw.ann : {};
+    const ann = {
+        enabled: rawAnn.enabled !== false,
+        m: boundedInt(rawAnn.m, 16, 4, 64),
+        efConstruction: boundedInt(rawAnn.efConstruction, 200, 4, 1_000),
+        efSearch: boundedInt(rawAnn.efSearch, 64, 1, 512),
+        maxBuild: boundedInt(rawAnn.maxBuild, 20_000, 100, 20_000),
+    };
+    const rawHybrid = raw.hybrid !== null && typeof raw.hybrid === 'object' ? raw.hybrid : {};
+    const hybrid = {
+        lexicalWeight: boundedNumber(rawHybrid.lexicalWeight, 0.55, 0, 1),
+        vectorWeight: boundedNumber(rawHybrid.vectorWeight, 0.45, 0, 1),
+        candidateLimit: boundedInt(rawHybrid.candidateLimit, 30, 5, 100),
+    };
     return {
         dir: asText(raw.dir) || DEFAULT_MEMORY_DIR,
         userLimitBytes: Number.isFinite(raw.userLimitBytes) ? raw.userLimitBytes : DEFAULT_USER_LIMIT_BYTES,
@@ -1880,12 +2284,41 @@ export function resolveMemoryConfig(memory = {}) {
         layers,
         scope: oneOf(raw.scope, MEMORY_SCOPES, 'workspace'),
         globalDir: asText(raw.globalDir),
+        kbDir: asText(raw.kbDir),
+        embedding,
+        selector,
+        ann,
+        hybrid,
         userScope: oneOf(raw.userScope, USER_SCOPES, 'memory'),
-        links: raw.links !== false,
         autoCapture: raw.autoCapture !== false,
         recallQuality: quality,
         quota,
+        llm: normalizeKbLlmConfig(raw.llm),
     };
+}
+
+/**
+ * 全局命名空间标记：只在一次成功的真实归档写入后落一次。
+ * 标记不含路径/正文，只记录旧档当时是否已被证明属于全局层；读 / 创建实例 /
+ * 失败的写入都不落标记，避免把「读过一次」变成归属证据。
+ */
+function ensureGlobalArchiveMarker(store) {
+    const scope = store?.paths?.archiveScope;
+    if (scope === undefined || scope.store !== 'global' || scope.writeNamespaced !== true) return;
+    const marker = globalNamespaceMarkerPath(scope.archiveDir);
+    if (existsSync(marker)) return;
+    try {
+        mkdirSync(scope.writeDir, { recursive: true });
+        writeFileSync(marker, `${JSON.stringify({
+            version: 1,
+            kind: 'global-archive',
+            legacy: scope.legacyAttribution,
+            shared: scope.sharedDir === true,
+            reason: scope.mode,
+        })}\n`, 'utf8');
+    } catch {
+        // 标记写不下去时仍按本次判定写；下一次会重新判定，不会回退到根 archive。
+    }
 }
 
 /**
@@ -1900,10 +2333,19 @@ export function resolveMemoryConfig(memory = {}) {
 function buildStores(root, config) {
     const stores = [];
     const wantGlobal = config.scope === 'global' || config.scope === 'both' || config.userScope === 'global';
-    const wantWorkspace = config.scope !== 'global';
-    if (wantGlobal) stores.push({ id: 'global', paths: globalMemoryPaths(config) });
-    if (wantWorkspace) stores.push({ id: 'workspace', paths: memoryPaths(root, config) });
-    if (stores.length === 0) stores.push({ id: 'workspace', paths: memoryPaths(root, config) });
+    const keepWorkspace = config.scope !== 'global';
+    // 工作区 archive 无论如何先算出来：它既可能是一个 store，也是判断「全局目录
+    // 与工作区 archive 物理上是不是同一个目录」的唯一证据。只看配置里的绝对
+    // memory.dir 会漏掉默认目录与相对目录 —— 那正是两侧判定不对称的来源。
+    const workspacePaths = memoryPaths(root, config);
+    const globalPaths = wantGlobal
+        ? globalMemoryPaths(config, { otherArchiveDirs: [workspacePaths.archiveScope?.archiveDir || workspacePaths.archive] })
+        : null;
+    // 命名空间标记不在这里落：创建实例 / 读状态都可能是只读路径，不能在读的时候
+    // 改变盘上的归属判定。标记只由一次成功的真实归档写入建立（见 appendArchive）。
+    if (wantGlobal) stores.push({ id: 'global', paths: globalPaths });
+    if (keepWorkspace) stores.push({ id: 'workspace', paths: workspacePaths });
+    if (stores.length === 0) stores.push({ id: 'workspace', paths: workspacePaths });
     return stores;
 }
 
@@ -1929,35 +2371,110 @@ function combineRevisions(items) {
 /**
  * 建一个记忆实例。所有读写都通过它，路径与上限在构造时定死。
  *
- * @param {{root: string, memory?: object}} options
- *   root   会话工作目录（路径解析的基准）
- *   memory 已解析的记忆配置（见 config.js 的 memory 段）
+ * @param {{root: string, memory?: object, llm?: object|null, gallery?: object|null}} options
+ *   root    会话工作目录（路径解析的基准）
+ *   memory  已解析的记忆配置（见 config.js 的 memory 段）
+ *   llm     宿主 llm 服务（可选）：知识库大模型切片 / 摘要与图库视觉描述会用它。
+ *           没传时 host 通道明确报不可用，其余功能照常；工具层用 ctx.get('llm') 取。
+ *   gallery 已解析的图库配置（config.gallery；文本向量缺省沿用知识库 embedding）。
  */
-export function createMemory({ root, memory = {} }) {
+export function createMemory({ root, memory = {}, llm = null, gallery = null }) {
     const base = asText(root);
     if (base === '') throw new Error('createMemory 需要会话工作目录。');
     const config = resolveMemoryConfig(memory);
+    /** 宿主模型服务（可为 null）：host 通道用；openai 通道不需要它。 */
+    const hostLlm = llm !== null && typeof llm === 'object' ? llm : null;
+    /** 预估与真实入库共用同一个可用性判据；只读属性，不探活、不发请求。 */
+    const hostLlmUsable = hostLlm !== null && typeof hostLlm.prepareCall === 'function';
     const stores = buildStores(base, config);
     /** 工作区根（默认的那一个）。`paths` 保持指向它，兼容既有调用方。 */
     const paths = (stores.find((store) => store.id === 'workspace') ?? stores[0]).paths;
     const layers = config.layers;
 
-    /** 某个目标该写进哪个根：USER 侧可以单独常驻全局，其余看 scope。 */
+    /**
+     * 知识库的唯一存储（第八十八轮）：`id` 固定为 `kb`，不再有 global / workspace 两个根。
+     *
+     * 只带 `paths.kb`：知识库的块、索引、图片资产都在那个目录里，而热记忆 / 台账 /
+     * 关系仍属于各自的记忆根。函数里需要「哪份文档属于哪个根」的旧判据随之失效，
+     * 这正是本轮要消掉的那层复杂度 —— 一份文档就是一份文档。
+     */
+    const kbPaths = kbPathsAt(kbRootDir(config));
+    // 清理意图（墓碑）与其它根同一套写法：kbStore.paths 顶层要有 dir / tombstones，
+    // kb 自己的文件位置收在 paths.kb 下。
+    const kbStore = { id: 'kb', paths: { dir: kbPaths.dir, tombstones: kbPaths.tombstones, kb: kbPaths } };
+    // 兼容既有调用方：`paths` 曾经也带 kb 位置。它现在指向单库，而不是工作区兄弟目录。
+    paths.kb = kbStore.paths.kb;
+
+    // 审美参考图库：与知识库分开存（原图、缩略图、两个向量空间），默认根是
+    // 知识库目录旁边的 gallery/。构造是同步的，工具与视图层可以直接取实例。
+    const galleryDir = galleryRootDir(config, kbPaths.dir) || join(dirname(kbPaths.dir), 'gallery');
+    const galleryConfig = gallery !== null && typeof gallery === 'object'
+        ? gallery
+        : { textEmbedding: config.embedding };
+    const galleryInstance = createGallery({
+        root: galleryDir,
+        cwd: base,
+        roots: [base, kbPaths.dir, galleryDir],
+        config: galleryConfig,
+        thumbnailer: createPillowThumbnailer(),
+    });
+
+    /**
+     * 某个目标该写进哪个根（2026-11-19 收紧）：
+     *   - **user = 个人口味**，有全局根就只写全局；它不该被某个项目的目录绑住。
+     *   - **project = 项目事实**，只写工作区；全局层里出现项目轮次记录就是这条没守住。
+     * 没有全局根时 user 退回工作区（单根部署仍然能用）。
+     */
     function storeFor(target) {
-        if (target === 'user' && config.userScope === 'global') {
-            const global = stores.find((store) => store.id === 'global');
-            if (global !== undefined) return global;
+        if (target === 'user') {
+            return stores.find((store) => store.id === 'global')
+                ?? stores.find((store) => store.id === 'workspace')
+                ?? stores[0];
         }
-        if (config.scope === 'global') {
-            return stores.find((store) => store.id === 'global') ?? stores[0];
-        }
-        return stores.find((store) => store.id === 'workspace') ?? stores[0];
+        return stores.find((store) => store.id === 'workspace')
+            ?? stores.find((store) => store.id === 'global')
+            ?? stores[0];
     }
 
     /** 台账这类「项目产物」该落在工作区；纯全局范围才落全局。 */
     function defaultStore() {
         if (config.scope === 'global') return stores.find((store) => store.id === 'global') ?? stores[0];
         return stores.find((store) => store.id === 'workspace') ?? stores[0];
+    }
+
+    /**
+     * 知识库默认写哪个根（第八十四轮）：**有全局根就写全局**。
+     *
+     * 知识库在语义上是「这台机器的资料库」，不是某个项目的产物；虚拟文件夹已经能表达
+     * 「这份资料属于哪个项目」，不必再靠两个物理根来隔离。工作区根仍可显式写入
+     * （scope:'workspace'），读的时候两个根合并。
+     */
+    function kbDefaultStore() {
+        return stores.find((store) => store.id === 'global') ?? defaultStore();
+    }
+
+    /**
+     * 本次调用显式指定的根（第八十轮）：scope='workspace'|'global' 时只动这一个根。
+     *
+     * 为什么要有它：`scope` / `userScope` 是**进程级**设置，决定「默认往哪儿写」；
+     * 但同一台机器上既有跨项目通用的偏好，也有只属于这个项目的流程约定 —— 只靠
+     * 设置就得二选一。显式 scope 把「这一条写哪边」变成每次调用可决定的事。
+     * 它**不改变读的可见范围**（读仍按设置合并各根），也不会顺手建根：没开的根
+     * 就报错，而不是悄悄写到别处。
+     */
+    function explicitStoreOf(scope) {
+        const wanted = asText(scope);
+        if (wanted === '') return null;
+        if (wanted !== 'workspace' && wanted !== 'global') {
+            throw new Error(`scope 只支持 workspace / global，收到「${wanted}」。省略时按设置页的记忆范围。`);
+        }
+        const found = stores.find((store) => store.id === wanted);
+        if (found === undefined) {
+            throw new Error(`设置里没有开「${wanted === 'global' ? '全局' : '工作区'}」记忆根`
+                + `（当前 scope=${config.scope}、userScope=${config.userScope}），本次没有写入或查找。`
+                + '要写全局请把设置页「记忆 → 范围」改成 both / global；要写工作区请让范围包含 workspace。');
+        }
+        return found;
     }
 
     /** 读一份快照：热记忆全量 + 用量。热记忆本来就小，全给。 */
@@ -1991,14 +2508,30 @@ export function createMemory({ root, memory = {} }) {
      *
      * @returns {Promise<object>} 紧凑结果（渲染由 renderRead 负责）
      */
-    async function read({ layer = 'all', query = '', limit = 0, since = '', until = '' } = {}) {
+    async function read({ layer = 'all', query = '', limit = 0, since = '', until = '', tags = [], entities = [] } = {}) {
         const wanted = layer === 'hot' || layer === 'ledger' || layer === 'archive' ? layer : 'all';
         const terms = queryTerms(query);
         const quality = config.recallQuality;
+        // 门控原料（第五十七轮 P2-8）：**只有带 query 时才攒** —— 不带 query 的浏览
+        // 没有「够不够答」这回事。攒的是「哪些查询词在命中条目的词表里真的出现过」
+        // 与「命中里最高的重要度」，两项都在下面逐层现算（判据见 gateVerdictOf）。
+        // 这里再去重一次是**防御**（`queryTerms` 转发自 `kbTerms`，那边已经 Set 过）：
+        // 判据里 `terms.length` 是分母，重复词会让「全覆盖」永远达不成。
+        const gateTermList = terms.length === 0 ? [] : [...new Set(terms)];
+        const gateTerms = gateTermList.length === 0 ? null : new Set();
+        let gateHits = 0;
+        let gateTop = '';
+        // 分区（新-12）与时间窗一样，在**打分之前**生效：它是**过滤器**（硬隔离），
+        // 不是排序项 —— 分区里的条目宁可少，也不能让别的主题混进来。
+        const partition = partitionFilterOf(tags, entities);
+        const partitioned = !partitionIsEmpty(partition);
         // 时间窗在**打分之前**生效：先缩小搜索空间，再排名。解析失败会在这里抛错
         // （静默忽略过滤器会把「没命中」说成「那段时间没有」）。
         const window = resolveTimeWindow({ since, until });
         const result = { layer: wanted, query: asText(query), truncated: false, origins: stores.map((store) => store.id), quality: quality.policy };
+        if (partitioned) {
+            result.partition = { tags: [...partition.tags], entities: [...partition.entities] };
+        }
         if (window !== null) {
             result.window = {
                 sinceInput: window.sinceInput,
@@ -2026,24 +2559,53 @@ export function createMemory({ root, memory = {} }) {
             // 时间维度过滤热记忆用 `updatedAt`（改动时刻），台账与归档用 `at`
             // （归档里 mnemon 迁来的条目只有 `storedAt`，走 stampOf 的回退）。
             const part = partitionByWindow(window, everything, (entry) => stampOf(entry));
-            const all = part.inWindow;
+            const inWindow = part.inWindow;
+            // 分区在窗前还是窗后都等价（两个都是纯过滤），放在窗后是为了让
+            // `windowFiltered` 与 `partitionFiltered` 各自报自己隔掉了多少条。
+            const all = inWindow.filter((entry) => inPartition(partitionFieldsOf(entry), partition));
             // 排序：**重要度永远是主键**，同重要度内按 recency 弱先验（新的在前，见
             // `recencyPriorOf` 的三条口径）。第三档是时刻字符串、第四档是 id —— 后两档
             // 只为「同一毫秒写多条」时给一个确定的次序（稳定排序的副产品不该是契约）。
+            //
+            // **带 query 时也只做过滤、不改排序**（独立复核 P1-4 的修法）。第五十四轮初版
+            // 让命中强度当主键（照投影的次序），两处后果都实测出来了：一条 `low` 的笔记
+            // 命中两个词就能压过一条 `critical` 的「永远不要把草稿发给客户」，`limit:1`
+            // 时那条约束干脆不出现；同族两版里**旧版**命中词多时也会排到当前版前面，
+            // 把第四十二轮量到增益才落地的「后写的那版是当前事实」静默撤销。
+            // 热记忆存的是**约束**，不是候选文档集 —— 所以这里保持「重要度是主键」这条
+            // 契约，query 的作用是**缩小集合**（一个词都没命中的条目不出现），不是重排。
+            // 投影（renderDigest）的「命中强度 → 重要度」是另一回事：它没有 query，
+            // 只有一份要花掉的字节预算，靠命中强度决定先折叠谁。
             const nowMs = Date.now();
+            const scoreOf = (entry) => (terms.length === 0 ? 0 : matchScore(entrySignalText(entry), terms));
+            const scored = all
+                .map((entry) => ({ entry, score: scoreOf(entry) }))
+                .filter((item) => terms.length === 0 || item.score > 0)
+                .sort((left, right) => (IMPORTANCE_RANK[left.entry.importance] - IMPORTANCE_RANK[right.entry.importance])
+                    || (recencyPriorOf(right.entry.updatedAt, nowMs) - recencyPriorOf(left.entry.updatedAt, nowMs))
+                    || String(right.entry.updatedAt).localeCompare(String(left.entry.updatedAt))
+                    || String(left.entry.id).localeCompare(String(right.entry.id)));
+            if (gateTerms !== null) {
+                gateHits += scored.length;
+                for (const { entry } of scored) {
+                    const signal = entrySignalText(entry).toLowerCase();
+                    for (const term of gateTermList) if (signal.includes(term)) gateTerms.add(term);
+                    // 「最高重要度」按 IMPORTANCE_RANK（critical = 0 最好）比，未知值归一成 normal，
+                    // 不让一个拼错的字符串把门控判成 enough。
+                    const importance = oneOf(entry.importance, ['critical', 'normal', 'low'], 'normal');
+                    if (gateTop === '' || IMPORTANCE_RANK[importance] < IMPORTANCE_RANK[gateTop]) gateTop = importance;
+                }
+            }
             const admitted = admit(
-                all
-                    .slice()
-                    .sort((left, right) => (IMPORTANCE_RANK[left.importance] - IMPORTANCE_RANK[right.importance])
-                        || (recencyPriorOf(right.updatedAt, nowMs) - recencyPriorOf(left.updatedAt, nowMs))
-                        || String(right.updatedAt).localeCompare(String(left.updatedAt))
-                        || String(left.id).localeCompare(String(right.id)))
-                    .map((entry) => ({ id: entry.id, target: entry.target, importance: entry.importance, updatedAt: entry.updatedAt, origin: entry.origin, entities: entry.entities, kbRefs: entry.kbRefs, sources: entry.sources, text: entry.content, digest: sha1(entry.content) })),
+                scored
+                    .map(({ entry }) => ({ id: entry.id, target: entry.target, importance: entry.importance, updatedAt: entry.updatedAt, origin: entry.origin, entities: entry.entities, tags: entry.tags, kbRefs: entry.kbRefs, sources: entry.sources, text: entry.content, digest: sha1(entry.content) })),
                 { resultLimit: cap('hot', READ_LIMITS.hotResults), itemChars: READ_LIMITS.itemChars, totalChars: budgetFor('hot') },
             );
             result.hot = {
                 items: admitted.items,
-                total: all.length,
+                total: inWindow.length,
+                matched: scored.length,
+                partitionFiltered: inWindow.length - all.length,
                 windowFiltered: part.outside,
                 windowUnstamped: part.unstamped,
                 budgetChars: budgetFor('hot'),
@@ -2063,11 +2625,24 @@ export function createMemory({ root, memory = {} }) {
             }
             const part = partitionByWindow(window, records, (record) => stampOf(record));
             const inWindow = part.inWindow;
-            const scored = inWindow
+            // 台账的分区字段是 `theme`（见 partitionFieldsOf）：它是这一行唯一的归类声明。
+            const inPartitioned = inWindow.filter((record) => inPartition(partitionFieldsOf(record, 'ledger'), partition));
+            const scored = inPartitioned
                 .map((record) => ({ record, score: terms.length === 0 ? 0 : matchScore(ledgerSearchText(record), terms) }))
                 .filter((item) => terms.length === 0 || item.score > 0)
                 .sort((left, right) => (right.score - left.score) || String(right.record.at).localeCompare(String(left.record.at)));
             const picked = applyRecallQuality(scored, { quality, limit: cap('ledger', READ_LIMITS.ledgerResults), termCount: terms.length });
+            if (gateTerms !== null) {
+                // 台账侧只看**命中**的那些（判据是「记忆里有没有这件事」，不是「额度给没给」）。
+                gateHits += scored.length;
+                for (const { record } of scored) {
+                    const signal = ledgerSearchText(record).toLowerCase();
+                    for (const term of gateTermList) if (signal.includes(term)) gateTerms.add(term);
+                }
+            }
+            // 依据的强弱**读时现算**（P1-4b；复核 P1-2 把它从写入期搬到读侧）：档位会变、
+            // 块会删，登记那一刻算出来的标记会变成一份会过期的快照。只对真正取出来的那几条算。
+            const trust = await ledgerTrustOf(picked.items.map((item) => item.record));
             const admitted = admit(
                 picked.items.map((item) => ({
                     id: asText(item.record.id),
@@ -2080,6 +2655,10 @@ export function createMemory({ root, memory = {} }) {
                     score: item.score,
                     // 用过哪块知识来源（usedRefs）：渲染台账行时要印出来。
                     kbRefs: asArray(item.record.kbRefs),
+                    // 其中待核（unverified）与找不到的那两类：渲染台账行时当场印出来，
+                    // 「这份交付物的依据里有一块单源未核实」不该只躺在 jsonl 里。
+                    untrustedRefs: trust.get(item.record)?.untrusted ?? [],
+                    unknownRefs: trust.get(item.record)?.unknown ?? [],
                     text: [asText(item.record.path), asText(item.record.purpose), asArray(item.record.outline).slice(0, 4).join(' / ')].filter(Boolean).join(' —— '),
                 })),
                 { resultLimit: cap('ledger', READ_LIMITS.ledgerResults), itemChars: READ_LIMITS.itemChars, totalChars: budgetFor('ledger') },
@@ -2089,6 +2668,7 @@ export function createMemory({ root, memory = {} }) {
                 total: inWindow.length,
                 windowFiltered: part.outside,
                 windowUnstamped: part.unstamped,
+                partitionFiltered: inWindow.length - inPartitioned.length,
                 matched: scored.length,
                 budgetChars: budgetFor('ledger'),
                 qualityDropped: picked.dropped,
@@ -2116,11 +2696,31 @@ export function createMemory({ root, memory = {} }) {
             // 归档条目的时间戳要回退到 `storedAt`：mnemon 迁来的历史长期记忆只有它。
             const part = partitionByWindow(window, items, (item) => stampOf(item));
             const inWindow = part.inWindow;
-            const scored = inWindow
+            // 归档里三种条目各自的归类字段不同：热记忆下沉的带 tags/entities、mnemon 迁来的
+            // 带 tags/entities、台账滚下来的只有 theme（partitionFieldsOf 按 kind 判）。
+            const inPartitioned = inWindow.filter((item) => inPartition(
+                partitionFieldsOf(item, item.kind === 'ledger' ? 'ledger' : ''), partition,
+            ));
+            const scored = inPartitioned
                 .map((item) => ({ item, score: terms.length === 0 ? 0 : matchScore(archiveSearchText(item), terms) }))
                 .filter((entry) => terms.length === 0 || entry.score > 0)
                 .sort((left, right) => (right.score - left.score) || String(right.item.at ?? '').localeCompare(String(left.item.at ?? '')));
             const picked = applyRecallQuality(scored, { quality, limit: cap('archive', READ_LIMITS.archiveResults), termCount: terms.length });
+            if (gateTerms !== null) {
+                gateHits += scored.length;
+                for (const { item } of scored) {
+                    const signal = archiveSearchText(item).toLowerCase();
+                    for (const term of gateTermList) if (signal.includes(term)) gateTerms.add(term);
+                    // 归档里的**热记忆条目**照样带重要度，要一起算进门控的最高重要度
+                    // （独立复核 P2-1）：只认热记忆层时，`layer:'archive'` 会永远到不了
+                    // enough，回执还会写「命中的没有约束级条目」——而它正下方那一行就印着
+                    // `热记忆（workspace/critical）`。台账条目本来没有这个字段，跳过。
+                    if (item.kind === 'hot') {
+                        const importance = oneOf(item.importance, ['critical', 'normal', 'low'], 'normal');
+                        if (gateTop === '' || IMPORTANCE_RANK[importance] < IMPORTANCE_RANK[gateTop]) gateTop = importance;
+                    }
+                }
+            }
             const admitted = admit(
                 picked.items.map((entry) => ({
                     id: entry.item.id,
@@ -2152,6 +2752,7 @@ export function createMemory({ root, memory = {} }) {
                 damagedVolumes,
                 windowFiltered: part.outside,
                 windowUnstamped: part.unstamped,
+                partitionFiltered: inWindow.length - inPartitioned.length,
                 matched: scored.length,
                 budgetChars: budgetFor('archive'),
                 qualityDropped: picked.dropped,
@@ -2161,6 +2762,20 @@ export function createMemory({ root, memory = {} }) {
         }
 
         result.qualityDroppedTotal = (result.ledger?.qualityDropped ?? 0) + (result.archive?.qualityDropped ?? 0);
+        // 门控结论随 read 一起回去（第五十七轮 P2-8）：`recall` 靠它决定要不要下探 kb，
+        // 而单独调 `read` 时它同样是「这次检索算不算查到了」的可核对自述。
+        if (gateTerms !== null) {
+            const covered = gateTermList.filter((term) => gateTerms.has(term));
+            const missing = gateTermList.filter((term) => !gateTerms.has(term));
+            result.gate = {
+                verdict: gateVerdictOf({ terms: gateTermList, covered: covered.length, hits: gateHits, topImportance: gateTop }),
+                terms: gateTermList,
+                covered,
+                missing,
+                hits: gateHits,
+                topImportance: gateTop,
+            };
+        }
         result.paths = {
             memory: relPath(base, paths.memory),
             user: relPath(base, paths.user),
@@ -2184,7 +2799,7 @@ export function createMemory({ root, memory = {} }) {
      * `oldText` 子串唯一命中。id 是 read 的行首那个（`m-xxxxxxxx`），有它就
      * 不必再猜原文；oldText 那条老路一字未改，向后兼容。
      */
-    async function mutate({ action, target = 'project', content = '', oldText = '', id = '', importance = 'normal', entities = [], tags = [], tier = '', source = null } = {}) {
+    async function mutate({ action, target = 'project', content = '', oldText = '', id = '', importance = 'normal', entities = [], tags = [], tier = '', source = null, scope = '' } = {}) {
         const act = asText(action);
         if (!['add', 'replace', 'remove'].includes(act)) throw new Error(`记忆动作只支持 add / replace / remove，收到「${act}」。`);
         // 层开关是「不再读 / 不再写」，不是「只读」：关掉热记忆之后还能 add，
@@ -2192,6 +2807,7 @@ export function createMemory({ root, memory = {} }) {
         if (!layers.hot) throw new Error('热记忆层已在设置里关掉（memory.layers.hot），本次没有写入。要写入请先把它打开；已有条目不会被删除。');
         const realTarget = asText(target);
         if (!MEMORY_TARGETS.includes(realTarget)) throw new Error(`记忆目标只支持 user / project，收到「${realTarget}」。`);
+        const explicitStore = explicitStoreOf(scope);
         const wanted = asText(content);
         const needle = asText(oldText);
         const wantedId = asText(id);
@@ -2235,7 +2851,7 @@ export function createMemory({ root, memory = {} }) {
             }
             await assertRefsTrusted(givenRefs);
         }
-        const store = storeFor(realTarget);
+        const store = explicitStore ?? storeFor(realTarget);
 
         // **锁全部根**，不只是被请求的那个：跨根命中时真正被写的是另一个根的条目与边，
         // 只锁一侧等于没锁（审查实测：跨根并发会造出悬空引用、静默丢写与 rename EPERM）。
@@ -2255,7 +2871,7 @@ export function createMemory({ root, memory = {} }) {
             // 内容没变（静默假回执）。这是本轮之前就存在的缺陷，随「按 id 跨根改删」一起修掉。
             let ownerEntries = entries;
             let matched = act === 'add' ? [] : hitsOf(entries);
-            if (act !== 'add' && matched.length === 0) {
+            if (act !== 'add' && matched.length === 0 && explicitStore === null) {
                 for (const other of stores) {
                     if (other.id === store.id) continue;
                     const candidate = await loadStore(other.paths);
@@ -2276,9 +2892,12 @@ export function createMemory({ root, memory = {} }) {
                 entries.push(touched);
             } else {
                 if (matched.length === 0) {
-                    throw new Error(wantedId !== ''
+                    const where = explicitStore === null
+                        ? ''
+                        : `（本次只找${explicitStore.id === 'global' ? '全局' : '工作区'}根，未跨根兜底）`;
+                    throw new Error((wantedId !== ''
                         ? `热记忆里没有 id 为「${wantedId}」的条目。id 是 read 行首那个（m-…）；台账与归档条目不能改（归档只读）。`
-                        : `没有哪条记忆包含「${truncate(needle, 60)}」。先用 action:'read' 看现在的条目。`);
+                        : `没有哪条记忆包含「${truncate(needle, 60)}」。先用 action:'read' 看现在的条目。`) + where);
                 }
                 if (matched.length > 1) {
                     // 改和删都要求唯一命中：命中多条时按顺序取第一条，可能改错或删错的是
@@ -2395,6 +3014,9 @@ export function createMemory({ root, memory = {} }) {
         const store = defaultStore();
 
         return withQueue(store.paths.dir, async () => {
+            // 台账侧的质量门（P1-4b 的后半句）**不在这里判**：档位是可变的、块是会删的，
+            // 所以在 `log` 那一刻算出来的标记会变成一份「当时如此」的快照。判据放在读侧
+            // （`ledgerTrustOf` 在 `read` 的台账分支里现算），这里只负责把行登记下来。
             await appendLedger(store.paths, clean);
             const all = await loadLedger(store.paths);
             const limit = Math.max(1, config.ledgerLimit);
@@ -2555,24 +3177,78 @@ export function createMemory({ root, memory = {} }) {
     // kb 不进 `read` 的三层额度：那是「带问题查资料」的机械，读整块有自己的额度
     // （KB_READ_CHARS），检索命中只给预览（KB_HIT_PREVIEW）与次数配额（kbSearchPerTurn）。
 
-    /** 工作目录内的相对路径（绝对路径与越界都拒绝）。 */
-    function relativeInside(rawPath) {
+    /** 工作目录内的相对路径（绝对路径与越界都拒绝）。root 只给内部临时源用。 */
+    function relativeInside(rawPath, root = base) {
         const given = asText(rawPath);
         if (given === '') throw new Error('需要 path（相对会话工作目录的文档路径）。');
-        const absolute = isAbsolute(given) ? given : join(base, given);
-        const rel = relative(base, absolute);
+        const absolute = isAbsolute(given) ? given : join(root, given);
+        const rel = relative(root, absolute);
         if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
             throw new Error(`path 要在会话工作目录里面：「${given}」指向目录之外，没有入库。`);
         }
         return rel.split(sep).join(posix.sep);
     }
 
-    /** 跨根的全部 manifest 行（带 origin）。 */
-    async function kbRows() {
+    /**
+     * 归档条目在知识库里的投影（第八十四轮）。
+     *
+     * 归档不再单独占一个页签：它变成知识库里的一棵「归档」文件夹，按月份分层。
+     * 这些行**不进 manifest**（归档真源仍是 archive/*.jsonl，删 Knowledge doc 不能
+     * 影响归档），由 harvestArchive 现算；只读，不参与 kbDrop / 清边。
+     */
+    async function kbArchiveRows() {
+        if (!layers.archive) return [];
         const rows = [];
         for (const store of stores) {
-            for (const row of await loadKbManifest(store.paths.kb)) rows.push({ ...row, origin: store.id });
+            const scope = store.paths.archiveScope;
+            // 没有命名空间的根（默认工作区 / 显式 owner / 独立全局层）继续用旧路径
+            // 与旧 docHash；只有真正共用、碰撞的根才改成带身份的命名空间。
+            const compat = scope === undefined || scope.writeNamespaced !== true;
+            let harvested;
+            try {
+                harvested = await harvestArchive(store.paths, store.id);
+            } catch {
+                continue; // 归档索引坏了不该让整棵知识库树消失。
+            }
+            const seen = new Set();
+            for (const item of asArray(harvested.items)) {
+                const text = archiveSearchText(item).trim();
+                if (text === '') continue;
+                const key = asText(item.id) || `${asText(item.blockId)}:${text}`;
+                const hash = compat
+                    ? 'a' + sha1(`${store.id}:${key}`).slice(0, 12)
+                    : archiveDocHash(scope, key);
+                if (seen.has(hash)) continue;
+                seen.add(hash);
+                const month = asText(item.month) || monthOf(item.blockAt || item.at);
+                const folder = normalizeKbFolder(compat ? `归档/${month}` : kbArchiveFolder(scope, month));
+                const title = truncate(archiveItemText(item) || item.id || '归档条目', 60);
+                rows.push({
+                    id: `kb:${hash}`,
+                    path: `${folder}/${hash}.md`,
+                    folder,
+                    hash,
+                    title,
+                    bytes: byteLength(text),
+                    chars: text.length,
+                    chunks: 1,
+                    tier: 'user',
+                    at: asText(item.at) || asText(item.blockAt),
+                    origin: store.id,
+                    synthetic: true,
+                    archiveId: asText(item.id),
+                    text,
+                });
+            }
         }
+        return rows;
+    }
+
+    /** 单库的全部 manifest 行，外加归档条目在知识库里的只读投影（第八十八轮）。 */
+    async function kbRows() {
+        const rows = [];
+        for (const row of await loadKbManifest(kbStore.paths.kb)) rows.push({ ...row, origin: 'kb' });
+        for (const row of await kbArchiveRows()) rows.push(row);
         return rows;
     }
 
@@ -2586,8 +3262,573 @@ export function createMemory({ root, memory = {} }) {
      * （它按内容寻址，同一份内容本来就是同一批块）。
      */
     function kbLookupStores() {
-        const primary = defaultStore();
-        return [primary, ...stores.filter((store) => store.id !== primary.id)];
+        return [kbStore];
+    }
+
+    /** 全局索引的落点：单库目录（`memory.kbDir`，或默认的 `.office/kb`）。 */
+    function kbDbDir() {
+        return kbStore.paths.kb.dir;
+    }
+
+    /**
+     * 打开索引做一件事，结束后一定关掉。sqlite 不可用时返回 null 而不是抛错 ——
+     * 索引是可重建的加速层，它缺席不该让记忆面板整页变红。
+     */
+    async function withKbDb(fn) {
+        const handle = await openKbDb({ dir: kbDbDir() });
+        if (handle.ok !== true) return null;
+        try {
+            return await fn(handle);
+        } finally {
+            try { handle.close(); } catch { /* 关不掉也没有更好的处理 */ }
+        }
+    }
+
+    /** 把各根的 manifest 增量同步进全局索引（索引是投影，manifest 仍是真源）。 */
+    async function syncKbIndex(handle) {
+        const report = [];
+        const rows = await loadKbManifest(kbStore.paths.kb);
+        const result = await handle.syncDocuments(rows, {
+            origin: 'kb',
+            loadChunks: async (row) => await loadKbChunks(kbStore.paths.kb, row.hash, row.chunks),
+        });
+        report.push({ origin: 'kb', ...result });
+        return report;
+    }
+
+    /**
+     * 补缺的向量：只给没有 embedding 的块算，批量走配置里的 embedding 通道。
+     *
+     * `maxEmbed` 是**一次检索的补嵌入预算**（第一百零三轮）：本地推理比远端慢一个
+     * 数量级，一次检索把几千块全补完会把这次调用卡死几十秒。超出预算的块留着下次，
+     * `pending` 报还剩多少 —— 不是失败，只是「这次还没补到」。
+     */
+    async function ensureKbEmbeddings(handle, chunkIds, options = {}) {
+        const embeddingConfig = options.config !== null && typeof options.config === 'object' ? options.config : config.embedding;
+        const strict = options.strict === true;
+        const maxEmbed = Number.isFinite(options.maxEmbed) ? Math.max(0, Math.trunc(options.maxEmbed)) : Number.POSITIVE_INFINITY;
+        const ids = [...new Set((Array.isArray(chunkIds) ? chunkIds : []).filter((id) => asText(id) !== ''))];
+        const missing = [];
+        for (const id of ids) {
+            if (handle.embeddingFor(id) === null) missing.push(id);
+        }
+        const pending = Math.max(0, missing.length - maxEmbed);
+        const todo = Number.isFinite(maxEmbed) ? missing.slice(0, maxEmbed) : missing;
+        if (todo.length === 0) {
+            return { ok: true, embedded: 0, mode: embeddingConfig.mode, degraded: false, error: '', pending };
+        }
+        let embedded = 0;
+        let mode = embeddingConfig.mode;
+        let degraded = false;
+        let lastError = '';
+        const batchSize = Math.max(1, embeddingConfig.batchSize);
+        for (let at = 0; at < todo.length; at += batchSize) {
+            const batch = todo.slice(at, at + batchSize);
+            const marks = batch.map(() => '?').join(', ');
+            const rows = handle.db.prepare('SELECT id, text FROM chunks WHERE id IN (' + marks + ')').all(...batch);
+            const textOf = new Map(rows.map((row) => [String(row.id), String(row.text ?? '')]));
+            const texts = batch.map((id) => textOf.get(id) ?? '');
+            if (texts.every((text) => text === '')) continue;
+            // strict：远端/本机推理失败时不要偷偷把哈希向量写进缓存，否则下一轮
+            // 远端恢复后会读到「模型字段是远端、向量其实是哈希」的旧行。
+            const result = await embedTexts({ texts, config: embeddingConfig, strict });
+            mode = result.mode;
+            degraded = result.degraded === true;
+            if (!result.ok) {
+                lastError = result.error;
+                break;
+            }
+            handle.upsertEmbeddings({
+                items: batch.map((id, index) => ({
+                    chunkId: id,
+                    vector: result.vectors[index],
+                    model: result.model,
+                })),
+            });
+            embedded += batch.length;
+        }
+        return { ok: lastError === '', embedded, mode, degraded, error: lastError, pending };
+    }
+
+    /**
+     * 摘要 id 的两种写法：文档 id `summary:<摘要 id>`、块 id `summary:<摘要 id>:1`。
+     *
+     * 两种都要试，且**不能先剥尾号再查**：AI 摘要的 id 本身形如
+     * `kbllm:<docHash>:<块号>`（第九十二轮），先剥尾号会把真实 id 截断，
+     * 于是 `summary:kbllm:…:3` 查不到自己的摘要。返回候选列表，由调用方按
+     * 「完整 id 优先、再退回去掉块号的写法」依次查。
+     */
+    function summaryIdOf(value) {
+        const wanted = asText(value);
+        const prefix = 'summary:';
+        if (!wanted.startsWith(prefix)) return [];
+        const rest = wanted.slice(prefix.length);
+        if (rest === '') return [];
+        const ids = [rest];
+        const trailing = /:\d+$/.exec(rest);
+        if (trailing !== null && trailing.index > 0) ids.push(rest.slice(0, trailing.index));
+        return ids;
+    }
+
+    /**
+     * 摘要命中 → 合成块。摘要不落 chunks 表，所以形状在这里现拼：一块、正文就是摘要，
+     * docId 用 `summary:` 前缀与真实文档分开（kb-read / kb-doc 认这个前缀）。
+     */
+    function summaryHitOf(row) {
+        const id = `summary:${asText(row.id)}`;
+        const text = asText(row.text);
+        const title = asText(row.title) || '块摘要';
+        const chunkIds = Array.isArray(row.chunkIds) ? row.chunkIds.map((item) => asText(item)) : [];
+        return {
+            chunkId: `${id}:1`,
+            docId: id,
+            n: 1,
+            text,
+            head: `# ${title}`,
+            folder: asText(row.folder),
+            path: `摘要/${asText(row.id)}.md`,
+            title,
+            origin: asText(row.origin),
+            tier: asText(row.tier),
+            at: asText(row.createdAt),
+            start: 1,
+            end: text.length,
+            score: Number(row.score) || 0,
+            summaryOf: chunkIds,
+        };
+    }
+
+    /** 纯词法检索的候选形状（kbRankChunks 要 id / span / text / head）。 */
+    function summaryCandidateOf(hit) {
+        return {
+            id: hit.chunkId,
+            docId: hit.docId,
+            path: hit.path,
+            title: hit.title,
+            tier: hit.tier,
+            at: hit.at,
+            origin: hit.origin,
+            n: 1,
+            span: { start: 1, end: hit.text.length },
+            text: hit.text,
+            head: hit.head,
+            summaryOf: hit.summaryOf,
+            synthetic: true,
+        };
+    }
+
+    async function summaryHitsFor(query, filters, scope = null) {
+        const rows = await withKbDb(async (handle) => handle.searchSummaries({ query, limit: 20, filters }));
+        if (!Array.isArray(rows)) return [];
+        // 摘要正文的来源块可能在别的文件夹里：受限会话下逐条核来源，越界的不进候选
+        // （否则预览与 kb-read 都会把范围外内容带出来）。
+        const visible = [];
+        for (const row of rows) {
+            if (await summarySourcesVisible(scope, row.chunkIds)) visible.push(summaryHitOf(row));
+        }
+        return visible;
+    }
+
+    /**
+     * 摘要的来源块清单（给面板显示「摘要 ↔ 块」的关系用）。
+     *
+     * 只带定位信息，不带正文：正文由调用方按块另读。来源块已经不在了的（文档被删 /
+     * 内容变了）不在列表里，用 missing 计数说清差额，别让人以为摘要凭空少了几块。
+     */
+    function summarySourcesOf(chunkIds, sources) {
+        const list = (Array.isArray(sources) ? sources : []).map((row) => ({
+            id: String(row.id ?? ''),
+            docId: String(row.docId ?? ''),
+            docPath: String(row.docPath ?? ''),
+            docTitle: String(row.docTitle ?? ''),
+            n: Number(row.n) || 0,
+            head: String(row.head ?? ''),
+            chars: Number(row.chars) || 0,
+            spanText: row.start === null || row.end === null || row.start === undefined
+                ? ''
+                : `字符 ${String(row.start)}–${String(row.end)}`,
+        }));
+        const wanted = Array.isArray(chunkIds) ? chunkIds.length : 0;
+        return { sources: list, sourcesMissing: Math.max(0, wanted - list.length) };
+    }
+
+    /** 摘要的 kb-read 形状：只有一块，正文就是摘要。 */
+    function summaryReadOf(summary, sources = []) {
+        const hit = summaryHitOf(summary);
+        return {
+            action: 'kb-read',
+            docId: hit.docId,
+            path: hit.path,
+            folder: hit.folder,
+            title: hit.title,
+            tier: hit.tier,
+            at: hit.at,
+            origin: hit.origin,
+            chunks: [{
+                id: hit.chunkId,
+                n: 1,
+                text: hit.text,
+                span: { start: 1, end: hit.text.length },
+                outline: [hit.title],
+                path: hit.path,
+                tier: hit.tier,
+                at: hit.at,
+                header: hit.head,
+                spanText: `字符 1–${hit.text.length}`,
+            }],
+            chunks_total: 1,
+            chunks_missing: 0,
+            total: 1,
+            truncated: false,
+            budgetChars: KB_READ_CHARS,
+            summaryOf: hit.summaryOf,
+            ...summarySourcesOf(hit.summaryOf, sources),
+            synthetic: true,
+        };
+    }
+
+    /** 摘要的 kb-doc 形状（面板看块清单 / 回填正文用；摘要不可改，synthetic 挡住「改正文」）。 */
+    function summaryDocOf(summary, sources = []) {
+        const hit = summaryHitOf(summary);
+        return {
+            action: 'kb-doc',
+            docId: hit.docId,
+            path: hit.path,
+            folder: hit.folder,
+            title: hit.title,
+            tier: hit.tier,
+            at: hit.at,
+            origin: hit.origin,
+            selectedChunk: 0,
+            text: hit.text,
+            chunks: [{
+                id: hit.chunkId,
+                n: 1,
+                chars: hit.text.length,
+                span: { start: 1, end: hit.text.length },
+                spanText: `字符 1–${hit.text.length}`,
+                outline: [hit.title],
+                header: hit.head,
+            }],
+            chunks_total: 1,
+            chunks_missing: 0,
+            total: 1,
+            summaryOf: hit.summaryOf,
+            ...summarySourcesOf(hit.summaryOf, sources),
+            synthetic: true,
+        };
+    }
+
+    /** 把向量候选与词法候选按权重融合；分数都先归一化，不然 BM25 的量纲会压死余弦。 */
+    function fuseKbHits(lexicalHits, vectorHits, weights) {
+        const lexical = Array.isArray(lexicalHits) ? lexicalHits : [];
+        const vector = Array.isArray(vectorHits) ? vectorHits : [];
+        const maxLex = lexical.reduce((max, hit) => Math.max(max, Math.abs(Number(hit.score) || 0)), 0) || 1;
+        const maxVec = vector.reduce((max, hit) => Math.max(max, Number(hit.score) || 0), 0) || 1;
+        const fused = new Map();
+        const put = (hit, score) => {
+            const id = asText(hit.chunkId);
+            if (id === '') return;
+            const before = fused.get(id);
+            if (before === undefined) {
+                fused.set(id, { ...hit, score, lexical: 0, vector: 0 });
+            } else {
+                before.score += score;
+            }
+        };
+        for (const hit of lexical) {
+            const score = weights.lexicalWeight * (Math.abs(Number(hit.score) || 0) / maxLex);
+            put(hit, score);
+            fused.get(asText(hit.chunkId)).lexical = Math.abs(Number(hit.score) || 0);
+        }
+        for (const hit of vector) {
+            const score = weights.vectorWeight * (Number(hit.score) || 0) / maxVec;
+            put(hit, score);
+            fused.get(asText(hit.chunkId)).vector = Number(hit.score) || 0;
+        }
+        return [...fused.values()].sort((left, right) => (right.score - left.score) || String(left.chunkId).localeCompare(String(right.chunkId)));
+    }
+
+    /**
+     * 向量 + 词法混合检索（第八十五轮）。只在**配置了远端 embedding（或显式 local）**时启用：
+     * 没有真实语义向量时，本地哈希向量与词法高度重合，拿它做召回只会把「弃答」变松。
+     */
+    async function hybridKbSearch({ query, limit, tier, path, origin, folder, recursive, exact = false, scope = null, diagnostics = null }) {
+        // 先按「通道」定实际走哪条路（第一百零四轮）：以前只判断 localEnabled，
+        // 结果 mode:'off' 也会起本地进程、mode:'remote' 会被本地抢占。现在
+        // off → 纯词法；local → 本地推理，没开才用本地哈希；remote → 只走远端；
+        // auto → 本地推理优先，其次远端，都没有就纯词法。
+        //
+        // 第一百零三轮：本地推理按需拉起本机服务，当成远端通道用（同一套
+        // OpenAI 兼容 /v1/embeddings，向量化逻辑不重复实现）。起不来就**明确
+        // 退回词法检索**：缺什么写进 diagnostics，由 kbSearch 附在词法结果上 ——
+        // 不能静默当成「没有向量」。
+        const localConfig = normalizeLocalEmbeddingConfig(config.embedding.local);
+        const route = embeddingRouteOf({
+            mode: config.embedding.mode,
+            localEnabled: localConfig.enabled,
+            remoteReady: canUseRemoteEmbedding(config.embedding),
+        });
+        if (route === 'off' || route === 'none') return null;
+        let localInfo = null;
+        let embeddingConfig = config.embedding;
+        if (route === 'local') {
+            // 只等 2 秒：冷启动实测 45–120 秒，检索不能跟着卡住。等不到就让进程在后台
+            // 继续起，这一次明确退回词法并说「正在启动」，下次检索多半就能用上向量。
+            localInfo = await ensureLocalEmbedding({ config: localConfig, kbDir: kbDbDir(), waitMs: 2000 });
+            if (!localInfo.ok) {
+                if (diagnostics !== null && typeof diagnostics === 'object') {
+                    diagnostics.embedding = {
+                        mode: 'local',
+                        model: LOCAL_EMBEDDING_MODEL,
+                        degraded: localInfo.starting !== true,
+                        starting: localInfo.starting === true,
+                        error: localInfo.error,
+                        local: localEmbeddingStatus(),
+                    };
+                }
+                return null;
+            }
+            embeddingConfig = {
+                ...config.embedding,
+                // 服务本身就是「OpenAI 兼容端点」：把 mode 归到 remote，才能让
+                // embedTexts 走远端那条路（而不是又落回本地哈希向量）。
+                mode: 'remote',
+                baseURL: localInfo.baseURL,
+                model: localInfo.model,
+                apiKey: '',
+                apiKeyEnv: '',
+                dimensions: localInfo.dim || 0,
+            };
+        }
+        const remote = canUseRemoteEmbedding(embeddingConfig);
+        // local-hash 是唯一允许「没有远端端点」的路径；其余走到这里 remote 必须为真。
+        if (route !== 'local-hash' && !remote) return null;
+        const wantedPath = asText(path) === '' ? '' : relativeInside(path);
+        const filters = {
+            origin: origin === 'global' || origin === 'workspace' ? origin : '',
+            tier: asText(tier),
+            docId: wantedPath === '' ? '' : docIdOf(wantedPath),
+            folder: normalizeKbFolder(folder),
+            recursive: recursive !== false,
+            exact: exact === true,
+        };
+        return withKbDb(async (handle) => {
+            await syncKbIndex(handle);
+            const candidateLimit = Math.max(5, config.hybrid.candidateLimit);
+            // 摘要块不是 chunks，单独查一层再并入词法候选；否则生成得了、检索不到。
+            // 摘要正文的来源块可能在会话范围外：这里与词法路径用同一条核验。
+            const summaryHits = [];
+            for (const row of handle.searchSummaries({ query, limit: candidateLimit, filters })) {
+                if (await summarySourcesVisible(scope, row.chunkIds)) summaryHits.push(summaryHitOf(row));
+            }
+            const lexicalHits = [...summaryHits, ...handle.searchLexical({ query, limit: candidateLimit, filters })];
+            // 只有显式 local-hash 才接受「没有真向量也继续」；remote / local 推理失败
+            // 一律退回词法（返回 null），不拿哈希向量冒充语义召回。
+            const strictEmbed = route !== 'local-hash';
+            const queryVector = await embedTexts({ texts: [query], config: embeddingConfig, strict: strictEmbed });
+            if (!queryVector.ok) return null;
+            const chunkIds = handle.allChunkIds({ filters }).slice(0, 2000);
+            // 补嵌入预算：本机推理一次检索最多补 64 块；远端通道放宽到 512（它快得多，
+            // 但仍比「一次补完几千块」可控）。没补到的块这一轮不参与向量召回。
+            const embedInfo = await ensureKbEmbeddings(handle, chunkIds, {
+                config: embeddingConfig,
+                strict: strictEmbed,
+                maxEmbed: localInfo === null ? 512 : 64,
+            });
+            const vectorHits = handle.searchVector({ vector: queryVector.vectors[0], limit: candidateLimit, filters, ann: config.ann });
+            const embeddingMeta = {
+                mode: localInfo === null ? embedInfo.mode : 'local',
+                model: queryVector.model,
+                degraded: embedInfo.degraded === true,
+                ...(localInfo === null ? {} : { local: localEmbeddingStatus() }),
+            };
+            let fused = fuseKbHits(lexicalHits, vectorHits, config.hybrid);
+            // 没有真实远端通道时，向量只能给词法命中加权，不能单独把「弃答」翻成命中。
+            if (fused.length === 0 || (lexicalHits.length === 0 && !remote)) {
+                return {
+                    action: 'kb-search', query, folder: filters.folder, recursive: filters.recursive,
+                    hits: [], matched: 0, truncated: false, reason: 'no-overlap', docs: 0, docsRead: 0,
+                    bounded: false, chunks: 0, chunksMissing: 0, budgetChars: KB_HIT_PREVIEW,
+                    maxChunks: KB_SEARCH_CHUNKS, engine: 'sqlite-hybrid',
+                    weights: { lexical: config.hybrid.lexicalWeight, vector: config.hybrid.vectorWeight },
+                    embedding: embeddingMeta,
+                    selector: { mode: config.selector.mode, applied: false, selected: 0 },
+                };
+            }
+            // 远端语义召回要过一道相似度门槛，避免「最像的那块」硬凑成命中。
+            if (lexicalHits.length === 0 && (fused[0].vector || 0) < 0.25) {
+                return {
+                    action: 'kb-search', query, folder: filters.folder, recursive: filters.recursive,
+                    hits: [], matched: 0, truncated: false, reason: 'no-overlap', docs: 0, docsRead: 0,
+                    bounded: false, chunks: 0, chunksMissing: 0, budgetChars: KB_HIT_PREVIEW,
+                    maxChunks: KB_SEARCH_CHUNKS, engine: 'sqlite-hybrid',
+                    weights: { lexical: config.hybrid.lexicalWeight, vector: config.hybrid.vectorWeight },
+                    embedding: embeddingMeta,
+                    selector: { mode: config.selector.mode, applied: false, selected: 0 },
+                };
+            }
+            // 候选筛选（第一百零三轮替代重排）：只把「编号 + 块头前 headChars 字」发给
+            // 侧路模型，只让它回编号；主上下文只拿被选中的那几块。失败/超时/未配置/回垃圾
+            // 编号都**原样返回融合结果**，检索不因此变少。
+            let selectorApplied = false;
+            let selectedCount = 0;
+            const selectorConfig = normalizeSelectorConfig(config.selector);
+            if (canUseSelector(selectorConfig) && fused.length > 1) {
+                const candidates = fused.slice(0, selectorConfig.maxCandidates);
+                const picked = await selectWithLlm({ query, hits: candidates, config: selectorConfig, env: process.env });
+                if (picked.ok && picked.ids.length > 0) {
+                    const wanted = new Set(picked.ids);
+                    // 按**原融合顺序**过滤，不按模型给出的顺序重排：模型只做粗筛。
+                    const kept = candidates.filter((hit) => wanted.has(hit.chunkId)).slice(0, selectorConfig.maxSelected);
+                    if (kept.length > 0) {
+                        fused = kept;
+                        selectorApplied = true;
+                        selectedCount = kept.length;
+                    }
+                }
+            }
+            const cap = limitOf(limit, KB_LIST_LIMIT, KB_SEARCH_LIMIT);
+            const hits = fused.slice(0, cap).map((hit) => ({
+                chunkId: hit.chunkId, docId: hit.docId, path: hit.path, title: hit.title,
+                tier: hit.tier, origin: hit.origin, n: hit.n, score: Math.round(hit.score * 10000) / 10000,
+                scoreText: hit.lexical ?? 0, scoreHead: 0, vector: hit.vector,
+                header: hit.head, spanText: hit.start === null || hit.end === null ? '' : spanText({ start: hit.start, end: hit.end }),
+                chars: hit.text.length, preview: truncate(hit.text, KB_HIT_PREVIEW),
+            }));
+            const docs = new Set(fused.map((hit) => hit.docId)).size;
+            return {
+                action: 'kb-search', query, folder: filters.folder, recursive: filters.recursive,
+                hits, matched: fused.length, truncated: fused.length > hits.length,
+                reason: fused.length > 0 ? 'hits' : 'no-overlap',
+                docs, docsRead: docs, bounded: false, chunks: fused.length, chunksMissing: 0,
+                budgetChars: KB_HIT_PREVIEW, maxChunks: KB_SEARCH_CHUNKS, engine: 'sqlite-hybrid',
+                weights: { lexical: config.hybrid.lexicalWeight, vector: config.hybrid.vectorWeight },
+                embedding: embeddingMeta,
+                selector: { mode: config.selector.mode, applied: selectorApplied, selected: selectedCount },
+            };
+        });
+    }
+
+    /** 块间建边：两端都必须在索引里真实存在，否则又是悬空边。 */
+    async function kbLink({ sourceId = '', targetId = '', kind = 'related', note = '', sessionScope = null } = {}) {
+        const source = asText(sourceId);
+        const target = asText(targetId);
+        if (source === '' || target === '') throw new Error('kb-link 需要 sourceId 与 targetId。');
+        if (source === target) throw new Error('不能把一块连到它自己。');
+        const result = await withKbDb(async (handle) => {
+            await syncKbIndex(handle);
+            const exists = handle.db.prepare('SELECT id FROM chunks WHERE id = ? LIMIT 1');
+            if (exists.get(source) === undefined || exists.get(target) === undefined) {
+                throw new Error('块不在索引里：先 kb-ingest 入库，再建块间关系。');
+            }
+            // 关联也是写：两端都必须落在会话范围里，不能借 link 把范围外的块牵进来。
+            if (sessionScope !== null) {
+                const folderOf = handle.db.prepare('SELECT d.folder AS folder FROM chunks c JOIN docs d ON d.id = c.doc_id WHERE c.id = ? LIMIT 1');
+                for (const id of [source, target]) {
+                    const row = folderOf.get(id);
+                    assertScope(sessionScope, row === undefined ? '' : String(row.folder ?? ''));
+                }
+            }
+            return handle.link({ sourceId: source, targetId: target, kind, note });
+        });
+        if (result === null) throw new Error('本机没有可用的 sqlite，块间关系暂时建不了。');
+        return { action: 'kb-link', ...result };
+    }
+
+    async function kbUnlink({ sourceId = '', targetId = '', kind = '' } = {}) {
+        const result = await withKbDb(async (handle) => {
+            await syncKbIndex(handle);
+            return handle.unlink({ sourceId: asText(sourceId), targetId: asText(targetId), kind: asText(kind) });
+        });
+        if (result === null) throw new Error('本机没有可用的 sqlite，块间关系暂时改不了。');
+        return { action: 'kb-unlink', ...result };
+    }
+
+    async function kbRelated({ chunkId = '', depth = 1, limit = 20, sessionScope = null } = {}) {
+        const result = await withKbDb(async (handle) => {
+            await syncKbIndex(handle);
+            if (sessionScope !== null) {
+                const startRow = handle.db.prepare('SELECT d.folder AS folder FROM chunks c JOIN docs d ON d.id = c.doc_id WHERE c.id = ? LIMIT 1')
+                    .get(asText(chunkId));
+                if (startRow !== undefined) assertScope(sessionScope, String(startRow.folder ?? ''));
+            }
+            // 邻接结果里范围外的块不返回：它们对这次调用等于不存在。
+            return handle.related({ chunkId: asText(chunkId), depth, limit })
+                .filter((item) => scopeAllows(sessionScope, item.folder));
+        });
+        if (result === null) throw new Error('本机没有可用的 sqlite，块间关系暂时查不了。');
+        return { action: 'kb-related', chunkId: asText(chunkId), items: result, total: result.length };
+    }
+
+    async function kbSummarize({ title = '', text = '', chunkIds = [], docId = '', sessionScope = null } = {}) {
+        const body = asText(text);
+        if (body === '') throw new Error('kb-summarize 需要 text（摘要正文）。');
+        const ids = (Array.isArray(chunkIds) ? chunkIds : []).map((id) => asText(id)).filter((id) => id !== '');
+        if (ids.length === 0) throw new Error('kb-summarize 需要 chunkIds（哪些块合成的摘要）。');
+        const result = await withKbDb(async (handle) => {
+            await syncKbIndex(handle);
+            const known = new Set(handle.allChunkIds({ filters: {} }));
+            for (const id of ids) if (!known.has(id)) throw new Error('摘要来源块不在索引里：' + id);
+            const wantedDoc = asText(docId);
+            let targetDoc = wantedDoc;
+            if (targetDoc === '') {
+                const row = handle.db.prepare('SELECT doc_id FROM chunks WHERE id = ? LIMIT 1').get(ids[0]);
+                targetDoc = row === undefined ? '' : String(row.doc_id);
+            }
+            // 摘要会作为块参与检索：来源块与目标文档都在范围内才允许生成，
+            // 否则等于把范围外的内容转一手带进可见集。
+            if (sessionScope !== null) {
+                const folderOfDoc = handle.db.prepare('SELECT folder FROM docs WHERE id = ? LIMIT 1');
+                for (const id of ids) {
+                    const row = handle.db.prepare('SELECT d.folder AS folder FROM chunks c JOIN docs d ON d.id = c.doc_id WHERE c.id = ? LIMIT 1').get(id);
+                    assertScope(sessionScope, row === undefined ? '' : String(row.folder ?? ''));
+                }
+                const docRow = folderOfDoc.get(targetDoc);
+                assertScope(sessionScope, docRow === undefined ? '' : String(docRow.folder ?? ''));
+            }
+            return handle.saveSummary({ title: asText(title) || '块摘要', text: body, docId: targetDoc, chunkIds: ids });
+        });
+        if (result === null) throw new Error('本机没有可用的 sqlite，摘要暂时存不了。');
+        return { action: 'kb-summarize', ...result, chunkIds: ids };
+    }
+
+    // 摘要块分页：总数与当页分开取。会话范围过滤只能在取回后做（文件夹可见性不在 SQL
+    // 里），所以有 sessionScope 时扫描上限（200，与 kb-db 的 MAX_LIMIT 一致）内过滤再切片。
+    async function summaryPageOf(handle, { limit = 50, offset = 0, sessionScope = null } = {}) {
+        await syncKbIndex(handle);
+        if (sessionScope === null) {
+            return {
+                items: handle.listSummaries({ limit, offset }),
+                total: handle.countSummaries(),
+            };
+        }
+        const all = handle.listSummaries({ limit: 200, offset: 0 });
+        // listSummaries 只给 docId：按 docId 现查文档文件夹，范围外的不列出。
+        // 来源块也核一遍：标题 / 摘要元数据同样不该跨文件夹回显。
+        const folderOf = handle.db.prepare('SELECT folder FROM docs WHERE id = ? LIMIT 1');
+        const visible = [];
+        for (const item of all) {
+            const row = folderOf.get(item.docId);
+            if (!scopeAllows(sessionScope, row === undefined ? '' : String(row.folder ?? ''))) continue;
+            if (!(await summarySourcesVisible(sessionScope, item.chunkIds))) continue;
+            visible.push(item);
+        }
+        const start = Math.max(0, Math.trunc(Number(offset)) || 0);
+        const size = Math.max(1, Math.trunc(Number(limit)) || 50);
+        return { items: visible.slice(start, start + size), total: visible.length };
+    }
+
+    async function kbSummaries({ limit = 50, offset = 0, sessionScope = null } = {}) {
+        const result = await withKbDb((handle) => summaryPageOf(handle, { limit, offset, sessionScope }));
+        if (result === null) return [];
+        return result.items;
+    }
+
+    async function kbSummariesCount({ sessionScope = null } = {}) {
+        const result = await withKbDb((handle) => summaryPageOf(handle, { limit: 1, offset: 0, sessionScope }));
+        if (result === null) return 0;
+        return result.total;
     }
 
     /**
@@ -2604,11 +3845,9 @@ export function createMemory({ root, memory = {} }) {
             if (asText(id) === '') return;
             map.set(id, map.has(id) ? strictestTier(map.get(id), tier) : kbTierOf(tier));
         };
-        for (const store of stores) {
-            for (const row of await loadKbManifest(store.paths.kb)) {
-                put(row.id, row.tier);
-                for (let n = 1; n <= row.chunks; n += 1) put(chunkIdOf(row.hash, n), row.tier);
-            }
+        for (const row of await loadKbManifest(kbStore.paths.kb)) {
+            put(row.id, row.tier);
+            for (let n = 1; n <= row.chunks; n += 1) put(chunkIdOf(row.hash, n), row.tier);
         }
         return map;
     }
@@ -2637,7 +3876,38 @@ export function createMemory({ root, memory = {} }) {
         }
     }
 
-    /** 一个根的 kb 计数：索引里的话直接读（`status` 的定位是「不读全文」），否则按 manifest 现算。 */    async function kbStatusOf(store) {
+    /**
+     * 给一批台账行算出「依据里有待核 / 找不到的引用」（P1-4b 的后半句）。
+     *
+     * 只标注、不拒绝：交付物用过哪块来源是**事实**，不是可以按档位删掉的字段。
+     * 两类各标各的 —— `untrustedRefs` 是单源未核实（档位为 unverified），
+     * `unknownRefs` 是库里根本找不到的 id（引用无法核对，与 `add` 门里的同一条判据）。
+     *
+     * **读时现算，不落盘**（独立复核 P1-2 的修法）：第五十四轮初版把这两个字段写在
+     * `log` 那一刻并落进 jsonl，于是标记是「登记时的快照」而读侧把它当当前事实印 ——
+     * 块从 unverified **升成** verified 之后仍印「⚠ 待核」，块从 user **降成** unverified
+     * 之后反而没有标记（同一块在 `add` / `replace` 里是会被硬规则拒的），块被删掉之后
+     * 也不报「找不到」。档位是可变的、块是会删的，所以判据只能在**读的那一刻**算。
+     * 副作用也一并对掉了：Pack 导入的历史台账行不会绕过标记。
+     */
+    async function ledgerTrustOf(records) {
+        const anyRefs = records.some((record) => asArray(record.kbRefs).length > 0);
+        if (!anyRefs) return new Map();
+        const tiers = await kbTierIndex();
+        const map = new Map();
+        for (const record of records) {
+            const refs = asArray(record.kbRefs);
+            if (refs.length === 0) continue;
+            const untrusted = refs.filter((ref) => tiers.get(ref) === 'unverified');
+            const unknown = refs.filter((ref) => !tiers.has(ref));
+            if (untrusted.length === 0 && unknown.length === 0) continue;
+            map.set(record, { untrusted, unknown });
+        }
+        return map;
+    }
+
+    /** 一个根的 kb 计数：索引里的话直接读（`status` 的定位是「不读全文」），否则按 manifest 现算。 */
+    async function kbStatusOf(store) {
         const index = await loadKbIndex(store.paths.kb);
         if (index !== null) return { ...index.counts, dir: relPath(base, store.paths.kb.dir) };
         const counts = kbCountsOf(await loadKbManifest(store.paths.kb));
@@ -2672,13 +3942,161 @@ export function createMemory({ root, memory = {} }) {
      * 同名的 `notes.md` 恰好就是同一个 id ——「同 id 就跳过」会把那个根正在用的块
      * 一起判死，于是边被清掉（跨根共用内容这条用例就是这么挖出来的）。
      */
-    async function kbLiveAcrossStores({ store: excludeStore, rows: replacedRows }) {
-        const rows = [];
-        for (const store of stores) {
-            const source = store.id === excludeStore.id ? replacedRows : await loadKbManifest(store.paths.kb);
-            for (const row of source) rows.push(row);
+    async function kbLiveAcrossStores({ store: _store, rows: replacedRows }) {
+        // 单库之后这里只需要「被操作的那一份换成新清单之后，库里还活着哪些 id」。
+        // 参数名保留 `rows` 是为了不改调用点的语义：它就是替换后的完整清单。
+        return kbLiveIdsOf(replacedRows);
+    }
+
+    /**
+     * 清扫孤儿块目录：`chunks/<docHash>/` 里**没有任何 manifest 行引用**的那几份。
+     *
+     * 为什么需要它（第五十六轮 S-03）：提交点前移之后，孤儿块是唯一会被崩溃留下的
+     * 残留物 —— 换代时新块先落盘、manifest 还没提交就崩了，那批新块就成了没人引用的
+     * 目录。孤儿块**不损坏任何东西**（manifest 是清单，没被引用就读不到），但它会一直
+     * 占着盘；用「按 manifest 现算」的清扫收掉它，比记一份「待删清单」稳（清单本身
+     * 也会过期）。
+     *
+     * 两条边界：
+     *   - 只扫**这个根自己**的块目录。块目录按根分开（`kbDirOf` 跟着记忆目录走），
+     *     另一个根的 manifest 不可能引用这里的目录 —— 所以只开一个根的会话不会误删。
+     *   - 只删**没被引用**的。另一份内容相同的文档还在用时，它的 hash 就在 manifest 里，
+     *     目录原样保留（跨根共用内容那条契约）。
+     */
+    async function sweepKbOrphanChunks(store) {
+        let names = [];
+        try {
+            names = await readdir(store.paths.kb.chunks);
+        } catch {
+            // 还没有块目录 = 没有孤儿。
+            return { removed: 0, failed: 0 };
         }
-        return kbLiveIdsOf(rows);
+        const live = new Set((await loadKbManifest(store.paths.kb)).map((row) => row.hash));
+        let removed = 0;
+        let failed = 0;
+        for (const name of names) {
+            if (live.has(name)) continue;
+            try {
+                await rm(join(store.paths.kb.chunks, name), { recursive: true, force: true });
+                removed += 1;
+            } catch {
+                // 删不掉就照实记数：这不是「已经清干净了」。
+                failed += 1;
+            }
+        }
+        return { removed, failed };
+    }
+
+    /**
+     * 写一条「提交后清理」的意图（`pending.json`）。
+     *
+     * 记的是**判据 + 待清 id**，不是「请重试整个入库」：`expectHash` 是这次动作**之前**
+     * 活着的那一版内容哈希，重放时拿它跟 manifest 对一下，就知道当时到底提交了没有。
+     */
+    async function writeKbPending(store, record) {
+        await writeAtomic(store.paths.kb.pending, `${JSON.stringify(record)}\n`);
+    }
+
+    /** 清掉意图日志（幂等：本来就没有也不报错）。 */
+    async function clearKbPending(store) {
+        await rm(store.paths.kb.pending, { force: true });
+    }
+
+    /**
+     * 执行一条清理意图：跨根清边 → 墓碑 → 删日志。**幂等**，所以可以重放。
+     *
+     * 为什么清边必须在提交之后：提交之前清，一旦后面失败，旧版本还活着而它的边已经没了
+     * —— 那是**无说明地丢关系**；提交之后清，中间崩掉留下的是「边指向已经不在 manifest 里的
+     * 块 id」，属于可诊断状态（`danglingRefs()` / `related().danglingCount` 都报得出来），
+     * 而且下一次 kb 写操作读到这份日志就会把它补完。两份代价都不为零，这里选**可诊断、
+     * 可重放**的那一份。
+     */
+    async function runKbCleanup(store, record) {
+        const dead = new Set(asArray(record?.dead).map((value) => asText(value)).filter((id) => id !== ''));
+        let prunedLinks = 0;
+        let tombstones = 0;
+        if (dead.size > 0) {
+            for (const item of stores) prunedLinks += await pruneLinks(item.paths, dead);
+            tombstones = await appendTombstones(store.paths, [...dead].map((id) => ({
+                id,
+                reason: asText(record?.reason) || 'kb-cleanup',
+            })));
+        }
+        await clearKbPending(store);
+        return { prunedLinks, tombstones };
+    }
+
+    /**
+     * 提交点之后的收尾：有意图就执行清理，没有就只扫一遍孤儿块。
+     *
+     * **收尾失败不许把已经提交的写操作报成失败**：manifest 已经落了，这次写就是发生了，
+     * 抛错只会让调用方以为「没成功」而重试（重试是幂等的，但回执是假的）。所以失败
+     * 如实写进回执（`cleanupPending` / `orphansFailed`），下次写操作读到日志补做 ——
+     * 「报得清楚」与「做完了」是两件事，不能拿其中一件冒充另一件。
+     */
+    async function finishKbWrite(store, journal) {
+        const out = { prunedLinks: 0, tombstones: 0, orphans: 0 };
+        try {
+            if (journal !== null) {
+                const cleanup = await runKbCleanup(store, journal);
+                out.prunedLinks = cleanup.prunedLinks;
+                out.tombstones = cleanup.tombstones;
+            }
+        } catch (error) {
+            out.cleanupPending = asText(error?.message) || '提交后清理未完成';
+        }
+        const orphans = await sweepKbOrphanChunks(store);
+        out.orphans = orphans.removed;
+        if (orphans.failed > 0) out.orphansFailed = orphans.failed;
+        return out;
+    }
+
+    /**
+     * 重放一个根上没做完的清理；没有日志就返回 null。
+     *
+     * 两种结局，都必须**照实**：
+     *   - manifest 里那一份**还是 `expectHash`** ⇒ 崩在提交之前，这次动作没有生效，
+     *     旧版本是完整的。此时**不许清边**（那些 id 还活着），只把提交前写进去的新块
+     *     当孤儿扫掉，然后丢掉日志。
+     *   - 已经变了 ⇒ 崩在提交之后，新版本是完整的，把记录下来的死 id 补清一遍。
+     */
+    async function replayKbPending(store) {
+        const record = await readJsonOrNull(store.paths.kb.pending);
+        if (record === null || typeof record !== 'object') return null;
+        const docId = asText(record.docId);
+        const expectHash = asText(record.expectHash);
+        const rows = await loadKbManifest(store.paths.kb);
+        // 两个判据取「或」：`expectGone` 是「OCR 覆盖旧笔记」这次要一并收掉的旧文档。
+        // 只要**任何一个**旧状态还在盘上，就说明崩在提交之前 —— 此时不许动边与墓碑
+        // （记录里的死 id 可能还活着），只收提交前写进去的孤儿块。
+        const expectGone = asText(record.expectGone);
+        const stillOld = (expectHash !== '' && rows.some((row) => row.id === docId && row.hash === expectHash))
+            || (expectGone !== '' && rows.some((row) => row.id === expectGone));
+        if (stillOld) {
+            const orphans = await sweepKbOrphanChunks(store);
+            await clearKbPending(store);
+            return {
+                origin: store.id, replayed: false, stage: 'pre-commit', docId,
+                op: asText(record.op), reason: '提交之前就中断了：旧版本完整，只收掉提交前写进去的孤儿块',
+                prunedLinks: 0, tombstones: 0, orphans: orphans.removed, orphansFailed: orphans.failed,
+            };
+        }
+        const cleanup = await runKbCleanup(store, record);
+        const orphans = await sweepKbOrphanChunks(store);
+        return {
+            origin: store.id, replayed: true, stage: 'post-commit', docId,
+            op: asText(record.op), reason: '提交之后中断的清理已补完',
+            prunedLinks: cleanup.prunedLinks, tombstones: cleanup.tombstones,
+            orphans: orphans.removed, orphansFailed: orphans.failed,
+        };
+    }
+
+    /** 扫一遍**所有打开的根**：任何一处有没做完的清理都在这一次写操作里补掉。 */
+    async function replayAllKbPending() {
+        const reports = [];
+        const report = await replayKbPending(kbStore);
+        if (report !== null) reports.push(report);
+        return reports;
     }
 
     /**
@@ -2689,73 +4107,378 @@ export function createMemory({ root, memory = {} }) {
      *     记的是相对路径）。所以源文件被删之后，kb 里剩下的仍是当时切出来的正文，
      *     但它不再是「那一份文件的当前版本」——`kb-read` 会如实带上入库时刻。
      *   - **同路径同内容 = 幂等**：内容哈希没变就直接回`unchanged`，一个字节不重写。
-     *   - **同路径新内容 = 换代**：旧块文件删掉、指向旧块的边同事务清掉、旧块 id 留墓碑；
-     *     文档 id（按路径寻址）不变，块 id（按内容寻址）换成新的。
+     *   - **同路径新内容 = 换代**：文档 id（按路径寻址）不变，块 id（按内容寻址）换成新的。
+     *     换代走两段式提交协议（第五十六轮 S-03）：`manifest.jsonl` + `index.json` 落盘
+     *     是提交点，提交之前不删旧字节；提交之后照 `pending.json` 清旧边 / 留墓碑 / 收旧块。
      */
-    async function kbIngest({ path = '', tier = '' } = {}) {
-        const relPosix = relativeInside(path);
-        const absolute = join(base, relPosix);
+    /** 把一次 kb-ingest 的 ai 参数折叠成 kb-llm 配置（纯函数，不调用模型）。 */
+    function kbLlmConfigFor({ ai = false, aiModel = '', aiChunking = null, aiSummary = null } = {}) {
+        const cfg = normalizeKbLlmConfig(config.llm);
+        if (ai !== true) return { ...cfg, mode: 'off' };
+        if (typeof aiChunking === 'boolean') cfg.chunking = aiChunking;
+        if (typeof aiSummary === 'boolean') cfg.summary = aiSummary;
+        const wanted = asText(aiModel);
+        if (wanted !== '') {
+            if (cfg.mode === 'host' && wanted.includes('/')) {
+                const cut = wanted.indexOf('/');
+                cfg.provider = wanted.slice(0, cut);
+                cfg.model = wanted.slice(cut + 1);
+            } else {
+                cfg.model = wanted;
+            }
+        }
+        return cfg;
+    }
+
+    /** 只开摘要时，把模型给的原文区间映射到确定性块，换成真实块 id。 */
+    function kbLlmSummariesOfSegments(segments, pieces, docHash) {
+        return mapSummariesToChunks({ segments, chunks: pieces }).map((bucket) => ({
+            title: bucket.title || '片段摘要',
+            text: bucket.text,
+            chunkIds: bucket.chunkIndexes.map((at) => chunkIdOf(docHash, pieces[at].n)),
+        }));
+    }
+
+    /** 摘要另存：先清这份文档的旧摘要，再逐条写（摘要绝不进块正文）。 */
+    async function saveKbSummaries(docId, payload) {
+        if (!Array.isArray(payload) || payload.length === 0) return 0;
+        const saved = await withKbDb(async (handle) => {
+            await syncKbIndex(handle);
+            handle.db.prepare('DELETE FROM summaries WHERE doc_id = ?').run(docId);
+            let count = 0;
+            for (const item of payload) {
+                if (asText(item.text) === '' || !Array.isArray(item.chunkIds) || item.chunkIds.length === 0) continue;
+                const row = await handle.saveSummary({
+                    ...(asText(item.id) === '' ? {} : { id: asText(item.id) }),
+                    title: asText(item.title) || '片段摘要',
+                    text: item.text,
+                    docId,
+                    chunkIds: item.chunkIds,
+                });
+                if (row !== null && row !== undefined) count += 1;
+            }
+            return count;
+        });
+        return saved ?? 0;
+    }
+    async function kbIngest({ path = '', tier = '', scope = '', folder = null, displayPath = '', sourceTitle = '', ai = false, aiModel = '', aiChunking = null, aiSummary = null, aiEstimate = false, aiResume = false, aiRunLimit = 0, sessionScope = null, sourceRoot = null, bodyText = null, ocr = false, onProgress = null } = {}) {
+        // 内部参数，不是工具/路由参数：上传通道把内容写在 OS 私有临时目录里，抽取时以它
+        // 为根（path 仍是相对该根的临时名）。公共契约没变 —— 只有 kbUpload 会传，
+        // 并且必须同时给 displayPath，临时文件名不会漏进 manifest。tools.js 逐字段
+        // 构造参数、路由也只转固定字段，外部没有任何入口能注入一个绝对路径。
+        if (sourceRoot !== null && sourceRoot !== undefined && !isAbsolute(String(sourceRoot))) {
+            throw new Error('内部错误：临时源根必须是绝对路径。');
+        }
+        const report = (event) => {
+            if (typeof onProgress !== 'function') return;
+            try { onProgress(event); } catch { /* 进度回调不能打断入库 */ }
+        };
+        report({ phase: 'extract' });
+        const rootDir = sourceRoot === null || sourceRoot === undefined ? base : resolve(String(sourceRoot));
+        if (rootDir !== base) {
+            // 可信临时根：只接受 OS 临时目录里的绝对路径。来源目前只有 kbUpload 的
+            // mkdtemp；工具与路由都构造不出这个参数，这里再兜一层，防止以后被接上。
+            const relToTemp = relative(resolve(tmpdir()), rootDir);
+            if (relToTemp === '' || relToTemp.startsWith('..') || isAbsolute(relToTemp)) {
+                throw new Error('内部错误：临时源根必须在 OS 临时目录里。');
+            }
+        }
+        if (rootDir !== base && displayPath === '') {
+            throw new Error('内部错误：临时源必须给 displayPath，不能把临时文件名写进知识库。');
+        }
+        const relPosix = relativeInside(path, rootDir);
+        // 上传通道（2026-11-19）：`path` 是抽取用的临时源文件，`displayPath` 是 manifest
+        // 里真正的逻辑路径（uploads/<文件夹>/<文件名>）。临时文件在入库返回前删除，
+        // 知识库里只留切片与图片资产 —— 这是用户明确要的「处理完只保留切片」。
+        const displayRel = displayPath === '' ? relPosix : relativeInside(displayPath);
+        const shownPath = displayRel;
+        // 第八十八轮：知识库单库，`scope` 只为兼容旧调用面保留，不再选根。
+        // 要让模型 / 用户把文档放进不同项目，用虚拟文件夹 folder，而不是第二座库。
+        const store = kbStore;
+        // folder=null 表示「没传」：已有文档保持原文件夹，新文档落根。显式传空串才是移到根。
+        const wantedFolder = folder === null || folder === undefined ? null : normalizeKbFolder(folder);
+        // 显式指定的目标文件夹必须在会话范围里：范围外入库等于把范围外的内容变成
+        // 「可见文档」，这条比检索更直接。
+        if (wantedFolder !== null) assertScope(sessionScope, wantedFolder);
+        // 显式正文（第一百零一轮）：OCR 识别结果直接入库时，正文是调用方转交的文本，
+        // 不是源文件抽出来的 —— 临时源文件可能根本不存在（`text` 通道没有二进制）。
+        // 单文档上限仍按旧口径守住，别让一次识别把整本扫描件塞进一个 manifest 行。
+        const givenText = typeof bodyText === 'string' ? bodyText : null;
+        const ext = extname(relPosix).slice(1).toLowerCase();
+        const binaryExt = ext === 'pdf' || ext === 'docx' || ext === 'pptx' || ext === 'xlsx'
+            || ext === 'png' || ext === 'jpg' || ext === 'jpeg' || ext === 'webp' || ext === 'gif';
         let info = null;
-        try {
-            info = await stat(absolute);
-        } catch (error) {
-            throw new Error(`读不了「${relPosix}」（${error?.code ?? '未知错误'}）。路径要相对会话工作目录。`);
+        if (givenText !== null) {
+            if (givenText.trim() === '') throw new Error(`「${shownPath}」的正文是空的，没有可入库的内容。`);
+            if (givenText.length > KB_MAX_DOC_BYTES) {
+                throw new Error(`识别结果有 ${givenText.length} 字符，超过 kb 的单文档上限 ${KB_MAX_DOC_BYTES} 字符。`
+                    + '先按卷 / 章拆开再入库 —— kb 有意不复制大文件进工作目录。');
+            }
+        } else {
+            try {
+                info = await stat(join(rootDir, relPosix));
+            } catch (error) {
+                throw new Error(`读不了「${shownPath}」（${error?.code ?? '未知错误'}）。路径要相对会话工作目录。`);
+            }
+            if (!info.isFile()) throw new Error(`「${shownPath}」不是文件，知识库只收工作目录里的文件。`);
+            if (!binaryExt && info.size > KB_MAX_DOC_BYTES) {
+                throw new Error(`「${shownPath}」有 ${info.size} 字节，超过 kb 的单文档上限 ${KB_MAX_DOC_BYTES} 字节。`
+                    + '先把它切小或只放需要的那一节 —— kb 有意不复制大文件进工作目录。');
+            }
+            if (!binaryExt) {
+                const raw = await readFile(join(rootDir, relPosix));
+                if (raw.includes(0)) {
+                    throw new Error(`「${shownPath}」看起来是二进制（正文里有 NUL）。知识库只收文本或可抽取的文档格式。`);
+                }
+            }
         }
-        if (!info.isFile()) throw new Error(`「${relPosix}」不是文件，kb 一期只认工作目录里的文本文件。`);
-        if (info.size > KB_MAX_DOC_BYTES) {
-            throw new Error(`「${relPosix}」有 ${info.size} 字节，超过 kb 的单文档上限 ${KB_MAX_DOC_BYTES} 字节。`
-                + '先把它切小或只放需要的那一节 —— kb 有意不复制大文件进工作目录。');
+        // 多格式入库（第八十五轮）：文本直读，PDF / DOCX / PPTX / XLSX 走 kb-extract，
+        // 图片落 kb/assets/ 并把引用写进正文 —— 统一成「文本块 + 图片资产」两种形态。
+        // 抽取器有自己的边界（8 MB、扩展名白名单、路径越界检查），错误原样带出来。
+        const pdfEnv = {
+            root: rootDir,
+            resolve: (target) => resolve(rootDir, target),
+        };
+        let extracted = null;
+        if (givenText === null) {
+            try {
+                extracted = await extractKbSource({ root: rootDir, path: relPosix, env: pdfEnv, maxBytes: KB_EXTRACT_MAX_BYTES });
+            } catch (error) {
+                throw new Error(`读不了「${shownPath}」：${error?.message ?? error}`);
+            }
         }
-        let text = '';
-        try {
-            text = await readFile(absolute, 'utf8');
-        } catch (error) {
-            throw new Error(`读不了「${relPosix}」的正文（${error?.code ?? error?.message ?? '未知错误'}）。`);
-        }
-        if (text.includes('\u0000')) {
-            throw new Error(`「${relPosix}」看起来是二进制（正文里有 NUL）。kb 一期只收文本：'
-                + 'PDF 先用 office.pdf.text 抽成 .md，表格先导出成 .md，再入库。`);
+        let text = givenText === null ? extracted.text : givenText;
+        report({ phase: 'chunks', chars: text.length });
+        const assetKey = createHash('sha1').update(displayRel + '\u0000' + text, 'utf8').digest('hex').slice(0, 12);
+        const images = [];
+        if (Array.isArray(extracted?.images) && extracted.images.length > 0) {
+            // 先把「正文里的图片引用 + 待落盘清单」算出来；真正的资产写入放到
+            // aiEstimate 的只读分支之后（见下面 aiEstimate !== true 的守卫）。
+            // 预估是纯只读操作：连 assets/<key>/ 空目录都不能留，否则一次「只看
+            // 要花多少钱」的调用就会在知识库里留下孤儿资产。
+            const files = [];
+            const lines = [];
+            for (let at = 0; at < extracted?.images.length; at += 1) {
+                const image = extracted.images[at];
+                const safeName = basename(String(image.name ?? 'image')).replace(/[^\w.-]+/g, '_') || ('image-' + (at + 1));
+                const fileName = (at + 1) + '-' + safeName;
+                const relAsset = posix.join('assets', assetKey, fileName);
+                files.push({ fileName, data: image.data });
+                images.push(relAsset);
+                lines.push('![' + String(image.name ?? fileName) + '](' + relAsset + ')');
+            }
+            text = text.trimEnd() + '\n\n' + lines.join('\n') + '\n';
+            if (aiEstimate !== true) {
+                const assetDir = join(store.paths.kb.dir, 'assets', assetKey);
+                await mkdir(assetDir, { recursive: true });
+                for (const file of files) await writeFile(join(assetDir, file.fileName), file.data);
+            }
         }
         // 来源档：显式传了就要看得懂（拼错一个字母不该静默降档，见 strictTierOf）。
         const realTier = strictTierOf(tier) || kbTierOf('');
+        // 来源证据面（P1-4b）：现算这份文档自己给出了几个独立来源。门在下面 existing
+        // 算出来之后才判 —— 「内容没变、档也没变」的幂等重入不该被追溯拦下。
+        const evidence = sourceEvidenceOf(text);
         // 文档哈希 = 内容 + **切块档**（kbHash 的注释说明了为什么档位必须进哈希）。
-        const docHash = kbHash(text, chunkCharsFor(relPosix));
-        const docId = docIdOf(relPosix);
-        const store = defaultStore();
+        // 开了模型切片时，切块档换成模型 profile：换模型 / 换装箱上限就是另一套块 id，
+        // 不会和确定性块的 id 空间混在一起（review 要求：必须传真实 docHash）。
+        const aiCfg = kbLlmConfigFor({ ai, aiModel, aiChunking, aiSummary });
+        // 显式要求 AI 但设置里还是 off：如实拒绝，不静默退回确定性切块假装成功。
+        if (ai === true && aiCfg.mode === 'off') {
+            throw new Error('AI 建库未启用：设置里的 memory.llm.mode 仍是 off（默认）。先选通道与模型，或这次先不带 ai:true 走确定性切块。');
+        }
+        if (aiEstimate === true && aiCfg.mode === 'off') {
+            return { action: 'kb-ingest', dryRun: true, path: shownPath, chars: text.length, estimate: { ...estimateKbLlmJob(text, aiCfg), calls: 0, batches: 0 }, ai: { mode: 'off' }, note: 'AI 未启用：将走确定性切块，不调用模型。' };
+        }
+        const aiWanted = (ai === true || aiEstimate === true) && aiCfg.mode !== 'off';
+        const useAiChunking = aiWanted && aiCfg.chunking === true;
+        // 切块档 = 块大小 + 重叠量（两条都改变块的边界与正文）。重叠量由块大小派生，
+        // 但必须显式进 profile：只写块大小时，一次「给已有块补重叠」的升级会让新旧
+        // 边界共用同一个 docHash，重入被判成「内容没变」，旧的非重叠块就永远留着。
+        const chunkChars = chunkCharsFor(displayRel);
+        const overlapChars = chunkOverlapFor(chunkChars);
+        // 模型切片的块大小是 aiCfg.maxChunkChars，重叠量也要按它派生 —— 用文档档
+        // 的 1200 算出来的 150 与模型块的 700 不匹配（重叠占比失衡，测试也会抓到）。
+        const aiOverlapChars = chunkOverlapFor(aiCfg.maxChunkChars);
+        const docHash = kbHash(text, useAiChunking ? kbLlmProfile(aiCfg) : (chunkChars + ':' + overlapChars));
+        const docId = docIdOf(displayRel);
+        const aiReceipt = { mode: aiCfg.mode, provider: aiCfg.provider, model: aiCfg.model, chunking: aiCfg.chunking, summary: aiCfg.summary };
+        // 会话范围闸门的前置检查（P1）：文档 id 按路径寻址，同路径的旧文档可能落在
+        // **范围外**的文件夹里。同内容分支会改档 / 补摘要、换代分支会搬文件夹，都必须
+        // 先知道旧文档在不在范围里；放在 AI 调用之前，还保证不会先花模型调用、
+        // 再在下面拒绝，也不会回显范围外文档的标题 / 块数 / 档位。
+        if (sessionScope !== null && sessionScope !== undefined) {
+            let preRows = [];
+            try {
+                preRows = await loadKbManifest(store.paths.kb);
+            } catch {
+                preRows = [];
+            }
+            const preExisting = preRows.find((row) => row.id === docId);
+            if (preExisting !== undefined) assertScope(sessionScope, preExisting.folder);
+        }
+        let aiRun = null;
+        let aiPayload = [];
+        let aiStateKey = '';
+        if (aiWanted) {
+            const estimate = estimateKbLlmJob(text, aiCfg);
+            // 同内容是否需要模型，必须先于预算 / 宿主可用性判断：重入只改档、搬
+            // 文件夹、回执「未改动」时根本不调用模型，不能被 overBudget 或
+            // hostLlm 不可用挡住。范围闸门已在上面跑过，这里只读清单。
+            let sameBefore = false;
+            let manifestReadable = true;
+            try {
+                sameBefore = (await loadKbManifest(store.paths.kb)).some((row) => row.id === docId && row.hash === docHash);
+            } catch {
+                manifestReadable = false;
+            }
+            const needsModel = !sameBefore || (!useAiChunking && aiCfg.summary === true);
+            if (aiEstimate === true) {
+                if (!needsModel) {
+                    return {
+                        action: 'kb-ingest', dryRun: true, path: shownPath, chars: text.length,
+                        // 0 次调用就不该再报「N 批」；正文规模仍由 chars / units 表达。
+                        estimate: { ...estimate, batches: 0, calls: 0, estimatedInputTokens: 0, estimatedOutputTokens: 0, overBudget: false },
+                        ai: { ...aiReceipt, available: true, calls: 0, summaries: 0 },
+                        duplicate: true,
+                        note: '同一版内容与切块档已经在库里：实际入库会直接回执「未改动」，0 次模型调用；来源档 / 文件夹的重入只改清单，不重跑模型。',
+                    };
+                }
+                // 只读预估：宿主通道没接上 llm 时如实报不可用，不探活、不发请求。
+                // 不能先报「预计 N 次调用」再让真实入库抛错 —— 用户会以为通道是好的。
+                if (aiCfg.mode === 'host' && !hostLlmUsable) {
+                    const reason = '宿主没有可用的 llm 服务（host 通道的 ctx.llm 不可达）。';
+                    return {
+                        action: 'kb-ingest', dryRun: true, path: shownPath, chars: text.length,
+                        estimate: { ...estimate, batches: 0, calls: 0, estimatedInputTokens: 0, estimatedOutputTokens: 0, overBudget: false },
+                        ai: { ...aiReceipt, available: false, calls: 0, reason },
+                        note: reason + '这次不会发起任何模型请求；改选 openai 兼容通道，或先在宿主里配置模型后再预估。',
+                    };
+                }
+                const ready = kbLlmReady(aiCfg);
+                if (!ready.ok) throw new Error('AI 建库不可用：' + ready.reason + '。默认关闭；在设置的知识库大模型分组里选通道与模型后才可用。');
+                // 清单读不到就退回全量保守值并说明原因（不猜）；读到且要真跑模型时，
+                // overBudget 照实给 true，让用户看到「确认后会被拒绝」。
+                return {
+                    action: 'kb-ingest', dryRun: true, path: shownPath, chars: text.length,
+                    estimate, ai: { ...aiReceipt, available: true },
+                    ...(manifestReadable ? {} : { note: '读不到知识库清单，无法确认这份内容是否已经入库；预估按全量保守计算。' }),
+                };
+            }
+            if (needsModel) {
+                const ready = kbLlmReady(aiCfg);
+                if (!ready.ok) throw new Error('AI 建库不可用：' + ready.reason + '。默认关闭；在设置的知识库大模型分组里选通道与模型后才可用。');
+                if (estimate.overBudget) {
+                    throw new Error('按当前预算处理不了「' + shownPath + '」：预估 ' + estimate.batches + ' 批 / ' + estimate.calls + ' 次调用，超过总预算 ' + aiCfg.maxCalls + '。调大预算或按卷 / 章拆小后再入库；这次没有调用模型。');
+                }
+                // 与 createHostGenerator 的可用性判据一致：对象在、但拿不出 prepareCall，
+                // 同样算不可用；只读属性，不探活、不发请求。
+                if (aiCfg.mode === 'host' && !hostLlmUsable) {
+                    throw new Error('宿主没有可用的 llm 服务：host 通道不可用。改选 openai 兼容通道，或先在宿主里配置模型；这次没有调用模型。');
+                }
+                const key = kbLlmJobKeyOf(text, aiCfg);
+                aiStateKey = key;
+                let state = null;
+                if (aiResume === true) {
+                    const saved = await readKbLlmJob(store.paths.kb.dir, key);
+                    state = saved === null ? null : saved.state;
+                }
+                const generate = aiCfg.mode === 'host'
+                    ? createHostGenerator({ llm: hostLlm, config: aiCfg, purpose: 'office-kb-ingest' })
+                    : createOpenAiGenerator({ config: aiCfg });
+                aiRun = await runKbLlmJob({ text, config: aiCfg, generate, state, docHash, runLimit: Number.isFinite(aiRunLimit) && aiRunLimit > 0 ? aiRunLimit : null, env: process.env, onProgress: report });
+                await writeKbLlmJob(store.paths.kb.dir, key, { version: 1, key, at: nowIso(), state: aiRun.state });
+                if (aiRun.status === 'paused' || aiRun.status === 'budget') {
+                    return {
+                        action: 'kb-ingest', path: shownPath, paused: true, status: aiRun.status,
+                        calls: aiRun.calls, doneBatches: aiRun.state.cursor, batches: estimate.batches,
+                        stateKey: key, ai: { ...aiReceipt, calls: aiRun.calls, degraded: aiRun.degraded, truncated: aiRun.truncated, retried: aiRun.retried },
+                        note: aiRun.reason,
+                    };
+                }
+                aiReceipt.calls = aiRun.calls;
+                aiReceipt.degraded = aiRun.degraded;
+                aiReceipt.truncated = aiRun.truncated;
+                aiReceipt.retried = aiRun.retried;
+                aiReceipt.errors = aiRun.errors;
+                if (aiCfg.summary === true) {
+                    aiPayload = useAiChunking
+                        ? aiRun.summaries.map((row) => ({ id: row.id, title: row.title, text: row.text, chunkIds: row.chunkIds }))
+                        : kbLlmSummariesOfSegments(aiRun.segments, splitDocument(text, { chunkChars, overlap: overlapChars }), docHash);
+                }
+            }
+        }
 
-        return withQueue(store.paths.dir, async () => {
+        return withQueues([...stores.map((item) => item.paths.dir), kbStore.paths.kb.dir], async () => {
+            // 先补上一次没做完的清理（第五十六轮 S-03）：日志要么被丢弃（崩在提交前，
+            // 旧版本完整），要么被重放（崩在提交后，补完清边与墓碑）。照实带回执。
+            const recoveries = await replayAllKbPending();
+            const recovered = recoveries.length === 0 ? {} : { recoveries };
             const rows = await loadKbManifest(store.paths.kb);
             const existing = rows.find((row) => row.id === docId);
-            if (existing !== undefined && existing.hash === docHash) {
+            const sameContent = existing !== undefined && existing.hash === docHash;
+            const wantedTier = strictTierOf(tier);
+            // 入库评估闸（P1-4b）在这里才判：只有「这次要把档位变成 verified」的调用才过门。
+            // 「内容没变、档也不变（或没传档）」的幂等重入放行 —— 库里那些在门之前入库的
+            // verified 文档不该因为一次幂等重入就被追溯拦下（门是向前的，不追历史）。
+            const keepingTier = sameContent && (wantedTier === '' || wantedTier === existing.tier);
+            if (realTier === 'verified' && !keepingTier) assertIngestEvidence({ tier: realTier, path: shownPath, evidence });
+            if (sameContent) {
                 // **同内容但显式改了来源档** = 改档，不是重写：两份独立来源确认之后，一份
                 // 单源材料该能从「待核」升成「已验证」—— 否则硬规则就成了死路（内容一个字
                 // 没变，却因为没有升级通道只能一直关在待核区，或者被迫改一个字来触发换代）。
                 // 改的是 manifest 行的 `tier`：**块文件里没有档位**（档是文档级的），所以
                 // 共用同一批块的另一份文档不会被连带改档（独立验证 F13 的 (a)）。
-                const wantedTier = strictTierOf(tier);
-                if (wantedTier !== '' && wantedTier !== existing.tier) {
-                    const next = rows.map((row) => (row.id === docId ? { ...row, tier: wantedTier } : row));
+                const nextFolder = wantedFolder === null ? existing.folder : wantedFolder;
+                const moving = nextFolder !== existing.folder;
+                // 兜底再核一遍（预检与这里之间 manifest 可能被并发改过）：范围外文档不能
+                // 借「同内容重入」改档 / 补摘要 / 回显元数据；旧文件夹与目标文件夹都要在范围内。
+                assertScope(sessionScope, existing.folder);
+                assertScope(sessionScope, nextFolder);
+                // 只开摘要时，内容没变也要把摘要补上（摘要另存，不动块与 manifest）。
+                const summarySaved = aiPayload.length > 0 ? await saveKbSummaries(docId, aiPayload) : 0;
+                // 模型切片 + 模型摘要同时开着时，同内容重入不会重跑切片（避免重复计费）。
+                // 但这也意味着「先切片、后开摘要」的第二次重入不会补摘要 —— 必须如实说明，
+                // 不能回执 summaries:0 却让用户以为摘要已经生成（review P2）。
+                const aiSameNote = useAiChunking && aiCfg.summary === true && aiPayload.length === 0
+                    ? '内容与切块档都没变：本次没有重跑模型切片，也没有补摘要。已有摘要保持不变；要补摘要请先关闭「模型切片」再用 ai:true 入库。'
+                    : '';
+                if (aiStateKey !== '') await dropKbLlmJob(store.paths.kb.dir, aiStateKey);
+                if ((wantedTier !== '' && wantedTier !== existing.tier) || moving) {
+                    const next = rows.map((row) => (row.id === docId
+                        ? { ...row, tier: wantedTier !== '' ? wantedTier : row.tier, folder: nextFolder }
+                        : row));
                     await saveKbManifest(store.paths.kb, next);
                     await saveKbIndex(store.paths.kb, next);
                     return {
-                        action: 'kb-ingest', docId, path: relPosix, title: existing.title,
-                        chunks: existing.chunks, tier: wantedTier, previousTier: existing.tier,
-                        unchanged: true, retiered: true, replaced: false, origin: store.id,
+                        action: 'kb-ingest', docId, path: shownPath, title: existing.title,
+                        chunks: existing.chunks, tier: wantedTier !== '' ? wantedTier : existing.tier,
+                        previousTier: existing.tier, unchanged: true,
+                        retiered: wantedTier !== '' && wantedTier !== existing.tier,
+                        moved: moving, folder: nextFolder, previousFolder: existing.folder,
+                        replaced: false, origin: store.id, evidence, ...recovered,
+                        ...(aiWanted ? { ai: { ...aiReceipt, summaries: summarySaved, ...(aiSameNote === '' ? {} : { note: aiSameNote }) } } : {}),
                     };
                 }
                 return {
-                    action: 'kb-ingest', docId, path: relPosix, title: existing.title,
+                    action: 'kb-ingest', docId, path: shownPath, title: existing.title,
                     chunks: existing.chunks, tier: existing.tier, unchanged: true, replaced: false,
-                    origin: store.id,
+                    folder: existing.folder, origin: store.id, evidence, ...recovered,
+                    ...(aiWanted ? { ai: { ...aiReceipt, summaries: summarySaved, ...(aiSameNote === '' ? {} : { note: aiSameNote }) } } : {}),
                 };
             }
             // 先切块（纯函数，确定性），切不出正文就明确报错，不写一份空文档进 kb。
             const at = nowIso();
-            const pieces = splitDocument(text, { chunkChars: chunkCharsFor(relPosix) });
+            // 两条切块路径都走同一个 overlapChunks：模型切片按小节分组，与结构切块的
+            // 边界不同，但「相邻块带一点上一块的句尾」这件事必须一致（否则同一个知识库
+            // 里有的块能回溯上下文、有的不能）。
+            const pieces = aiRun !== null && useAiChunking && Array.isArray(aiRun.chunks) && aiRun.chunks.length > 0
+                ? overlapChunks(text, aiRun.chunks.map((chunk) => ({ n: chunk.n, text: chunk.text, span: chunk.span, outline: chunk.outline })), aiOverlapChars)
+                : splitDocument(text, { chunkChars, overlap: overlapChars });
             if (pieces.length === 0) {
-                throw new Error(`「${relPosix}」里没有可入库的正文（全是空白行或标题）。`);
+                throw new Error(`「${shownPath}」里没有可入库的正文（全是空白行或标题）。`);
             }
-            const title = kbTitleOf(text, relPosix);
+            const title = sourceTitle === '' ? kbTitleOf(text, displayRel) : sourceTitle;
             // 块文件只放与块本身有关的东西（正文 / span / 标题路径 / 自校验哈希）：来源路径、
             // 入库时刻、来源档都是文档级的，由 manifest 行现取 —— 两份内容相同的文档共用同一
             // 批块文件，把文档级元数据写进去就会互相覆盖（独立验证 F3）。
@@ -2766,33 +4489,76 @@ export function createMemory({ root, memory = {} }) {
                 span: piece.span,
                 outline: piece.outline,
             }));
-            // 顺序有意写成「正文先落 → 清旧件与边 → manifest → index」：与归档同一条纪律
-            // （真源先落、索引后落），崩在任何一步都不会留下「索引说有、正文没有」的卷。
+            // 提交协议（第五十六轮 S-03，两段式）：
+            //   ① 提交点之前**只增**：只写新块文件，不删任何一个旧字节。`manifest.jsonl`
+            //      （真源）与 `index.json`（计数投影）落盘，这次换代才算发生。
+            //   ② 提交点之后才做删除类动作（清旧边 / 留墓碑 / 收旧块），而且先把意图写进
+            //      `pending.json` —— 提交了但清理没做完时，下一次 kb 写操作照日志补完。
+            // 为什么必须这么排：从前是「清旧件与边 → manifest」，于是「旧块已删、新 manifest
+            // 还没写」这个窗口里，盘上的 manifest 仍指着**已经被删掉的正文**（与这里原先
+            // 那句「崩在任何一步都不会留下索引说有、正文没有」正相反，S-03 点名的就是它）。
+            // 现在崩在提交之前，盘上就是**完整的旧版本**，多出来的只是没人引用的新块
+            // （`sweepKbOrphanChunks` 收掉）；崩在提交之后，新版本完整，剩下的清理可重放。
             for (const chunk of chunks) {
                 await writeAtomic(join(store.paths.kb.chunks, chunkRelOf(docHash, chunk.n)), `${JSON.stringify(chunk)}\n`);
             }
-            let prunedLinks = 0;
             let replaced = false;
-            const next = rows.filter((item) => item.id !== docId);
-            if (existing !== undefined) {
+            let journal = null;
+            // 旧的 OCR 笔记（第 91 轮起存成 `<stem>.ocr.md`）：OCR 文本现在写进**源文件
+            // 自己的文档**（`uploads/<文件夹>/<原文件名>`），旁挂笔记必须一起收掉 ——
+            // 同一份扫描件在库里留两份互相矛盾的正文，检索会把两句都当成原文。
+            // 只有这次确实是 OCR 入库（ocr === true）才动它，普通入库不碰别人的笔记。
+            const legacyRel = ocr === true ? legacyOcrNoteOf(displayRel) : '';
+            const legacyId = legacyRel === '' ? '' : docIdOf(legacyRel);
+            const legacyRow = legacyId !== '' && legacyId !== docId
+                ? rows.find((item) => item.id === legacyId)
+                : undefined;
+            if (legacyRow !== undefined) {
+                // 删除也是写：范围外文档不能借「OCR 覆盖旧笔记」被删掉。
+                assertScope(sessionScope, legacyRow.folder);
+            }
+            const removedRows = [existing, legacyRow].filter((item) => item !== undefined && item !== null);
+            const next = rows.filter((item) => item.id !== docId && item.id !== legacyId);
+            if (removedRows.length > 0) {
                 replaced = true;
                 // 墓碑只留**真的死掉**的**块** id：文档 id 按路径寻址，换代之后同一个 id 还活着
                 // （新内容），给它留墓碑既与「alive wins」的判死口径多绕一圈，又会让
                 // `pruneLinks` 把指向这份文档的边**误清**（独立验证 F5 实测：注释写着「不留」，
                 // 代码却在留）。所以这里把文档 id 从死名单里摘掉，再按跨根的活 id 集合过滤块 id。
-                const dead = deadKbIds(existing, await kbLiveAcrossStores({ store, rows: next }));
-                dead.delete(existing.id);
-                for (const item of stores) prunedLinks += await pruneLinks(item.paths, dead);
-                if (dead.size > 0) {
-                    await appendTombstones(store.paths, [...dead].map((deadId) => ({ id: deadId, reason: 'kb-reingest' })));
+                // 旧笔记的文档 id 则相反：它真的没了，要按 kb-drop 的口径留墓碑。
+                const live = await kbLiveAcrossStores({ store, rows: next });
+                const dead = new Set();
+                for (const removed of removedRows) {
+                    for (const id of deadKbIds(removed, live)) {
+                        if (id === removed.id && removed.id === docId) continue;
+                        dead.add(id);
+                    }
                 }
-                if (!next.some((item) => item.hash === existing.hash)) {
-                    await rm(join(store.paths.kb.chunks, existing.hash), { recursive: true, force: true });
-                }
+                journal = {
+                    version: 1,
+                    op: 'kb-ingest',
+                    at: nowIso(),
+                    docId,
+                    // 重放判据：manifest 里这一份**不再是** expectHash（且 expectGone 那一份
+                    // 已经不在）时，换代确实提交了。两个条件都要看：OCR 覆盖旧笔记这次
+                    // 可能只有「旧笔记消失」这一个可观察的变化。
+                    expectHash: existing === undefined ? '' : existing.hash,
+                    ...(legacyRow === undefined ? {} : { expectGone: legacyRow.id }),
+                    dead: [...dead],
+                    reason: legacyRow === undefined ? 'kb-reingest' : 'kb-ocr-replace-note',
+                };
             }
+            // 没显式给 folder 时沿用旧文档的文件夹：那份旧文档也已经过范围闸（注：这里
+            // 只可能是同路径重入库，existing 在范围外时下方 assert 会拦下）。
+            // 旧文档本身也要在范围内：只核 targetFolder 会允许「把范围外那份文档搬进范围」
+            // —— 内容换了、文件夹换了，等于替范围外文档做了决定。
+            if (existing !== undefined) assertScope(sessionScope, existing.folder);
+            const targetFolder = wantedFolder === null ? (existing?.folder ?? '') : wantedFolder;
+            assertScope(sessionScope, targetFolder);
             const row = normalizeManifestRow({
                 id: docId,
-                path: relPosix,
+                path: shownPath,
+                folder: targetFolder,
                 hash: docHash,
                 title,
                 bytes: byteLength(text),
@@ -2800,30 +4566,622 @@ export function createMemory({ root, memory = {} }) {
                 chunks: chunks.length,
                 tier: realTier,
                 at,
+                // 抽出来的图片留在 assets/ 下；manifest 记相对路径，面板才知道去哪取。
+                ...(images.length > 0 ? { images } : {}),
+                // 正文来自 OCR（第一百零一轮）：只留「什么时候、多长」，识别服务与页数
+                // 属于那一次调用的回执 —— manifest 是长期事实，不该记住一次工具的输出。
+                ...(ocr === true ? { ocr: { at, chars: text.length } } : {}),
             });
             next.push(row);
+            if (journal !== null) await writeKbPending(store, journal);
             await saveKbManifest(store.paths.kb, next);
             const counts = await saveKbIndex(store.paths.kb, next);
+            const cleanup = await finishKbWrite(store, journal);
+            // 入库后把 SQLite 索引跟上（索引是加速层：打不开就跳过，不影响入库）。
+            // 这样「全局库」在第一次入库后就真的存在，而不是等第一次检索 / 建边才现建。
+            try {
+                await withKbDb(async (handle) => {
+                    await syncKbIndex(handle);
+                    return true;
+                });
+            } catch { /* 索引失败不阻塞入库 */ }
+            let summaryCount = 0;
+            if (aiPayload.length > 0) {
+                try { summaryCount = await saveKbSummaries(docId, aiPayload); } catch (error) { aiReceipt.summaryError = String(error?.message ?? error); }
+            }
+            if (aiStateKey !== '') await dropKbLlmJob(store.paths.kb.dir, aiStateKey);
             return {
-                action: 'kb-ingest', docId, path: relPosix, title, chunks: chunks.length,
+                // kind / warnings 来自抽取器；OCR 入库时正文不是抽出来的，
+                // 抽取器可能根本没跑（`text` 通道），不能直接读 extracted.kind。
+                action: 'kb-ingest', docId, path: shownPath, title,
+                kind: extracted?.kind ?? (ocr === true ? 'ocr' : 'text'), chunks: chunks.length,
                 chars: text.length, bytes: byteLength(text), tier: realTier,
-                unchanged: false, replaced, prunedLinks, counts, origin: store.id,
+                folder: row.folder, unchanged: false, replaced, counts, origin: store.id, evidence,
+                ...(aiWanted ? { ai: { ...aiReceipt, summaries: summaryCount } } : {}),
+                images, warnings: extracted?.warnings ?? [],
+                ...(ocr === true ? { ocr: true } : {}),
+                ...(legacyRow === undefined ? {} : { removedOcrNote: legacyRow.path }),
+                ...cleanup, ...recovered,
             };
         });
     }
 
-    /** kb 清单：按入库时刻倒序，有界。 */
-    async function kbList({ limit = 0 } = {}) {
-        const rows = await kbRows();
-        rows.sort((left, right) => String(right.at).localeCompare(String(left.at)));
+    /**
+     * 上传入库（2026-11-19）：浏览器把文件内容送上来，服务端抽取 → 切块 → 只留切片与图片。
+     *
+     * 临时文件放在**私有 OS 临时目录**（mkdtemp 独占、0600、wx 不覆盖），入库返回
+     * （无论成功失败）整目录删掉；不放工作区 `.office/runtime/` —— 那里可能被配置或
+     * 符号链接改道，也会与用户/同步盘共享。manifest 记的逻辑路径是
+     * `uploads/<虚拟文件夹>/<文件名>`，和临时文件无关。同文件夹同名 = 同一份文档：
+     * 内容变了就换代，没变就幂等返回 unchanged。
+     */
+    async function kbUpload({
+        name = '', folder = '', data = null, text = null, ocr = false, tier = '', scope = '',
+        ai = false, aiModel = '', aiChunking = null, aiSummary = null, aiEstimate = false, aiResume = false, aiRunLimit = 0,
+        onProgress = null,
+    } = {}) {
+        // 两条入库通道（第一百零一轮）：
+        //   - `data`：二进制上传，落私有临时目录再抽取（原路径，未动）。
+        //   - `text`：**现成正文**，不落临时文件、不抽取 —— OCR 结果要写回「源文件自己的
+        //     那一份文档」时走这条，二进制已经被识别过一遍，再传一次既慢又可能超限。
+        const givenText = typeof text === 'string' ? text : null;
+        if (givenText === null) {
+            if (!Buffer.isBuffer(data) || data.length === 0) throw new Error('上传内容为空。');
+            if (data.length > KB_EXTRACT_MAX_BYTES) {
+                throw new Error(`文件有 ${data.length} 字节，超过单文件上限 ${KB_EXTRACT_MAX_BYTES} 字节。`);
+            }
+        } else if (givenText.trim() === '') {
+            throw new Error('正文是空的，没有可入库的内容。');
+        } else if (givenText.length > KB_MAX_DOC_BYTES) {
+            throw new Error(`正文有 ${givenText.length} 字符，超过单文档上限 ${KB_MAX_DOC_BYTES} 字符。先按卷 / 章拆开再入库。`);
+        }
+        const rawName = basename(String(name ?? '').replace(/\\/g, '/'));
+        const safeName = rawName.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').replace(/^\.+/, '').trim() || ('upload-' + randomUUID().slice(0, 8));
+        const ext = extname(safeName).slice(1).toLowerCase();
+        const folderNorm = normalizeKbFolder(folder);
+        const displayPath = posix.join('uploads', folderNorm, safeName);
+        const ingestCommon = {
+            displayPath,
+            sourceTitle: safeName,
+            tier,
+            scope,
+            folder: folderNorm,
+            ai,
+            aiModel,
+            aiChunking,
+            aiSummary,
+            aiEstimate,
+            aiResume,
+            aiRunLimit,
+            onProgress,
+        };
+        if (givenText !== null) {
+            // 正文入库：`path` 只用来定位范围闸与来源档（工作区根下的同名相对路径），
+            // 真正进切块的是 `bodyText` —— kbIngest 不会去 stat 这个文件。
+            return await kbIngest({ ...ingestCommon, path: safeName, bodyText: givenText, ocr: ocr === true });
+        }
+        const tempDir = await mkdtemp(join(tmpdir(), 'dsh-kb-upload-'));
+        const tempName = randomUUID() + (ext === '' ? '' : '.' + ext);
+        // 只在这一支（私有上传源）擦临时路径：错误里可能带 randomUUID 文件名或整个
+        // mkdtemp 目录（抽取器、stat/读取/写入失败都会），对用户没意义，还会泄漏本机
+        // 临时目录。公共 workspace 入库的错误原样不改 —— 那里的路径是用户自己给的。
+        const scrubTemp = (message) => {
+            let out = String(message ?? '');
+            // 根目录先擦（两种分隔符），再擦文件名，避免只擦一半留下 "/uuid.pdf"。
+            const dirs = [tempDir, tempDir.split(sep).join('/'), tempDir.split('/').join(sep)];
+            for (const dir of dirs) {
+                if (dir === '') continue;
+                out = out.split(dir + sep).join('').split(dir + '/').join('').split(dir).join('');
+            }
+            const names = [tempName, tempName.split(sep).join('/'), posix.basename(tempName)];
+            for (const name of names) {
+                if (name === '') continue;
+                out = out.split(name).join(safeName);
+            }
+            return out;
+        };
+        try {
+            // 写失败也要走 finally 删目录，所以写文件放在 try 里。
+            await writeFile(join(tempDir, tempName), data, { mode: 0o600, flag: 'wx' });
+            // 二进制通道的正文来自抽取器，不是 OCR：ocr 标记只在正文通道置位。
+            return await kbIngest({
+                ...ingestCommon,
+                path: tempName,
+                sourceRoot: tempDir,
+            });
+        } catch (error) {
+            throw new Error(scrubTemp(error?.message ?? error));
+        } finally {
+            // 整目录删掉：里面就是这份上传内容的临时副本，知识库只该留下切片与资产。
+            await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+        }
+    }
+
+    /** 预览卡里正文摘要的字符数上限（够看清是什么文件，不够抄走整篇）。 */
+    const KB_PREVIEW_CHARS = 1200;
+    /**
+     * 预览阶段允许「先判定类型、不抽正文」的上限（与 view.js 的 OCR_DATA_MAX_BYTES 对齐）。
+     *
+     * 文本抽取本身只有 8 MB；但一份 8–24 MB 的扫描件/图片仍然可以走显式的「识别文字」
+     * —— 那是 OCR 通道的能力（24 MB），不该被预览的 8 MB 上限挡死。超过 24 MB 才拒绝。
+     */
+    const KB_PREVIEW_OCR_MAX_BYTES = 24 * 1024 * 1024;
+    /** 扩展名是否在 OCR 通道的白名单里（.doc/.ppt 不能入库，但能识别后存成笔记）。 */
+    const kbOcrEligibleName = (name) => OCR_SUPPORTED_EXTENSIONS.includes(extname(String(name ?? '')).toLowerCase());
+
+    /**
+     * 只抽取、不入库的预览（第九十四轮「识别文件 / 上传文件」合并成单一入口的后端）。
+     *
+     * 与 `kbUpload` 的分工是**副作用**而不是代码量：这里不写 manifest、不建块、不调模型，
+     * 只回答「这份文件能不能入库、里面有大概什么、要 OCR 吗」。所以它可以在用户点下
+     * 文件名的那一刻就跑，而不构成任何「入库」或「上传给远端」的授权 —— OCR 仍然
+     * 只由面板上那个显式按钮触发（`/office-memory/ocr`），不在这个函数里。
+     *
+     * 返回**不带任何路径**：预览卡只显示用户自己给的文件名。临时文件建在**私有 OS 临时
+     * 目录**（mkdtemp 独占、0700 目录 + 0600 文件，不落工作区子目录），函数返回前整个
+     * 目录删掉；错误文案里的临时路径也替换成文件名 —— 客户端给的路径一律不当服务端
+     * 路径用（它可能来自另一台机器）。
+     *
+     * 8 MB 是「抽正文」的上限，不是「判定类型」的上限：8–24 MB 且 OCR 可识别的文件
+     * 返回 kind='unknown'（没有判定文本层、要识别就点显式按钮），>24 MB 才拒绝。
+     *
+     * @param {{name?: string, data?: Buffer, splitTargetBytes?: number}} input
+     *   splitTargetBytes 只给测试用：默认每份约 4 MB，调小可强制大 PDF 按页拆开。
+     * @returns {Promise<object>} kind = text | scan | broken | invalid | image | unsupported | unknown | too_large | split
+     */
+    async function kbPreview({ name = '', data = null, splitTargetBytes = 0 } = {}) {
+        if (!Buffer.isBuffer(data) || data.length === 0) throw new Error('预览内容为空。');
+        if (data.length > KB_PREVIEW_OCR_MAX_BYTES) {
+            // 连 OCR 内容通道也不收：不要为了「看一眼」把更大的文件传上来。
+            const safe = basename(String(name ?? '').replace(/\\/g, '/')).replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').slice(0, 80) || '文件';
+            return {
+                action: 'kb-preview',
+                name: safe,
+                ext: extname(safe).slice(1).toLowerCase(),
+                bytes: data.length,
+                kind: 'too_large',
+                ocrEligible: false,
+                chars: 0,
+                chunks: 0,
+                head: '',
+                truncated: false,
+                images: 0,
+                note: '文件有 ' + data.length + ' 字节，超过单文件上限 ' + KB_PREVIEW_OCR_MAX_BYTES
+                    + ' 字节：先压小或拆页再试（识别通道也是这个上限）。',
+            };
+        }
+        const rawName = basename(String(name ?? '').replace(/\\/g, '/'));
+        const safeName = rawName.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').replace(/^\.+/, '').trim() || ('upload-' + randomUUID().slice(0, 8));
+        const ext = extname(safeName).slice(1).toLowerCase();
+        const ocrEligible = kbOcrEligibleName(safeName);
+        const baseResult = { action: 'kb-preview', name: safeName, ext, bytes: data.length, ocrEligible };
+        if (!isExtractableKbPath(safeName)) {
+            return {
+                ...baseResult,
+                kind: 'unsupported',
+                chars: 0,
+                chunks: 0,
+                head: '',
+                truncated: false,
+                images: 0,
+                note: ocrEligible
+                    ? '这个格式不能直接入库：支持文本、PDF、Word / PPT / Excel 与常见图片。要读里面的文字，可以点「识别文字」，结果能存成知识库笔记。'
+                    : '这个格式不能直接入库：支持文本、PDF、Word / PPT / Excel 与常见图片。可以先另存为其中的一种。',
+            };
+        }
+        // 文本类仍守 kbIngest 的旧口径：单文档 2 MB（KB_MAX_DOC_BYTES）。PDF / Office /
+        // 图片走抽取器的 8 MB，且还有「识别文字」这条退路；纯文本没有，所以预览就要拦住
+        // ——否则卡上会出现「入库」，点下去才被服务端按 2 MB 拒掉。
+        const binaryExt = ext === 'pdf' || ext === 'docx' || ext === 'pptx' || ext === 'xlsx'
+            || ext === 'png' || ext === 'jpg' || ext === 'jpeg' || ext === 'webp' || ext === 'gif';
+        if (!binaryExt && data.length > KB_MAX_DOC_BYTES) {
+            return {
+                ...baseResult,
+                kind: 'too_large',
+                ocrEligible: false,
+                chars: 0,
+                chunks: 0,
+                head: '',
+                truncated: false,
+                images: 0,
+                note: '文本文件有 ' + data.length + ' 字节，超过单文档上限 ' + KB_MAX_DOC_BYTES
+                    + ' 字节（2 MB）：先切小或只放需要的那一节。',
+            };
+        }
+        if (data.length > KB_EXTRACT_MAX_BYTES) {
+            // 大 PDF（8–24 MB）：先按页拆成每份 ≤4 MB 的小 PDF，再逐份抽取。
+            // 这样既不会把整份 24 MB 塞进抽取器的 8 MB 上限，也不会为了预览把
+            // 文件硬切坏；拆分失败（本机没有 PyMuPDF）才退回原来的「要识别就点 OCR」。
+            if (ext === 'pdf') {
+                const splitDir = await mkdtemp(join(tmpdir(), 'dsh-kb-split-'));
+                const splitEnv = { root: splitDir, resolve: (target) => resolve(splitDir, String(target ?? '')) };
+                const cleanSplit = (message) => String(message ?? '')
+                    .split(splitDir).join('')
+                    .split(join(splitDir, 'parts')).join('')
+                    .split('source.pdf').join(safeName);
+                try {
+                    const sourceAbs = join(splitDir, 'source.pdf');
+                    await writeFile(sourceAbs, data, { mode: 0o600 });
+                    let split = null;
+                    try {
+                        const targetBytes = Math.min(KB_EXTRACT_MAX_BYTES, Math.max(1, Math.floor(Number(splitTargetBytes) || KB_EXTRACT_MAX_BYTES / 2)));
+                        split = await pdfSplit(sourceAbs, {
+                            outDir: join(splitDir, 'parts'),
+                            targetBytes,
+                        }, splitEnv, null);
+                    } catch (error) {
+                        return {
+                            ...baseResult,
+                            kind: ocrEligible ? 'unknown' : 'too_large',
+                            chars: 0,
+                            chunks: 0,
+                            head: '',
+                            truncated: false,
+                            images: 0,
+                            note: '文件超过本地预览上限（8 MB），自动拆分也没成功：'
+                                + cleanSplit(error?.message || '未知原因')
+                                + (ocrEligible ? '；要读里面的文字请点「识别文字」，内容会发给 DeepSeek OCR。' : '；先手动拆分或只放需要的那一节。'),
+                        };
+                    }
+                    const stem = safeName.replace(/\.pdf$/i, '').replace(/[\\/:*?"<>|]/g, '-').slice(0, 60) || '文档';
+                    const parts = [];
+                    for (const part of split.parts) {
+                        const partName = stem + '（第' + part.from + (part.to === part.from ? '' : '-' + part.to) + '页）.pdf';
+                        const partBytes = await readFile(part.path);
+                        const encoded = partBytes.toString('base64');
+                        const common = {
+                            name: partName,
+                            pageFrom: part.from,
+                            pageTo: part.to,
+                            pages: part.pages,
+                            bytes: part.bytes,
+                            data: encoded,
+                            folder: '',
+                        };
+                        if (part.bytes > KB_EXTRACT_MAX_BYTES) {
+                            parts.push({
+                                ...common,
+                                kind: 'too_large',
+                                ocrEligible: true,
+                                chars: 0,
+                                chunks: 0,
+                                head: '',
+                                truncated: false,
+                                images: 0,
+                                note: '这一页段仍有 ' + part.bytes + ' 字节，超过单份 8 MB：可单独点「识别文字」。',
+                            });
+                            continue;
+                        }
+                        try {
+                            const extracted = await extractKbSource({
+                                root: splitDir,
+                                path: relative(splitDir, part.path),
+                                env: splitEnv,
+                                maxBytes: KB_EXTRACT_MAX_BYTES,
+                            });
+                            const text = typeof extracted?.text === 'string' ? extracted.text : '';
+                            const images = Array.isArray(extracted?.images) ? extracted.images.length : 0;
+                            if (extracted?.kind === 'image') {
+                                parts.push({ ...common, kind: 'image', ocrEligible: true, chars: 0, chunks: 0, head: '', truncated: false, images });
+                                continue;
+                            }
+                            const pieces = text.trim() === '' ? [] : splitDocument(text, {
+                                chunkChars: chunkCharsFor(partName),
+                                overlap: chunkOverlapFor(chunkCharsFor(partName)),
+                            });
+                            const head = text.slice(0, KB_PREVIEW_CHARS);
+                            parts.push({
+                                ...common,
+                                kind: 'text',
+                                ocrEligible: false,
+                                chars: text.length,
+                                chunks: pieces.length,
+                                head,
+                                truncated: text.length > head.length,
+                                images,
+                            });
+                        } catch (error) {
+                            const code = error?.code ?? '';
+                            const broken = code === 'kb_parse_failed' || code === 'kb_encrypted';
+                            const scan = code === 'kb_no_text_layer';
+                            parts.push({
+                                ...common,
+                                kind: scan ? 'scan' : (broken ? 'broken' : 'invalid'),
+                                ocrEligible: scan,
+                                chars: 0,
+                                chunks: 0,
+                                head: '',
+                                truncated: false,
+                                images: 0,
+                                note: scan
+                                    ? '这一页段没有文本层（多半是扫描件）：请单独点「识别文字」。'
+                                    : (broken ? '这一页段读不出来（可能已损坏）：换一份副本再试。' : cleanSplit(error?.message || '这一页段抽不出文字。')),
+                            });
+                        }
+                    }
+                    const oversized = parts.filter((part) => part.kind === 'too_large').length;
+                    return {
+                        ...baseResult,
+                        kind: 'split',
+                        chars: 0,
+                        chunks: 0,
+                        head: '',
+                        truncated: false,
+                        images: 0,
+                        parts,
+                        note: '文件有 ' + data.length + ' 字节，已按页拆成 ' + parts.length + ' 份（每份目标不超过 '
+                            + Math.floor(KB_EXTRACT_MAX_BYTES / 2) + ' 字节'
+                            + (oversized > 0 ? '；其中 ' + oversized + ' 份单页仍超过 8 MB，只能单独识别' : '')
+                            + '）；逐份确认入库。',
+                    };
+                } finally {
+                    await rm(splitDir, { recursive: true, force: true }).catch(() => {});
+                }
+            }
+            // 关键的诚实边界：没有抽取就**不能**断言它是扫描件（可能是大段原生文本）。
+            return {
+                ...baseResult,
+                kind: ocrEligible ? 'unknown' : 'too_large',
+                chars: 0,
+                chunks: 0,
+                head: '',
+                truncated: false,
+                images: 0,
+                note: ocrEligible
+                    ? '文件超过本地预览上限（8 MB），没有判定文本层；要读里面的文字请点「识别文字」，内容会发给 DeepSeek OCR。'
+                    : '文件超过可抽取的单文件上限（8 MB）：先拆分或只放需要的那一节。',
+            };
+        }
+        // 私有 OS 临时目录：不在工作区里建，避免被配置 / 符号链接改道，也不与同步盘共享。
+        const tempDir = await mkdtemp(join(tmpdir(), 'dsh-kb-preview-'));
+        const tempName = 'source' + (ext === '' ? '' : '.' + ext);
+        const tempAbs = join(tempDir, tempName);
+        await writeFile(tempAbs, data, { mode: 0o600 });
+        const clean = (message) => String(message ?? '')
+            .split(tempAbs).join(safeName)
+            .split(tempName).join(safeName)
+            .split(tempDir).join('');
+        // 抽取器要的 env（与 kbIngest 里那份同形）：只用来解析临时源文件。
+        const previewEnv = { root: tempDir, resolve: (target) => resolve(tempDir, String(target ?? '')) };
+        try {
+            let extracted = null;
+            try {
+                extracted = await extractKbSource({ root: tempDir, path: tempName, env: previewEnv, maxBytes: KB_EXTRACT_MAX_BYTES });
+            } catch (error) {
+                // 三种失败要分开说：扫描件（去 OCR 有用）、损坏（重导文件才有用）、
+                // 其它不可抽取（换格式）。混成一句「抽取失败」会让人做错下一步。
+                const code = error?.code ?? '';
+                const broken = code === 'kb_parse_failed' || code === 'kb_encrypted';
+                const scan = code === 'kb_no_text_layer';
+                return {
+                    ...baseResult,
+                    kind: scan ? 'scan' : (broken ? 'broken' : 'invalid'),
+                    chars: 0,
+                    chunks: 0,
+                    head: '',
+                    truncated: false,
+                    images: 0,
+                    note: scan
+                        ? '这份 PDF 没有文本层（多半是扫描件）：直接入库只会得到空壳，请用「识别文字」跑 OCR。'
+                        : (broken
+                            ? '这个文件读不出来（可能已损坏或加了密码）：换一份副本再试。'
+                            : clean(error?.message || '这个文件抽不出文字。')),
+                };
+            }
+            const text = typeof extracted?.text === 'string' ? extracted.text : '';
+            const images = Array.isArray(extracted?.images) ? extracted.images.length : 0;
+            if (extracted?.kind === 'image') {
+                return {
+                    ...baseResult,
+                    kind: 'image',
+                    chars: 0,
+                    chunks: 0,
+                    head: '',
+                    truncated: false,
+                    images,
+                    note: '图片可以直接入库（存缩略图与图片块）；要读出里面的文字，请点「识别文字」。',
+                };
+            }
+            // 预览的块数必须与真正入库一致：两处都按「块大小 + 重叠」切，
+            // 否则确认框写「约 12 块」，入库后是另一回事。
+            const pieces = text.trim() === '' ? [] : splitDocument(text, {
+                chunkChars: chunkCharsFor(safeName),
+                overlap: chunkOverlapFor(chunkCharsFor(safeName)),
+            });
+            const head = text.slice(0, KB_PREVIEW_CHARS);
+            return {
+                ...baseResult,
+                kind: 'text',
+                chars: text.length,
+                chunks: pieces.length,
+                head,
+                truncated: text.length > head.length,
+                images,
+                note: '',
+            };
+        } finally {
+            // 整个私有临时目录一起删：里面可能还有 PDF 引擎解出的中间文件。
+            await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+        }
+    }
+
+    // ── 会话级知识库范围 ──────────────────────────────────────────────────────
+    //
+    // 第九十几轮：聊天框左侧选定的虚拟文件夹属于**会话**，不是检索提示词。这里只在
+    // memory 这一层做「收窄 / 拒绝」，权威状态由 kb-session-scope.js 解析后以 scope 传入：
+    //   · scope == null   → 没有会话（内部 / 纯测试调用），保持旧契约（不受限）；
+    //   · scope.mode='all'→ 该会话显式放开全部知识库；
+    //   · scope.mode='folder' → 只允许该文件夹及其子目录。
+    // 任何调用者传的 folder 参数都只能在这个范围里继续收窄，越界一律抛错 —— 静默忽略
+    // 等于换了个查询对象，而「查了范围外」正是这个功能要防的事。
+
+    function scopeFolderOf(scope) {
+        if (scope === null || scope === undefined) return null;
+        if (scope.mode === 'all') return '';
+        if (scope.mode === 'folder') {
+            const folder = normalizeKbFolder(scope.folder);
+            if (folder === '') throw new Error('知识库范围里没有文件夹：拒绝这次调用（不会退回全库）。');
+            return folder;
+        }
+        throw new Error('知识库范围状态无法识别：拒绝这次调用（不会退回全库）。');
+    }
+
+    /** 范围是否允许某个 folder（null scope = 不受限）。 */
+    function scopeAllows(scope, folder) {
+        const bound = scopeFolderOf(scope);
+        if (bound === null || bound === '') return true;
+        return kbFolderInScope(folder, bound, { recursive: true });
+    }
+
+    function scopeViolation(bound, folder) {
+        const shown = folder === '' ? '根目录' : folder;
+        return new Error('「' + shown + '」不在当前会话的知识库范围里（只允许「' + bound + '」及其子目录）。'
+            + '要换范围请在输入框左侧重新选择目录。');
+    }
+
+    /**
+     * 写侧 / 目标侧闸门：文档落在范围外就拒绝。
+     *
+     * 文案**不点名**具体文件夹：写侧常常是「拿一个 id 来试」，把范围外那份文档
+     * 所在的目录名回显出去，等于确认了它的存在与位置。统一说「不在范围里（或不存在）」。
+     */
+    function assertScope(scope, folder) {
+        const bound = scopeFolderOf(scope);
+        if (bound === null || bound === '') return;
+        let value = '';
+        try { value = normalizeKbFolder(folder); } catch { value = ''; }
+        if (value !== '' && kbFolderInScope(value, bound, { recursive: true })) return;
+        throw new Error('这份内容不在当前会话的知识库范围里（或不存在）。要换范围请在输入框左侧重新选择目录。');
+    }
+
+    /**
+     * 把调用者给的 folder 参数收窄到会话范围里。
+     * 不给 folder 时变成「整个范围子树」；给了范围外的文件夹就抛错。
+     */
+    function narrowFolder(scope, folder, recursive = true) {
+        const bound = scopeFolderOf(scope);
+        const wanted = normalizeKbFolder(folder);
+        if (bound === null || bound === '') return { folder: wanted, recursive };
+        if (wanted === '') return { folder: bound, recursive: true };
+        if (kbFolderInScope(wanted, bound, { recursive: true })) return { folder: wanted, recursive };
+        throw scopeViolation(bound, wanted);
+    }
+
+    /** 只把范围内 manifest 行交给上层（清单 / 树 / 检索共用）。 */
+    function visibleRows(scope, rows) {
+        const bound = scopeFolderOf(scope);
+        if (bound === null || bound === '') return rows;
+        return rows.filter((row) => scopeAllows(scope, row.folder));
+    }
+
+    /**
+     * 摘要正文的来源块是否都在会话范围里（P1）。
+     *
+     * 摘要按 docId 归属一份文档，但正文可以是**别的文件夹**的块合成的（不受范围约束的
+     * 会话 / 旧数据都能生成这种摘要）。只按摘要所属文档的 folder 过滤，范围外的内容会
+     * 顺着摘要正文与检索预览漏出来。这里按块 id 里的内容哈希回查 manifest：只要存在
+     * 一份**范围内**的文档同样含这一块就算可见；否则整条摘要不可见（fail-closed，
+     * 不说明是哪一块，也不列范围外的目录名）。共享同一份内容的范围内文档不会误伤 ——
+     * 判定用的是「范围内是否存在同 hash 的文档」，而不是块的 doc_id 归属。
+     */
+    async function summarySourcesVisible(scope, chunkIds) {
+        const bound = scopeFolderOf(scope);
+        if (bound === null || bound === '') return true;
+        const ids = (Array.isArray(chunkIds) ? chunkIds : []).map((item) => asText(item)).filter((item) => item !== '');
+        // 旧摘要 / 外部写入的摘要可能没有可核对的来源块 id：受限会话里无法证明它来自
+        // 范围内，按不可见处理（fail-closed）；全库会话在上一行已经放行，不受影响。
+        if (ids.length === 0) return false;
+        const rows = (await kbRows()).filter((row) => scopeAllows(scope, row.folder));
+        for (const id of ids) {
+            const match = /^kb:([0-9a-fA-F]{6,}):(\d+)$/.exec(id);
+            if (match === null) return false;
+            const hash = match[1];
+            const n = Number.parseInt(match[2], 10);
+            const hit = rows.some((row) => String(row.hash) === hash && Number(row.chunks) >= n);
+            if (!hit) return false;
+        }
+        return true;
+    }
+
+    /**
+     * kb 清单：按入库时刻倒序，有界。`folder` 给定时只列这个子树（recursive 默认 true）。
+     * 清单是**文件夹视图**的数据源：面板按 folder 逐层下钻，检索也复用同一套范围语义。
+     *
+     * 有会话范围时：行、计数、**文件夹树**都必须用同一份可见行现算 —— 树里出现
+     * 范围外的目录名同样是泄漏（模型能据此知道别处有什么）。
+     */
+    async function kbList({ limit = 0, folder = '', recursive = true, origin = '', scope = null } = {}) {
+        // 显式创建的空目录只在**无会话范围**时并进文件夹树：有范围时多出别处的目录名
+        // 同样是泄漏；工具面默认 recursive=true 的语义保持不变（这里只加节点，不把目录当行）。
+        let foldersError = '';
+        const withVirtualFolders = async (tree) => {
+            if (scope !== null && scope !== undefined) return tree;
+            try {
+                return mergeKbFolders(tree, await readKbFolders(kbStore.paths.kb.dir, { strict: true }));
+            } catch (error) {
+                foldersError = String(error?.message ?? error);
+                return tree;
+            }
+        };
+        const treeMergedWithVirtual = async () => withVirtualFolders(kbFolderTree(visible));
+        const narrow = narrowFolder(scope, folder, recursive !== false);
+        const wantedFolder = narrow.folder;
+        // 第八十八轮：知识库是单库，旧调用面的 origin 不再参与筛选（传了也当没传）。
+        const all = await kbRows();
+        const visible = visibleRows(scope, all);
+        const scoped = visible.filter((row) => kbFolderInScope(row.folder, wantedFolder, { recursive: narrow.recursive }));
+        scoped.sort((left, right) => String(right.at).localeCompare(String(left.at)));
         const cap = limitOf(limit, KB_LIST_LIMIT, KB_LIST_LIMIT);
         return {
             action: 'kb-list',
-            items: rows.slice(0, cap),
-            total: rows.length,
-            truncated: rows.length > cap,
-            counts: kbCountsOf(rows),
+            folder: wantedFolder,
+            recursive: narrow.recursive,
+            items: scoped.slice(0, cap),
+            total: scoped.length,
+            truncated: scoped.length > cap,
+            counts: kbCountsOf(scoped),
+            tree: await treeMergedWithVirtual(),
+            foldersError,
         };
+    }
+
+    /** 知识库的文件夹树（manifest + 显式空目录，供面板左侧导航与 /kb-scope 校验）。 */
+    async function kbTree({ scope = null } = {}) {
+        // 单库：不再按来源分段；参数保留是为了旧调用面不炸。
+        const rows = visibleRows(scope, await kbRows());
+        let root = kbFolderTree(rows);
+        // 有会话范围时不并显式目录：范围外的空文件夹名也会泄漏范围拓扑。
+        let foldersError = '';
+        if (scope === null || scope === undefined) {
+            try {
+                root = mergeKbFolders(root, await readKbFolders(kbStore.paths.kb.dir, { strict: true }));
+            } catch (error) {
+                // 坏清单不能伪装成「没有显式目录」：保留 manifest 树，同时把原因带出去。
+                foldersError = String(error?.message ?? error);
+            }
+        }
+        return {
+            action: 'kb-tree',
+            root,
+            counts: kbCountsOf(rows),
+            origin: 'kb',
+            foldersError,
+        };
+    }
+
+    /**
+     * 新建显式的空虚拟文件夹（只落 <kbDir>/folders.json）。
+     *
+     * 不是工具动作：office_memory 的动作表里没有它，也不接受会话范围 —— 模型不能写
+     * 虚拟目录、不能借新建目录改变共享索引的拓扑；面板端点只从 POST 路由调用。
+     */
+    async function kbFolderCreate({ path = '', scope = null } = {}) {
+        if (scope !== null && scope !== undefined) {
+            const error = new Error('会话范围里不能新建知识库文件夹。');
+            error.code = 'KB_FOLDER_FORBIDDEN';
+            throw error;
+        }
+        return await createKbFolder(kbStore.paths.kb.dir, path);
     }
 
     /**
@@ -2832,7 +5190,7 @@ export function createMemory({ root, memory = {} }) {
      * `id` 两种：块 id（`kb:<docHash>:<n>`）只读那一块；文档 id（`kb:<docHash>`）按块号
      * 顺序读到额度用完为止。额度是 KB_READ_CHARS，被截断时明确报「还有 N 块没给」。
      */
-    async function kbRead({ id = '', path = '' } = {}) {
+    async function kbRead({ id = '', path = '', scope = null } = {}) {
         const wantedId = asText(id);
         let docId = '';
         let wantedHash = '';
@@ -2851,15 +5209,74 @@ export function createMemory({ root, memory = {} }) {
         } else {
             docId = docIdOf(relativeInside(path));
         }
+        // 摘要块：只在 SQLite 索引里，没有 manifest / 块文件，正文就是摘要本身。
+        const summaryRefs = summaryIdOf(wantedId);
+        if (summaryRefs.length > 0) {
+            const loaded = await withKbDb(async (handle) => {
+                for (const ref of summaryRefs) {
+                    const found = await handle.summaryFor(ref);
+                    if (found !== null) {
+                        // 摘要属于生成它的那份文档：文档在范围外时摘要也不可见。
+                        const row = handle.db.prepare('SELECT folder FROM docs WHERE id = ? LIMIT 1').get(found.docId);
+                        assertScope(scope, row === undefined ? '' : String(row.folder ?? ''));
+                        // 来源块也要在范围内：摘要正文可能引用了范围外文件夹的内容。
+                        if (!(await summarySourcesVisible(scope, found.chunkIds))) return null;
+                        return { summary: found, sources: handle.chunksByIds({ ids: found.chunkIds }) };
+                    }
+                }
+                return null;
+            });
+            if (loaded !== null) return summaryReadOf(loaded.summary, loaded.sources);
+            throw new Error(`kb 里没有「${wantedId}」这份摘要。先用 action:'kb-summaries' 看清单。`);
+        }
+        // 归档投影是只读的虚拟文档：没有 manifest / 块文件，正文就在行上。
+        if (!wantedChunk || wantedChunk === 1) {
+            const syntheticRows = (await kbRows()).filter((row) => row.synthetic === true);
+            const synthetic = wantedHash !== ''
+                ? syntheticRows.find((row) => row.hash === wantedHash)
+                : syntheticRows.find((row) => row.id === docId);
+            if (synthetic !== undefined) {
+                assertScope(scope, synthetic.folder);
+                return {
+                    action: 'kb-read',
+                    docId: synthetic.id,
+                    path: synthetic.path,
+                    folder: synthetic.folder,
+                    title: synthetic.title,
+                    tier: synthetic.tier,
+                    at: synthetic.at,
+                    chunks: [{
+                        id: `kb:${synthetic.hash}:1`,
+                        n: 1,
+                        text: synthetic.text,
+                        span: { start: 1, end: synthetic.text.length },
+                        outline: [synthetic.title],
+                        path: synthetic.path,
+                        tier: synthetic.tier,
+                        at: synthetic.at,
+                        header: `# ${synthetic.title}`,
+                        spanText: `字符 1–${synthetic.text.length}`,
+                    }],
+                    chunks_total: 1,
+                    chunks_missing: 0,
+                    total: 1,
+                    truncated: false,
+                    budgetChars: KB_READ_CHARS,
+                    origin: synthetic.origin,
+                };
+            }
+        }
         for (const store of kbLookupStores()) {
             const rows = await loadKbManifest(store.paths.kb);
             // 块 id 按**内容**寻址，同一批块可能被两个根里的两份文档共用；请求的块号在
             // 这一份里越界时**继续往后找**（多个候选里挑第一个真的有这一块的），
             // 而不是当场报「只有 N 块」——那不是「没有这一块」，只是这一份没有
             // （独立验证 4h）。文档 id 则按路径寻址，直接命中或继续找。
+            // 范围外的行先剔掉：它们对这次调用等于不存在（按 id 读也一样）。
+            const inScope = visibleRows(scope, rows);
             const candidates = wantedHash !== ''
-                ? rows.filter((item) => item.hash === wantedHash)
-                : rows.filter((item) => item.id === docId);
+                ? inScope.filter((item) => item.hash === wantedHash)
+                : inScope.filter((item) => item.id === docId);
             if (candidates.length === 0) continue;
             const row = wantedChunk > 0
                 ? candidates.find((item) => wantedChunk <= item.chunks)
@@ -2885,6 +5302,7 @@ export function createMemory({ root, memory = {} }) {
                 action: 'kb-read',
                 docId: row.id,
                 path: row.path,
+                folder: row.folder,
                 title: row.title,
                 tier: row.tier,
                 at: row.at,
@@ -2912,6 +5330,124 @@ export function createMemory({ root, memory = {} }) {
     }
 
     /**
+     * 一份文档的**块清单**（面板下钻用）：只给元数据，不搬正文。
+     *
+     * 为什么不复用 kbRead：kbRead 的额度是给模型读正文的（默认 12 块 / 1.2 万字），
+     * 面板要的是「这份文档到底切成了几块、每块在源文的哪一段」，块数再多也只该列
+     * 元数据。正文按块另取（kbRead 传块 id），一次只读一块，面板不会因为一份长文档
+     * 把整页拖成几 MB。
+     *
+     * 入参可以是文档 id、文档 path，或块 id（kb:<内容哈希>:<块号>）—— 块 id 会先
+     * 定位到它所属的那份文档，弹回块清单时仍能高亮那一块。找不到就抛错（调用方
+     * buildSnapshot 会把它写成 kbDocError，不把整份快照打红）。
+     */
+    async function kbDoc({ id = '', path = '', origin = '' } = {}) {
+        const wantedId = asText(id);
+        // 单库：origin 只保留在签名上，不再用于筛选。
+        let docId = '';
+        let wantedHash = '';
+        let wantedChunk = 0;
+        if (wantedId !== '') {
+            const parts = wantedId.split(':');
+            if (parts[0] === 'kb' && parts.length >= 3) {
+                wantedHash = parts[1];
+                wantedChunk = Number.parseInt(parts[2], 10) || 0;
+            } else {
+                docId = wantedId;
+            }
+        } else {
+            docId = docIdOf(relativeInside(path));
+        }
+        // 摘要块：在 SQLite 索引里，块清单固定一块；正文就是摘要。
+        const summaryRefs = summaryIdOf(wantedId);
+        if (summaryRefs.length > 0) {
+            const loaded = await withKbDb(async (handle) => {
+                for (const ref of summaryRefs) {
+                    const found = await handle.summaryFor(ref);
+                    if (found !== null) return { summary: found, sources: handle.chunksByIds({ ids: found.chunkIds }) };
+                }
+                return null;
+            });
+            if (loaded !== null) return summaryDocOf(loaded.summary, loaded.sources);
+            throw new Error(`kb 里没有「${wantedId}」这份摘要。先用 action:'kb-summaries' 看清单。`);
+        }
+        // 归档投影的块清单：固定一块，没有块文件可读。
+        if (!wantedChunk || wantedChunk === 1) {
+            const syntheticRows = (await kbRows()).filter((row) => row.synthetic === true);
+            const synthetic = wantedHash !== ''
+                ? syntheticRows.find((row) => row.hash === wantedHash)
+                : syntheticRows.find((row) => row.id === docId);
+            if (synthetic !== undefined) {
+                return {
+                    action: 'kb-doc',
+                    docId: synthetic.id,
+                    path: synthetic.path,
+                    folder: synthetic.folder,
+                    title: synthetic.title,
+                    tier: synthetic.tier,
+                    at: synthetic.at,
+                    origin: synthetic.origin,
+                    selectedChunk: wantedChunk,
+                    // 面板改正文时要能整篇回填；归档投影只有这一块，就是全文。
+                    text: synthetic.text,
+                    chunks: [{
+                        id: `kb:${synthetic.hash}:1`,
+                        n: 1,
+                        chars: synthetic.text.length,
+                        span: { start: 1, end: synthetic.text.length },
+                        spanText: `字符 1–${synthetic.text.length}`,
+                        outline: [synthetic.title],
+                        header: `# ${synthetic.title}`,
+                    }],
+                    chunks_total: 1,
+                    chunks_missing: 0,
+                    total: 1,
+                };
+            }
+        }
+        for (const store of kbLookupStores()) {
+            if (store.id !== kbStore.id) continue;
+            const rows = await loadKbManifest(store.paths.kb);
+            const candidates = wantedHash !== ''
+                ? rows.filter((item) => item.hash === wantedHash)
+                : rows.filter((item) => item.id === docId);
+            if (candidates.length === 0) continue;
+            const row = wantedChunk > 0
+                ? candidates.find((item) => wantedChunk <= item.chunks)
+                : candidates[0];
+            if (row === undefined) continue;
+            const all = await loadKbChunks(store.paths.kb, row.hash, row.chunks);
+            return {
+                action: 'kb-doc',
+                docId: row.id,
+                path: row.path,
+                folder: row.folder,
+                title: row.title,
+                tier: row.tier,
+                at: row.at,
+                origin: store.id,
+                selectedChunk: wantedChunk,
+                // 块是源文的切片；按序拼回去就是可编辑的整篇（多空一行，重切时会被
+                // splitDocument 归一掉）。只给面板回填，不参与检索。
+                text: all.map((chunk) => chunk.text).join('\n\n'),
+                chunks: all.map((chunk) => ({
+                    id: chunk.id,
+                    n: chunk.n,
+                    chars: chunk.text.length,
+                    span: chunk.span,
+                    spanText: spanText(chunk.span),
+                    outline: chunk.outline,
+                    header: chunkHeaderOf({ outline: chunk.outline, source: row.path, at: row.at }),
+                })),
+                chunks_total: row.chunks,
+                chunks_missing: row.chunks - all.length,
+                total: all.length,
+                ...(Array.isArray(row.images) && row.images.length > 0 ? { images: row.images } : {}),
+            };
+        }
+        throw new Error('kb 里没有「' + (wantedId || docId) + '」这份文档。先用 action:kb-list 看清单。');
+    }
+    /**
      * kb 检索（第二十四轮 24-11）：词法多路（正文 + 块头）BM25 融合，**弃答**而不是硬凑。
      *
      * 三条口径，都有出处：
@@ -2926,14 +5462,35 @@ export function createMemory({ root, memory = {} }) {
      * 检索**不占读取额度**但占每回合配额（与记忆侧的 `read` 同一条纪律）：词法检索最容易被
      * 「没查到就换个词再查」拖着走，所以次数由 `quota.kbSearchPerTurn` 管。
      */
-    async function kbSearch({ query = '', limit = 0, tier = '', path = '' } = {}) {
+    async function kbSearch({ query = '', limit = 0, tier = '', path = '', origin = '', folder = '', recursive = true, exactFolder = false, scope = null } = {}) {
         const wanted = asText(query);
+        // 单库：origin 参数保留兼容，但不再过滤任何文档。
+        // folder 参数只能把会话范围往里收：给了范围外的文件夹直接报错，而不是换个查询。
+        const narrow = narrowFolder(scope, folder, recursive !== false);
+        const wantedFolder = narrow.folder;
+        const wantRecursive = narrow.recursive;
+        // 面板「仅当前层」的精确目录过滤：根目录也要按空串精确匹配。工具面不传，
+        // 仍走 kbFolderInScope（folder 为空串 = 整个库）的原语义。
+        const exactDir = exactFolder === true;
+        const inWantedFolder = (folder) => exactDir
+            ? String(folder ?? '') === wantedFolder
+            : kbFolderInScope(folder, wantedFolder, { recursive: wantRecursive });
         if (wanted === '') {
             throw new Error('kb-search 需要 query（要查什么）。它是**词法**检索：中文按 bigram 展开、'
                 + '拉丁词整词保留；查询与正文用词完全对不上（语义改写）时召不回 —— 这是这条边界的原文意思，不是故障。');
         }
         const wantedTier = strictTierOf(tier, 'tier');
         const wantedPath = asText(path) === '' ? '' : relativeInside(path);
+        // 配了真实向量通道才走 SQLite 混合检索；没有时保持原来的词法路径不变
+        // （本地哈希向量的语义能力是零，拿它放开「弃答」只会制造假命中）。
+        // diagnostics：混合检索退回词法时，把「为什么没有向量」带回来附在结果上
+        // （本地推理缺解释器/缺模型/超预算都有明确文字），不静默降级。
+        const diagnostics = {};
+        const hybrid = await hybridKbSearch({
+            query: wanted, limit, tier: wantedTier, path: wantedPath, origin: '',
+            folder: wantedFolder, recursive: wantRecursive, exact: exactDir, scope, diagnostics,
+        });
+        if (hybrid !== null) return hybrid;
         const candidates = [];
         const seen = new Set();
         /** 同一个内容哈希可能被多份文档共用（块按内容寻址），块文件只读一次。 */
@@ -2945,10 +5502,42 @@ export function createMemory({ root, memory = {} }) {
         //   missingChunks manifest 说有几块、盘上却读不到（或自校验对不上）的块数
         let capped = false;
         let missingChunks = 0;
+        // 归档投影参与检索：它们没有块文件，直接以整条为一块进候选。
+        for (const row of (await kbRows()).filter((item) => item.synthetic === true)) {
+            if (wantedTier !== '' && row.tier !== wantedTier) continue;
+            if (wantedPath !== '' && row.path !== wantedPath) continue;
+            if (!scopeAllows(scope, row.folder)) continue;
+            if (!inWantedFolder(row.folder)) continue;
+            docsTotal += 1;
+            if (candidates.length >= KB_SEARCH_CHUNKS) {
+                capped = true;
+                continue;
+            }
+            docsRead += 1;
+            const chunkId = `kb:${row.hash}:1`;
+            if (seen.has(chunkId)) continue;
+            seen.add(chunkId);
+            candidates.push({
+                id: chunkId,
+                docId: row.id,
+                path: row.path,
+                title: row.title,
+                tier: row.tier,
+                at: row.at,
+                origin: row.origin,
+                n: 1,
+                span: { start: 1, end: row.text.length },
+                text: row.text,
+                head: `# ${row.title}`,
+            });
+        }
         for (const store of kbLookupStores()) {
+            if (store.id !== kbStore.id) continue;
             for (const row of await loadKbManifest(store.paths.kb)) {
                 if (wantedTier !== '' && row.tier !== wantedTier) continue;
                 if (wantedPath !== '' && row.path !== wantedPath) continue;
+                if (!scopeAllows(scope, row.folder)) continue;
+                if (!inWantedFolder(row.folder)) continue;
                 docsTotal += 1;
                 if (candidates.length >= KB_SEARCH_CHUNKS) {
                     capped = true;
@@ -2985,9 +5574,27 @@ export function createMemory({ root, memory = {} }) {
                 }
             }
         }
+        // 摘要块同样进候选：它们是用户从若干块合成的检索单元，不该只躺在摘要列表里。
+        const summaryCandidates = await summaryHitsFor(wanted, {
+            origin: '',
+            tier: wantedTier,
+            docId: wantedPath === '' ? '' : docIdOf(wantedPath),
+            folder: wantedFolder,
+            recursive: wantRecursive,
+            exact: exactDir,
+        }, scope);
+        for (const hit of summaryCandidates) {
+            if (seen.has(hit.chunkId)) continue;
+            seen.add(hit.chunkId);
+            candidates.push(summaryCandidateOf(hit));
+        }
         const cap = limitOf(limit, KB_LIST_LIMIT, KB_SEARCH_LIMIT);
         const ranked = kbRankChunks(candidates, wanted);
-        const hits = ranked.slice(0, cap).map((row) => ({
+        const hits = ranked.slice(0, cap).map((row) => {
+            // 摘要命中自带来源块：把第一块正文预览一并给出，模型不必再按 chunkIds 手工挑层。
+            const sourceIds = Array.isArray(row.chunk.summaryOf) ? row.chunk.summaryOf : [];
+            const firstSource = sourceIds.length > 0 ? candidates.find((c) => c !== undefined && c !== null && c.chunk !== undefined && c.chunk.id === sourceIds[0]) : null;
+            return {
             chunkId: row.chunk.id,
             docId: row.chunk.docId,
             path: row.chunk.path,
@@ -2995,6 +5602,9 @@ export function createMemory({ root, memory = {} }) {
             tier: row.chunk.tier,
             origin: row.chunk.origin,
             n: row.chunk.n,
+            kind: row.chunk.synthetic === true ? 'summary' : 'chunk',
+            sourceChunkIds: sourceIds,
+            sourcePreview: firstSource === null || firstSource === undefined ? '' : truncate(firstSource.chunk.text, KB_HIT_PREVIEW),
             score: row.score,
             scoreText: row.scoreText,
             scoreHead: row.scoreHead,
@@ -3002,13 +5612,17 @@ export function createMemory({ root, memory = {} }) {
             spanText: spanText(row.chunk.span),
             chars: row.chunk.text.length,
             preview: truncate(row.chunk.text, KB_HIT_PREVIEW),
-        }));
+            };
+        });
         // 没能给出命中时，**原因必须分得清**（复核 P3：path 筛掉全部文档时也写「弃答 /
         // 没有一块的词表与查询重叠」，把读者推向「换个更贴近原文的词」——而真实原因是筛选）。
+        // 第五十七轮再分一档（独立复核 P3）：`recall` 下探到**空库**时会走这条路，而它
+        // 没有 tier / path 可去掉 —— 「筛选条件下一份文档都没有」在那时是一句做不到的建议。
+        const noFilter = wantedTier === '' && wantedPath === '' && wantedFolder === '';
         const reason = hits.length > 0
             ? 'hits'
             : docsTotal === 0
-                ? 'filter-empty'
+                ? (noFilter ? 'no-docs' : 'filter-empty')
                 : candidates.length === 0
                     ? 'no-chunks'
                     : 'no-overlap';
@@ -3021,6 +5635,8 @@ export function createMemory({ root, memory = {} }) {
         return {
             action: 'kb-search',
             query: wanted,
+            folder: wantedFolder,
+            recursive: wantRecursive,
             hits,
             matched: ranked.length,
             truncated: ranked.length > hits.length,
@@ -3032,17 +5648,27 @@ export function createMemory({ root, memory = {} }) {
             chunksMissing: missingChunks,
             budgetChars: KB_HIT_PREVIEW,
             maxChunks: KB_SEARCH_CHUNKS,
+            ...(diagnostics.embedding === undefined ? {} : {
+                embedding: diagnostics.embedding,
+                selector: { mode: config.selector.mode, applied: false, selected: 0 },
+            }),
         };
     }
 
     /**
      * 显式删除一份入库文档。
      *
-     * 与 `remove` 同一条纪律：**先清边 + 留墓碑，再动正文与索引**。悬空边比悬空条目更糟，
-     * 而 kb 的块是 link 的目标（「这条结论依据哪块来源」），所以删文档时必须把落在它的
-     * 文档 id 与全部块 id 上的边一并清掉。墓碑留着：一份旧 Pack 不该把删掉的来源搬回来。
+     * 与 `remove` 同一条纪律：**留墓碑 + 清边**，且「悬空引用 == 0」照旧成立 —— kb 的块
+     * 是 link 的目标（「这条结论依据哪块来源」），所以删文档时必须把落在它的文档 id 与
+     * 全部块 id 上的边一并清掉；墓碑留着：一份旧 Pack 不该把删掉的来源搬回来。
+     *
+     * 顺序按第五十六轮 S-03 的两段式提交协议：`manifest.jsonl` + `index.json` 是提交点，
+     * 提交之前只写意图（`pending.json`）不删字节，清边 / 墓碑 / 收块都在提交之后 ——
+     * 崩在提交前 = 完整旧版本（`danglingRefs()` 仍为 0），崩在提交后 = 完整新版本 +
+     * 一份可重放的日志（下一次 kb 写操作补完清边）。
      */
-    async function kbDrop({ id = '', path = '' } = {}) {
+    async function kbDrop({ id = '', path = '', scope = '', sessionScope = null } = {}) {
+        // 第八十八轮：单库之后 `scope` 不再选根（旧调用面保留，传了也不影响查找范围）。
         const wantedId = asText(id);
         const relPosix = asText(path) === '' ? '' : relativeInside(path);
         // 给的可以是文档 id、块 id（`kb:<内容哈希>:<块号>`，删掉它所属的那份文档）
@@ -3054,29 +5680,133 @@ export function createMemory({ root, memory = {} }) {
             const rows = await loadKbManifest(store.paths.kb);
             const hit = byHash !== '' ? rows.find((row) => row.hash === byHash) : rows.find((row) => row.id === targetId);
             if (hit === undefined) continue;
-            return withQueue(store.paths.dir, async () => {
+            // 删除也是写：范围外的文档对这次调用等于不存在（按 id 或块 id 都不行）。
+            assertScope(sessionScope, hit.folder);
+            // 多根队列（第五十六轮 S-10）：这次调用会**跨根**清边，所以必须一次拿全所有根的
+            // 队列 —— 只锁被请求的那个根等于没锁（另一个根上的 link / unlink 会用同一份
+            // `links.jsonl` 的旧快照回写，把刚清掉的边复活或把新边抹掉）。与 `mutate` 同一条协议。
+            return withQueues(stores.map((item) => item.paths.dir), async () => {
+                const recoveries = await replayAllKbPending();
+                const recovered = recoveries.length === 0 ? {} : { recoveries };
                 const current = await loadKbManifest(store.paths.kb);
                 const again = current.find((row) => row.id === hit.id);
                 if (again === undefined) throw new Error(`「${hit.id}」在这一刻已经不在 kb 里了。`);
                 const next = current.filter((row) => row.id !== again.id);
                 const dead = deadKbIds(again, await kbLiveAcrossStores({ store, rows: next }));
-                let prunedLinks = 0;
-                for (const item of stores) prunedLinks += await pruneLinks(item.paths, dead);
-                if (dead.size > 0) {
-                    await appendTombstones(store.paths, [...dead].map((deadId) => ({ id: deadId, reason: 'kb-drop' })));
-                }
-                if (!next.some((row) => row.hash === again.hash)) {
-                    await rm(join(store.paths.kb.chunks, again.hash), { recursive: true, force: true });
-                }
+                const journal = {
+                    version: 1,
+                    op: 'kb-drop',
+                    at: nowIso(),
+                    docId: again.id,
+                    // 重放判据：manifest 里已经**没有**这一版（id + hash）时，删除确实提交了。
+                    expectHash: again.hash,
+                    dead: [...dead],
+                    reason: 'kb-drop',
+                };
+                await writeKbPending(store, journal);
                 await saveKbManifest(store.paths.kb, next);
                 await saveKbIndex(store.paths.kb, next);
+                const cleanup = await finishKbWrite(store, journal);
                 return {
                     action: 'kb-drop', docId: again.id, path: again.path, title: again.title,
-                    chunks: again.chunks, prunedLinks, tombstones: dead.size, origin: store.id,
+                    chunks: again.chunks, origin: store.id, ...cleanup, ...recovered,
                 };
             });
         }
         throw new Error(`kb 里没有「${wantedId || relPosix}」这份文档。先用 action:'kb-list' 看清单。`);
+    }
+
+    /** 在打开的根里找一份可写的 kb 文档（块 id 也能指到文档）。 */
+    async function findWritableKbDoc(wantedId, scope = '', sessionScope = null) {
+        const wanted = asText(wantedId);
+        if (wanted === '') throw new Error('kb 文档操作需要 id（文档 id 或块 id）。');
+        const parts = wanted.split(':');
+        const byHash = parts[0] === 'kb' && parts.length >= 3 ? parts[1] : '';
+        // 第八十八轮：单库，`scope` 保留在签名里只为兼容旧调用面。
+        for (const store of kbLookupStores()) {
+            const rows = await loadKbManifest(store.paths.kb);
+            const hit = byHash !== ''
+                ? rows.find((row) => row.hash === byHash)
+                : rows.find((row) => row.id === wanted);
+            if (hit !== undefined) {
+                // 改 / 删同一道闸：文档不在会话范围里就不允许写（否则可以借「改标题」把它搬进来）。
+                assertScope(sessionScope, hit.folder);
+                return { store, row: hit, rows };
+            }
+        }
+        throw new Error('kb 里没有「' + wanted + '」这份文档。归档条目是只读投影，不能改；'
+            + "其它文档先用 action:'kb-list' 看清单。");
+    }
+
+    /**
+     * 改一份 kb 文档的元数据（标题 / 虚拟文件夹 / 来源档），不动正文与块。
+     *
+     * 虚拟文件夹只是 manifest 行上的 folder 字段：改它不会移动磁盘上的源文件，
+     * 也不会复制第二份真源。标题同样只影响 manifest 与块头展示。
+     */
+    async function kbUpdate({ id = '', title = '', folder = null, tier = '', sessionScope = null } = {}) {
+        const wantedTitle = asText(title).replace(/\s+/g, ' ').trim().slice(0, 200);
+        const wantsFolder = folder !== null && folder !== undefined;
+        const wantedFolder = wantsFolder ? normalizeKbFolder(folder) : null;
+        // 目标文件夹也必须在会话范围里：否则可以把一份范围内的文档「挪出去」，再让
+        // 另一个会话读它 —— 受限会话里这条口子不留。
+        if (wantsFolder) assertScope(sessionScope, wantedFolder);
+        const wantedTier = asText(tier) === '' ? '' : strictTierOf(tier, 'tier');
+        if (wantedTitle === '' && !wantsFolder && wantedTier === '') {
+            throw new Error('kb-update 至少要改一样：title / folder / tier。');
+        }
+        const found = await findWritableKbDoc(id, '', sessionScope);
+        return withQueues(stores.map((item) => item.paths.dir), async () => {
+            const recoveries = await replayAllKbPending();
+            const recovered = recoveries.length === 0 ? {} : { recoveries };
+            const current = await loadKbManifest(found.store.paths.kb);
+            const again = current.find((row) => row.id === found.row.id);
+            if (again === undefined) throw new Error('「' + found.row.id + '」在这一刻已经不在 kb 里了。');
+            const nextTitle = wantedTitle === '' ? again.title : wantedTitle;
+            const nextFolder = wantsFolder ? wantedFolder : again.folder;
+            const nextTier = wantedTier === '' ? again.tier : wantedTier;
+            const changed = nextTitle !== again.title || nextFolder !== again.folder || nextTier !== again.tier;
+            if (changed) {
+                const next = current.map((row) => (row.id === again.id
+                    ? { ...row, title: nextTitle, folder: nextFolder, tier: nextTier }
+                    : row));
+                await saveKbManifest(found.store.paths.kb, next);
+                await saveKbIndex(found.store.paths.kb, next);
+            }
+            return {
+                action: 'kb-update', docId: again.id, path: again.path, title: nextTitle,
+                folder: nextFolder, tier: nextTier, origin: found.store.id, changed, ...recovered,
+            };
+        });
+    }
+
+    /**
+     * 直接修改一份文本型 kb 文档的正文，然后按原路径重新入库。
+     *
+     * 只认文本：源文件在工作目录里（相对路径已在入库时校验过），写入用临时文件 + rename，
+     * 不会把读到一半的半截文件留在盘上。归档投影与二进制抽取出来的文档没有可写源文件，
+     * 要改正文请先改源文件再 kb-ingest。
+     */
+    async function kbEdit({ id = '', text = '', sessionScope = null } = {}) {
+        if (typeof text !== 'string') throw new Error('kb-edit 需要 text（新的正文）。');
+        if (text.includes('\u0000')) throw new Error('正文里有 NUL 字节：kb 只收文本，图片请走资产。');
+        const bytes = byteLength(text);
+        if (bytes > KB_MAX_DOC_BYTES) {
+            throw new Error('正文有 ' + bytes + ' 字节，超过 kb 的单文档上限 ' + KB_MAX_DOC_BYTES + ' 字节。');
+        }
+        const found = await findWritableKbDoc(id, '', sessionScope);
+        if (found.row.path === '') throw new Error('这份文档没有相对路径，不能直接改正文。');
+        // 上传文档的正文只存在于块文件里，没有磁盘源文件可写；直接改正文会反而在
+        // 工作区里造出一份源文件，违背「只留切片」的上传口径。要改请删掉重新上传。
+        if (found.row.path.startsWith('uploads/')) {
+            throw new Error('这份文档是从本地上传的，知识库里只有切片、没有源文件；要改正文请删掉后重新上传。');
+        }
+        const relPosix = relativeInside(found.row.path);
+        await writeAtomic(join(base, relPosix), text);
+        // 内层重新入库必须带上会话范围：否则 kb-edit 会把范围核验跳过一次
+        // （外层只核了「要改的这份」，内层还会按 docId 命中同路径旧文档）。
+        const ingested = await kbIngest({ path: relPosix, tier: found.row.tier, scope: found.store.id, folder: found.row.folder, sessionScope });
+        return { ...ingested, action: 'kb-edit', edited: true, origin: found.store.id };
     }
 
     // ── 图关系 ──────────────────────────────────────────────────────────────
@@ -3089,7 +5819,6 @@ export function createMemory({ root, memory = {} }) {
      * 静默少一条 —— 那比直接报错难查得多。
      */
     async function link({ sourceId = '', targetId = '', kind = '', note = '', conflict = '', state = '' } = {}) {
-        if (!config.links) throw new Error('图关系已在设置里关掉（memory.links）。');
         const from = asText(sourceId);
         const to = asText(targetId);
         if (from === '' || to === '') throw new Error('link 需要 sourceId 与 targetId。');
@@ -3107,20 +5836,25 @@ export function createMemory({ root, memory = {} }) {
             throw new Error(`state 只支持 ${CONFLICT_STATES.join(' / ')}，收到「${wantedState}」。`);
         }
 
-        const index = await entryIndex();
-        // 墓碑只在「这个 id 现在确实不活着」时才判死：同一个 id 可能被重建
-        // （`pointer:archive` 就是固定 id —— 删掉之后下次容量溢出会重新建它），
-        // 陈旧墓碑不该把一条活着的条目永久锁死、更不能让它的合法边被删掉。
-        const stones = new Set((await allTombstones()).map((stone) => stone.id));
-        const alive = await liveIds();
-        for (const id of [from, to]) {
-            if (stones.has(id) && !alive.has(id)) throw new Error(`id 为「${id}」的条目已经被删除了（墓碑还在），不能给它建关系。`);
-        }
-        for (const id of [from, to]) {
-            if (!index.has(id)) throw new Error(`找不到 id 为「${id}」的记忆条目。先用 action:'read' 或 action:'related' 拿到确切 id。`);
-        }
-        const fromStore = stores.find((store) => store.id === index.get(from).origin) ?? defaultStore();
-        return withQueue(fromStore.paths.dir, async () => {
+        // 校验与写边必须在**同一次加锁**里（第五十六轮 S-10 的后半）：从前是「先算
+        // `entryIndex` / `liveIds` 判存活，再排队写」，于是校验与提交之间有一个窗口 ——
+        // 另一个写操作（`kbDrop` 删掉这一块、`remove` 删掉这一条）正好落在窗口里，
+        // 这条边就写成了**悬空边**（两个前提各自成立、拼起来不成立）。多根一起锁，
+        // 与 `mutate` 用同一条协议（跨根的边记在起点那一侧的根里）。
+        return withQueues(stores.map((item) => item.paths.dir), async () => {
+            const index = await entryIndex();
+            // 墓碑只在「这个 id 现在确实不活着」时才判死：同一个 id 可能被重建
+            // （`pointer:archive` 就是固定 id —— 删掉之后下次容量溢出会重新建它），
+            // 陈旧墓碑不该把一条活着的条目永久锁死、更不能让它的合法边被删掉。
+            const stones = new Set((await allTombstones()).map((stone) => stone.id));
+            const alive = await liveIds();
+            for (const id of [from, to]) {
+                if (stones.has(id) && !alive.has(id)) throw new Error(`id 为「${id}」的条目已经被删除了（墓碑还在），不能给它建关系。`);
+            }
+            for (const id of [from, to]) {
+                if (!index.has(id)) throw new Error(`找不到 id 为「${id}」的记忆条目。先用 action:'read' 或 action:'related' 拿到确切 id。`);
+            }
+            const fromStore = stores.find((store) => store.id === index.get(from).origin) ?? defaultStore();
             const existing = await loadLinks(fromStore.paths);
             const record = normalizeLink({ sourceId: from, targetId: to, kind: realKind, conflictClass: conflict, conflictState: state, note, at: nowIso() });
             const duplicate = existing.find((item) => item.sourceId === from && item.targetId === to && item.kind === realKind);
@@ -3167,25 +5901,23 @@ export function createMemory({ root, memory = {} }) {
         // kb 先放（第四层）：条目 id 是内容寻址的，只读 manifest 就能把文档与块全部摊出来，
         // 所以 `link` 可以指向「哪一块来源」而不必把正文读进内存。同 id 不可能与三层撞
         // （kb 前缀是 `kb:`，热记忆是 `m-`、台账是 `L-`、归档是 `mnemon:` / `b-`）。
-        for (const store of stores) {
-            for (const row of await loadKbManifest(store.paths.kb)) {
-                index.set(row.id, {
-                    id: row.id,
+        for (const row of await loadKbManifest(kbStore.paths.kb)) {
+            index.set(row.id, {
+                id: row.id,
+                layer: 'kb',
+                origin: 'kb',
+                text: `[kb 文档] ${row.title}（${row.path}，${row.chunks} 块）`,
+                item: row,
+            });
+            for (let n = 1; n <= row.chunks; n += 1) {
+                const id = chunkIdOf(row.hash, n);
+                index.set(id, {
+                    id,
                     layer: 'kb',
-                    origin: store.id,
-                    text: `[kb 文档] ${row.title}（${row.path}，${row.chunks} 块）`,
-                    item: row,
+                    origin: 'kb',
+                    text: `[kb 第 ${n} 块] ${row.path}`,
+                    item: { ...row, n },
                 });
-                for (let n = 1; n <= row.chunks; n += 1) {
-                    const id = chunkIdOf(row.hash, n);
-                    index.set(id, {
-                        id,
-                        layer: 'kb',
-                        origin: store.id,
-                        text: `[kb 第 ${n} 块] ${row.path}`,
-                        item: { ...row, n },
-                    });
-                }
             }
         }
         if (layers.archive) {
@@ -3235,6 +5967,8 @@ export function createMemory({ root, memory = {} }) {
         for (const store of stores) {
             for (const stone of await loadTombstones(store.paths)) out.push({ ...stone, origin: store.id });
         }
+        // 知识库是单库：它的墓碑落在 kb 目录里，也得算进「全部墓碑」。
+        for (const stone of await loadTombstones(kbStore.paths)) out.push({ ...stone, origin: kbStore.id });
         return out;
     }
 
@@ -3263,7 +5997,7 @@ export function createMemory({ root, memory = {} }) {
             }
             // kb 的文档 id 与块 id 也是关系边可能指向的目标（「这条结论依据哪块来源」）。
             // 只读 manifest：块 id 由「内容哈希 + 块号」算出来，不为这条不变量读正文。
-            for (const id of kbLiveIdsOf(await loadKbManifest(store.paths.kb))) ids.add(id);
+            for (const id of kbLiveIdsOf(await loadKbManifest(kbStore.paths.kb))) ids.add(id);
         }
         return ids;
     }
@@ -3287,7 +6021,6 @@ export function createMemory({ root, memory = {} }) {
      * mnemon 也把遍历限在一跳，图一旦放开很容易变成「把整个记忆库拉进上下文」。
      */
     async function related({ id = '', depth = 1, kind = '', limit = 0 } = {}) {
-        if (!config.links) throw new Error('图关系已在设置里关掉（memory.links）。');
         const start = asText(id);
         if (start === '') throw new Error('related 需要 id（先用 action:\'read\' 拿到条目 id）。');
         const index = await entryIndex();
@@ -3363,8 +6096,10 @@ export function createMemory({ root, memory = {} }) {
      * 不做抽取：猜出来的实体比没有实体更误导。热记忆可以在 add/replace 时带
      * entities 数组，归档条目里的 entities 来自迁移数据。
      */
-    async function entities({ query = '', limit = 0 } = {}) {
+    async function entities({ query = '', limit = 0, origin = '' } = {}) {
         const terms = queryTerms(query);
+        const wantedOrigin = origin === 'global' || origin === 'workspace' ? origin : '';
+        const inOrigin = (id) => wantedOrigin === '' || id === wantedOrigin;
         const table = new Map();
         const add = (name, ref) => {
             const key = asText(name);
@@ -3376,6 +6111,7 @@ export function createMemory({ root, memory = {} }) {
         };
         if (layers.hot) {
             for (const store of stores) {
+                if (!inOrigin(store.id)) continue;
                 for (const item of (await loadStore(store.paths)).entries) {
                     for (const name of stringList(item.entities)) add(name, { id: item.id, layer: 'hot', origin: store.id, text: truncate(item.content, 80) });
                 }
@@ -3383,6 +6119,7 @@ export function createMemory({ root, memory = {} }) {
         }
         if (layers.archive) {
             for (const item of await archiveItems()) {
+                if (!inOrigin(item.origin)) continue;
                 for (const name of stringList(item.entities)) {
                     add(name, { id: asText(item.id), layer: 'archive', origin: item.origin, text: truncate(archiveItemText(item), 80) });
                 }
@@ -3407,6 +6144,10 @@ export function createMemory({ root, memory = {} }) {
      */
     async function exportPack({ includeArchiveFiles = true } = {}) {
         const storesOut = [];
+        // 知识库单库：只挂在第一个记忆根下带走一次，其余根给空包 —— 否则导入时同一份
+        // manifest 会在两个根里各写一遍（单库之后它们指向同一个目录，就是重复行）。
+        const kbManifest = await loadKbManifest(kbStore.paths.kb);
+        const kbFiles = includeArchiveFiles ? await readKbChunkFiles(kbStore.paths.kb, kbManifest) : {};
         for (const store of stores) {
             const loaded = await loadStore(store.paths);
             const index = await loadArchiveIndex(store.paths);
@@ -3425,7 +6166,7 @@ export function createMemory({ root, memory = {} }) {
             }
             // 知识库（第四棵树）：manifest 是清单，块正文按 `<docHash>/<n>.json` 逐块带走。
             // 与归档同一个理由 —— 少了正文，导入方拿回的只是「有几份文档、切了几块」。
-            const kbManifest = await loadKbManifest(store.paths.kb);
+            const carrier = store.id === stores[0].id;
             storesOut.push({
                 id: store.id,
                 dir: store.paths.dir,
@@ -3435,8 +6176,8 @@ export function createMemory({ root, memory = {} }) {
                 archiveFiles,
                 archiveItemFiles,
                 kb: {
-                    manifest: includeArchiveFiles ? kbManifest : [],
-                    files: includeArchiveFiles ? await readKbChunkFiles(store.paths.kb, kbManifest) : {},
+                    manifest: carrier && includeArchiveFiles ? kbManifest : [],
+                    files: carrier && includeArchiveFiles ? kbFiles : {},
                 },
                 links: await loadLinks(store.paths),
                 tombstones: await loadTombstones(store.paths),
@@ -3638,7 +6379,7 @@ export function createMemory({ root, memory = {} }) {
                 //      包里的正文与 id 不匹配时照收，等于让「Pack 可以改内容而保留 id」。
                 const incomingKb = incomingStore.kb !== null && typeof incomingStore.kb === 'object' ? incomingStore.kb : {};
                 const incomingKbFiles = incomingKb.files !== null && typeof incomingKb.files === 'object' ? incomingKb.files : {};
-                const localKb = await loadKbManifest(store.paths.kb);
+                const localKb = await loadKbManifest(kbStore.paths.kb);
                 const localKbIds = new Set(localKb.map((row) => row.id));
                 const aliveNow = kbLiveIdsOf(localKb);
                 const freshKb = [];
@@ -3688,7 +6429,7 @@ export function createMemory({ root, memory = {} }) {
                         continue;
                     }
                     for (const [rel, text] of Object.entries(files)) {
-                        await writeAtomic(join(store.paths.kb.chunks, rel), text);
+                        await writeAtomic(join(kbStore.paths.kb.chunks, rel), text);
                     }
                     // 档位取**更保守**的一方：包里说 verified、本地同一份内容说 unverified 时，
                     // 相信 unverified（档位可以被人手改包里的字段，本地记录不会）。
@@ -3699,8 +6440,8 @@ export function createMemory({ root, memory = {} }) {
                     storeReport.kbDocs += 1;
                 }
                 if (freshKb.length > 0) {
-                    await saveKbManifest(store.paths.kb, [...localKb, ...freshKb]);
-                    await saveKbIndex(store.paths.kb, [...localKb, ...freshKb]);
+                    await saveKbManifest(kbStore.paths.kb, [...localKb, ...freshKb]);
+                    await saveKbIndex(kbStore.paths.kb, [...localKb, ...freshKb]);
                 }
 
                 // 关系**最后搬**（归档合并之后）：这样「活着的 id」集合已经包含本次
@@ -3740,6 +6481,94 @@ export function createMemory({ root, memory = {} }) {
     }
 
     /**
+     * 全量条目索引：id → { id, layer, origin, text, item }。
+     * 热记忆与台账优先于归档（同 id 只可能出现在热记忆下沉之后的归档里）。
+     * 第九十一轮图谱下线后仍有调用方：导入校验、悬空引用统计与知识库写入。
+     */
+    async function entryIndex() {
+        const index = new Map();
+        for (const row of await loadKbManifest(kbStore.paths.kb)) {
+            index.set(row.id, { id: row.id, layer: 'kb', origin: 'kb', text: `[kb 文档] ${row.title}（${row.path}，${row.chunks} 块）`, item: row });
+            for (let n = 1; n <= row.chunks; n += 1) {
+                const id = chunkIdOf(row.hash, n);
+                index.set(id, { id, layer: 'kb', origin: 'kb', text: `[kb 第 ${n} 块] ${row.path}`, item: { ...row, n } });
+            }
+        }
+        if (layers.archive) {
+            for (const item of await archiveItems()) {
+                const id = asText(item.id);
+                if (id === '') continue;
+                index.set(id, { id, layer: 'archive', origin: item.origin, text: archiveItemText(item), item });
+            }
+        }
+        if (layers.ledger) {
+            for (const store of stores) {
+                for (const record of await loadLedger(store.paths)) {
+                    const id = asText(record.id);
+                    if (id === '') continue;
+                    index.set(id, { id, layer: 'ledger', origin: store.id, text: [asText(record.path), asText(record.purpose)].filter(Boolean).join(' —— '), item: record });
+                }
+            }
+        }
+        if (layers.hot) {
+            for (const store of stores) {
+                for (const entry of (await loadStore(store.paths)).entries) {
+                    index.set(entry.id, { id: entry.id, layer: 'hot', origin: store.id, text: entry.content, item: entry });
+                }
+            }
+        }
+        return index;
+    }
+
+    /** 全部墓碑（跨根合并）。导入判死与悬空统计都靠它。 */
+    async function allTombstones() {
+        const out = [];
+        for (const store of stores) {
+            for (const stone of await loadTombstones(store.paths)) out.push({ ...stone, origin: store.id });
+        }
+        for (const stone of await loadTombstones(kbStore.paths)) out.push({ ...stone, origin: kbStore.id });
+        return out;
+    }
+
+    /**
+     * 全部**活着**的条目 id（热记忆 + 台账 + 归档 + 知识库）。
+     * 与 entryIndex 的差别是**不看层开关**：层关掉只是「这次不读」，不是「条目不存在」。
+     */
+    async function liveIds() {
+        const ids = new Set();
+        for (const store of stores) {
+            for (const entry of (await loadStore(store.paths)).entries) {
+                const id = asText(entry.id);
+                if (id !== '') ids.add(id);
+            }
+            for (const record of await loadLedger(store.paths)) {
+                const id = asText(record.id);
+                if (id !== '') ids.add(id);
+            }
+            const index = await loadArchiveIndex(store.paths);
+            for (const digest of index.digests) {
+                for (const block of asArray(digest.blocks)) {
+                    for (const id of blockIds(block)) ids.add(id);
+                }
+            }
+            for (const id of kbLiveIdsOf(await loadKbManifest(kbStore.paths.kb))) ids.add(id);
+        }
+        return ids;
+    }
+
+    /** 悬空引用（不变量：必须为空）。数得出来才守得住。 */
+    async function danglingRefs() {
+        const live = await liveIds();
+        const out = [];
+        for (const store of stores) {
+            for (const link of await loadLinks(store.paths)) {
+                if (!live.has(link.sourceId) || !live.has(link.targetId)) out.push({ ...link, origin: store.id });
+            }
+        }
+        return out;
+    }
+
+    /**
      * 浏览用的一次性读取：**原始记录**，不过召回质量、不按命中排序。
      *
      * 与 read() 的区别是用途不同：read() 服务「模型带着问题查资料」，所以要有
@@ -3763,9 +6592,6 @@ export function createMemory({ root, memory = {} }) {
                 digestCount += harvested.volumes;
                 for (const item of harvested.items) out.archive.push(item);
             }
-            if (config.links) {
-                for (const link of await loadLinks(store.paths)) out.links.push({ ...link, origin: store.id });
-            }
         }
         const byAt = (left, right) => String(right.at ?? right.updatedAt ?? '').localeCompare(String(left.at ?? left.updatedAt ?? ''));
         out.ledger.sort(byAt);
@@ -3782,6 +6608,37 @@ export function createMemory({ root, memory = {} }) {
             // 归档上限 archiveKeep 管的是**摘要文件数**（一个月一个），不是条目数 ——
             // 两者必须分开报，否则「30 条 / 60 个」这种配对会被读成「快满了」。
             digests: digestCount,
+        };
+    }
+
+    /**
+     * 归档隔离的对外摘要。
+     *
+     * 只给判定与警告，不打印旧档文件名、正文或绝对路径 —— 状态面板可以提示
+     * 「有归属不明的旧档」，但不能因此把它们的内容跨工作区摊开。
+     */
+    function archiveScopeStatusOf(store) {
+        const scope = store?.paths?.archiveScope;
+        if (scope === undefined) return null;
+        const warnings = [];
+        if (scope.legacyAttribution === 'unattributed') {
+            warnings.push('共用 archive 中有无法核实归属的旧档；已保持只读，不进入知识库，也不会归给本工作区。');
+        } else if (scope.legacyAttribution === 'other') {
+            warnings.push('共用 archive 中的旧档明确属于另一个工作区；本工作区只读隔离。');
+        }
+        if (scope.retentionSafe === false) {
+            if (scope.retentionReason === 'explicit-global-dir-unverified') {
+                warnings.push('全局目录是显式配置，归属无法核实；已跳过归档保留上限，避免误删可能是工作区的旧档。');
+            } else {
+                warnings.push('共享 archive 的归档保留上限已跳过：无法安全判断兄弟工作区的归档条目，避免误删共享关系或墓碑。');
+            }
+        }
+        return {
+            mode: scope.mode,
+            namespaced: scope.writeNamespaced === true,
+            legacy: scope.legacyAttribution,
+            retentionSafe: scope.retentionSafe !== false,
+            warnings,
         };
     }
 
@@ -3827,12 +6684,22 @@ export function createMemory({ root, memory = {} }) {
                 // 目录不存在时是 0 而不是 undefined —— 契约是数字，面板直接渲染它。
                 bytes: size.bytes,
                 files: size.files,
-                // 知识库（第四棵树）：文档数 / 块数 / 来源三档的分布。读索引就够了；
-                // 索引不在时按 manifest 现算（真源是 manifest 与块文件，索引只是投影）。
-                kb: await kbStatusOf(store),
+                archiveScope: archiveScopeStatusOf(store),
             });
         }
-        return { scope: config.scope, userScope: config.userScope, layers: { ...layers }, dangling, tombstones: tombstoneCount, stores: perStore };
+        // 知识库的墓碑单独落一条：面板上的「墓碑」按整个库算，删掉的块 id 不能再被 link。
+        tombstoneCount += (await loadTombstones(kbStore.paths)).length;
+        return {
+            scope: config.scope,
+            userScope: config.userScope,
+            layers: { ...layers },
+            dangling,
+            tombstones: tombstoneCount,
+            // 知识库是**单库**（第八十八轮），不属于任何一个记忆根：单独报一份。
+            // 读索引就够了；索引不在时按 manifest 现算（真源是 manifest 与块文件）。
+            kb: await kbStatusOf(kbStore),
+            stores: perStore,
+        };
     }
 
     return {
@@ -3840,6 +6707,9 @@ export function createMemory({ root, memory = {} }) {
         paths,
         config,
         stores: stores.map((store) => ({ id: store.id, dir: store.paths.dir })),
+        kb: { id: kbStore.id, dir: relPath(base, kbStore.paths.kb.dir) },
+        galleryDir,
+        gallery: () => galleryInstance,
         snapshot,
         read,
         browse,
@@ -3850,12 +6720,27 @@ export function createMemory({ root, memory = {} }) {
         archiveItems,
         sunk,
         kbIngest,
+        kbUpload,
+        kbPreview,
         kbRead,
+        kbDoc,
         kbList,
+        kbTree,
+        kbFolderCreate,
         kbSearch,
         kbDrop,
+        kbUpdate,
+        kbEdit,
+        kbLink,
+        kbUnlink,
+        kbRelated,
+        kbSummarize,
+        kbSummaries,
+        kbSummariesCount,
         kbRows,
         kbTierIndex,
+        // 第九十一轮：图谱不是工具面/界面能力了；这四个内部方法只为历史 links.jsonl
+        // 的导入、墓碑与悬空引用维护保留，工具与 UI 都不再暴露。
         link,
         unlink,
         related,
@@ -4023,7 +6908,7 @@ function hotLines(hot) {
  * 20 条又说空，模型会据此判定「台账里没有东西」，然后重做一份已有的交付物。
  * 现在：真的没有（total 0）说「空」；有但没命中说「没命中」；命中却被额度卡住说「额度被占满」。
  */
-function emptyLayerNote(layer, { query = '', windowed = false } = {}) {
+function emptyLayerNote(layer, { query = '', windowed = false, partitioned = false } = {}) {
     if (layer.total === 0 || layer.items_total === 0) {
         // 带时间窗时「一条都没有」有三种：本来就没有、有但都在窗外、有但没有时间戳。
         // 混着说会让模型把「窗选窄了」或「这条根本没有时间」读成「那段时间没记过」；
@@ -4036,9 +6921,22 @@ function emptyLayerNote(layer, { query = '', windowed = false } = {}) {
         }
         return '（空）';
     }
+    // 分区（新-12）与关键词是两件事，先分区后关键词：本层一条都没给而命中数是 0 时，
+    // 要分清是「分区把它们隔掉了」还是「关键词没命中」—— 前者的下一步是换标签 / 去分区，
+    // 后者的下一步是换词。说混了模型会一直换词，而换词永远换不出分区外的条目。
+    // 判据是「分区把这一层**全清**了」（隔掉数 = 分区前条数）：只隔掉一部分而分区内
+    // 一条都没命中时，建议「去掉分区」是错的 —— 去掉也一样没命中，该建议换词。
+    //
+    // 分区前的条数取 `total` **或** `items_total`（复核 P1-1）：归档那一层的字段名是
+    // `items_total`（热记忆与台账是 `total`），只认 `total` 会让 `>= undefined` 恒为假，
+    // 于是归档层的分区诊断**永远走不到**，还掉到最后那句假的「额度被占满」。
+    const before = layer.total ?? layer.items_total ?? 0;
+    if (partitioned && layer.matched === 0 && (layer.partitionFiltered ?? 0) >= before) {
+        return `（分区外的条目：本层 ${before} 条里没有一条声明过所给的分区标签/实体 —— 换标签，或去掉 tags / entities 看全量）`;
+    }
     if (query !== '' && layer.matched === 0) return '（没有命中的条目：换更准的关键词，或把召回质量 policy 改成 off）';
     const budget = layer.budgetChars === undefined ? '' : `本层 ${layer.budgetChars} 字额度`;
-    return `（命中 ${layer.matched ?? layer.total} 条，但${budget}被更长的条目占满，一条都没给）`;
+    return `（命中 ${layer.matched ?? before} 条，但${budget}被更长的条目占满，一条都没给）`;
 }
 
 /** 一层给了几条、被截掉几条 —— 有截断就明说给的是切片，而不是装作给全了。 */
@@ -4054,6 +6952,17 @@ export function renderRead(result) {
     const title = result.layer === 'all' ? '三层' : result.layer === 'hot' ? '热记忆' : result.layer === 'ledger' ? '台账' : '归档';
     const lines = [`📒 记忆读取（${title}）${result.query ? `：${result.query}` : ''}`];
     const windowed = result.window !== undefined;
+    // 分区（新-12）：给了 tags / entities 就是**硬隔离**，必须自报口径 —— 读的人
+    // 要能一眼看出「这次只看了哪一类」，否则「分区里没有」与「记忆里没有」会混成一件事。
+    const partitioned = result.partition !== undefined;
+    if (partitioned) {
+        const keys = [
+            result.partition.tags.length === 0 ? '' : `标签 ${result.partition.tags.join(' + ')}`,
+            result.partition.entities.length === 0 ? '' : `实体 ${result.partition.entities.join(' + ')}`,
+        ].filter(Boolean).join('、');
+        const dropped = (result.hot?.partitionFiltered ?? 0) + (result.ledger?.partitionFiltered ?? 0) + (result.archive?.partitionFiltered ?? 0);
+        lines.push(`分区：${keys}（硬过滤：没声明过这些标签/实体的条目一律不出现${dropped > 0 ? `，本次隔掉 ${dropped} 条` : ''}）`);
+    }
     if (result.window !== undefined) {
         const label = `${result.window.sinceInput || '不限'} ~ ${result.window.untilInput || '不限'}`;
         // 印出来的时刻必须是**本地**时刻：窗口是按本地时区解析的，印 UTC 会让人对不上账。
@@ -4065,10 +6974,31 @@ export function renderRead(result) {
     }
     if (result.hot !== undefined) {
         lines.push('', ...hotLines(result.hot));
-        const hotSlice = result.hot.total > result.hot.items.length
-            ? `（热记忆 ${result.hot.total} 条里给了 ${result.hot.items.length} 条：本层额度 ${result.hot.budgetChars} 字，看全部用 layer:'hot'）`
-            : '';
-        if (hotSlice !== '') lines.push(hotSlice);
+        // 切片行只在**额度真的吃掉条目**时才说「额度」（复核 P1-3）：从前它判 `total >
+        // items.length`，而带 query 时 total 是分区/窗口后的条数、items 是命中后的条数，
+        // 于是「query 过滤掉两条」被说成「额度吃掉了」，还会在 layer:'hot' 下建议
+        // 「看全部用 layer:'hot'」（空操作）。现在改判 `matched > items.length`：
+        // 只有命中多于给出才是截断；query / 分区隔掉的那些另有专门的说明行。
+        const hotMatched = result.hot.matched ?? result.hot.total;
+        if (hotMatched > result.hot.items.length) {
+            const what = result.query === '' ? '热记忆' : '热记忆命中的';
+            const how = result.layer === 'hot' ? '' : "；看全部用 layer:'hot'";
+            lines.push(`（${what} ${hotMatched} 条里给了 ${result.hot.items.length} 条：本层额度 ${result.hot.budgetChars} 字截断${how}）`);
+        }
+        // 「一条都没给」有四种原因，必须分开说：真的没有（total 0）/ 分区隔掉 / 没命中 /
+        // 额度被占满。混说会让模型对着分区外的条目一直换关键词 —— 而换词永远换不回来。
+        if (result.hot.items.length === 0 && result.hot.total > 0) {
+            // 先判「分区是不是把这一层全清了」，再判关键词：分区只隔掉一部分而分区内一条都没命中时，
+            // 建议「去掉分区看全量」是错的（去掉也一样没命中）—— 那种情况该建议换词。
+            const why = (result.hot.partitionFiltered ?? 0) >= result.hot.total
+                ? `热记忆 ${result.hot.partitionFiltered} 条没有声明所给的分区标签/实体（分区是硬过滤；去掉 tags / entities 看全量）`
+                : result.query !== '' && (result.hot.matched ?? 0) === 0
+                    ? '热记忆里没有命中关键词的条目（换词，或去掉 query 看全量）'
+                    : `热记忆命中 ${hotMatched} 条，但本层额度 ${result.hot.budgetChars} 字被更长的条目占满`;
+            lines.push(`（${why}）`);
+        } else if (partitioned && (result.hot.partitionFiltered ?? 0) > 0) {
+            lines.push(`（热记忆：另有 ${result.hot.partitionFiltered} 条没有声明所给的分区标签/实体，未列出）`);
+        }
         if (windowed && result.hot.total === 0) {
             const notes = [];
             if ((result.hot.windowUnstamped ?? 0) > 0) notes.push(`${result.hot.windowUnstamped} 条没有时间戳（排除，放宽窗口也读不到）`);
@@ -4082,7 +7012,7 @@ export function renderRead(result) {
     }
     if (result.ledger !== undefined) {
         lines.push('', `【台账】共 ${result.ledger.total} 条${result.query ? `，命中 ${result.ledger.matched} 条` : ''}`);
-        if (result.ledger.items.length === 0) lines.push(`- ${emptyLayerNote(result.ledger, { query: result.query, windowed })}`);
+        if (result.ledger.items.length === 0) lines.push(`- ${emptyLayerNote(result.ledger, { query: result.query, windowed, partitioned })}`);
         for (const item of result.ledger.items) {
             const badge = [item.format, item.theme].filter(Boolean).join(' · ');
             const id = asText(item.id) === '' ? '' : ` ${item.id}`;
@@ -4090,7 +7020,12 @@ export function renderRead(result) {
             // 结果里看得见，只存在字段里没人知道。
             const refs = stringList(item.kbRefs);
             const basis = refs.length === 0 ? '' : `｜用过 ${refs.slice(0, 3).join(' ')}${refs.length > 3 ? ' …' : ''}`;
-            lines.push(`- ${item.at.slice(0, 10)}${id}${originTag(item.origin)} ${item.text}${badge ? `  [${badge}]` : ''}${basis}`);
+            // 依据里的待核 / 找不到的引用（P1-4b）：行内点名，别让它只存在字段里。
+            const weak = [];
+            if (stringList(item.untrustedRefs).length > 0) weak.push(`${stringList(item.untrustedRefs).length} 块待核（只可引用、不可当定论）`);
+            if (stringList(item.unknownRefs).length > 0) weak.push(`${stringList(item.unknownRefs).length} 块在 kb 里找不到`);
+            const caution = weak.length === 0 ? '' : `｜⚠ 依据里 ${weak.join('、')}`;
+            lines.push(`- ${item.at.slice(0, 10)}${id}${originTag(item.origin)} ${item.text}${badge ? `  [${badge}]` : ''}${basis}${caution}`);
         }
         const note = sliceNote(result.ledger, 'ledger');
         if (note !== '') lines.push(note);
@@ -4100,7 +7035,7 @@ export function renderRead(result) {
     }
     if (result.archive !== undefined) {
         lines.push('', `【归档】${result.archive.digests} 个摘要 / ${result.archive.items_total} 条${result.query ? `，命中 ${result.archive.matched} 条` : ''}`);
-        if (result.archive.items.length === 0) lines.push(`- ${emptyLayerNote(result.archive, { query: result.query, windowed })}`);
+        if (result.archive.items.length === 0) lines.push(`- ${emptyLayerNote(result.archive, { query: result.query, windowed, partitioned })}`);
         for (const item of result.archive.items) {
             const label = item.kind === 'hot' ? `热记忆（${item.origin}/${item.importance}）`
                 : item.kind === 'mnemon' ? `mnemon 长期记忆${item.category ? `（${item.category}）` : ''}`
@@ -4131,6 +7066,33 @@ export function renderRead(result) {
     return lines.join('\n');
 }
 
+/**
+ * 统一入口路由（`recall`）的回执。
+ *
+ * 三段：**路由决策** → 记忆层正文（复用 `renderRead`）→ 下探到的 kb 命中（复用
+ * `renderKbSearch`）。第一段是这个动作存在的理由：只给结果不给决策，读的人看不出
+ * 「为什么这次没有 kb」—— 是记忆层够答，还是知识块检索的配额被挡住了。
+ */
+export function renderRecall(result) {
+    const gate = result.gate ?? {};
+    const terms = asArray(gate.terms);
+    const missing = asArray(gate.missing);
+    const lines = [`📒 统一入口（recall）：${result.query}`];
+    lines.push(`- 路由：记忆层命中 ${gate.hits ?? 0} 条｜查询词覆盖 ${asArray(gate.covered).length}/${terms.length}`
+        + (missing.length === 0 ? '' : `（缺「${missing.slice(0, 6).join('」「')}」${missing.length > 6 ? ' …' : ''}）`)
+        + `｜最高重要度 ${asText(gate.topImportance) === '' ? '—' : gate.topImportance}`);
+    const verdict = GATE_VERDICT_TEXT[gate.verdict] ?? asText(gate.verdict);
+    const descended = result.kb !== null && result.kb !== undefined;
+    const note = asText(result.kbNote);
+    lines.push(`- 判定：${verdict} → **${descended ? '已下探知识库' : '未下探知识库'}**`
+        + (descended
+            ? `（命中 ${result.kb.matched ?? 0} 块，给前 ${asArray(result.kb.hits).length} 块）`
+            : (note === '' ? '' : `（${note}）`)));
+    lines.push('', renderRead(result.read));
+    if (descended) lines.push('', renderKbSearch(result.kb));
+    return lines.join('\n');
+}
+
 /** 渲染一次写入的回执。mnemon 的做法：给回执，不回显整份文件。 */
 export function renderMutation(result) {
     const lines = [`📒 记忆已更新（${result.action} / ${result.target}）${originTag(result.origin)}`];
@@ -4141,10 +7103,13 @@ export function renderMutation(result) {
         // 删了就必须说清边和墓碑怎么了：只报「移除」会让人以为图里还留着这条路。
         lines.push(`- 同事务清掉关系边 ${result.prunedLinks ?? 0} 条；墓碑${result.tombStoned === true ? '已留' : '未写'}（删掉的 id 不会再被 link，也不会靠 Pack 导入复活）。`);
     } else if (result.action === 'replace') {
+        // 回执只给定位用的短预览：整条正文刚由调用方写入、已经在上文里，
+        // 再回灌一遍是纯 token 税（第七十五轮用户点名「每次调用都付税」）。
+        // 要看全文用 read，id 已经印在回执里。
         lines.push(`- 改前：${badge(result.previous)} ${truncate(result.previous?.content ?? '', 120)}`);
-        lines.push(`- 改后：${badge(result.entry)} ${result.entry?.content ?? ''}`);
+        lines.push(`- 改后：${badge(result.entry)} ${truncate(result.entry?.content ?? '', 120)}`);
     } else {
-        lines.push(`- 新增：${badge(result.entry)} ${result.entry?.content ?? ''}`);
+        lines.push(`- 新增：${badge(result.entry)} ${truncate(result.entry?.content ?? '', 120)}`);
     }
     // 写了就把它引用的知识块印出来（第四十一轮）：引用是给下一次「这条依据什么」看的，
     // 只写进文件而不回执，模型会以为这次引用没生效。
@@ -4152,7 +7117,13 @@ export function renderMutation(result) {
     if (result.action !== 'remove' && refs.length > 0) {
         lines.push(`- 依据 ${refs.length} 块来源：${refs.slice(0, 4).join(' ')}${refs.length > 4 ? ' …' : ''}（related 可以顺着这些 id 走）`);
     }
-    lines.push(`- 用量：${usageLine('user', result.usage.user)}；${usageLine('project', result.usage.project)}`);
+    // 用量只在「接近上限」或发生容量维持时印：平时它每次都是一样的数字，
+    // 对模型没有信息量，却会跟着每一条记忆回执进上下文。
+    const nearLimit = [result.usage?.user, result.usage?.project].some((usage) => usage
+        && Number.isFinite(usage.limit) && usage.limit > 0 && usage.used / usage.limit >= 0.95);
+    if (nearLimit || (result.maintenance ?? []).length > 0) {
+        lines.push(`- 用量：${usageLine('user', result.usage.user)}；${usageLine('project', result.usage.project)}`);
+    }
     if (result.evicted === true) {
         lines.push('- 注意：容量维持把刚写的这条也下沉了（它比现有条目更次要）。要留住它就先精简现有条目，或调大上限。');
     }
@@ -4175,7 +7146,6 @@ export function renderMutation(result) {
         lines.push(`- 篇幅提醒：这条 ${result.advisory.bytes} 字节，超过建议线 ${result.advisory.hint} 字节。`
             + '热记忆是「动笔前照办」的清单，建议压成一两句（谁、什么、怎么办），细节放 source 或入库到 kb。');
     }
-    lines.push('- 投影已重写：USER.md / MEMORY.md（都是生成物，不要直接编辑）。');
     return lines.join('\n');
 }
 
@@ -4226,14 +7196,54 @@ export function tierTag(tier) {
 
 /** 渲染 kb 入库的回执。 */
 export function renderKbIngest(result) {
+    if (result.dryRun === true) {
+        const est = result.estimate ?? {};
+        const lines = [
+            `🧮 AI 建库预估（没有调用模型）：${result.path}`,
+            `- ${est.chars ?? 0} 字符 / ${est.units ?? 0} 个小节 / ${est.batches ?? 0} 批，预计 ${est.calls ?? 0} 次调用`,
+            `- 预计输入约 ${est.estimatedInputTokens ?? 0} token、输出约 ${est.estimatedOutputTokens ?? 0} token；超预算：${est.overBudget === true ? '是（会被拒绝）' : '否'}`,
+        ];
+        if (asText(result.note) !== '') lines.push('- ' + result.note);
+        if (result.ai?.available === false) {
+            lines.push('- 通道不可用：这次没有发起任何模型请求；换通道或先配置宿主模型后再预估。');
+        } else if (result.duplicate === true) {
+            lines.push('- 实际入库会直接回执「同一版内容」，不会重跑模型；要重切请换模型 / 切块参数，或先 kb-drop 再入库。');
+        } else {
+            lines.push('- 确认后去掉 aiEstimate 再调一次；默认预算下超出的会直接拒绝，不会先烧钱。');
+        }
+        return lines.join('\n');
+    }
+    if (result.paused === true) {
+        return [
+            `⏸ AI 建库已暂停（未写入知识库）：${result.path}`,
+            `- 已完成 ${result.doneBatches ?? 0}/${result.batches ?? 0} 批，本次 ${result.calls ?? 0} 次调用；状态键 ${result.stateKey ?? ''}`,
+            `- ${result.note ?? ''}`,
+            '- 带 aiResume:true 再调一次即可从下一批继续；已完成的块会复用。',
+        ].join('\n');
+    }
+    const origin = originTag(result.origin);
     const head = result.retiered === true
-        ? `📚 kb 里那份内容一个字节没改，来源档已改：${result.path}（${tierTag(result.previousTier)} → ${tierTag(result.tier)}）`
+        ? `📚 kb 里那份内容一个字节没改，来源档已改：${result.path}（${tierTag(result.previousTier)} → ${tierTag(result.tier)}）${origin}`
         : result.unchanged === true
-            ? `📚 kb 里已经有这份文档的同一版内容（未写入任何字节）：${result.path}`
-            : `📚 kb 已入库 ${result.chunks} 块：${result.title}（${result.path}）`;
+            ? `📚 kb 里已经有这份文档的同一版内容（未写入任何字节）：${result.path}${origin}`
+            : `📚 kb 已入库 ${result.chunks} 块：${result.title}（${result.path}）${origin}`;
     const lines = [head];
     lines.push(`- 文档 id：${result.docId}（块 id 是 kb:<内容哈希>:<块号>，从 kb-read 的回执里抄。）`);
     lines.push(`- 来源档：${tierTag(result.tier)}${result.tier === 'unverified' ? ' —— 按硬规则不能进热记忆，只能留在 kb 里待核。' : ''}`);
+    // 入库评估闸（P1-4b）的回执：把「现算出来的证据面」印出来，别让档位只靠一句话。
+    const evidence = result.evidence;
+    if (evidence !== undefined) {
+        const hosts = asArray(evidence.hosts);
+        const shown = hosts.slice(0, 4).join('、');
+        lines.push(`- 来源证据（现算）：正文里 ${evidence.urls ?? 0} 个 http(s) 地址 / ${hosts.length} 个独立来源`
+            + `${hosts.length === 0 ? '' : `（${shown}${hosts.length > 4 ? ' …' : ''}）`}`);
+        if (result.tier === 'unverified' && hosts.length >= 2) {
+            lines.push(`  · 已经数得出 ≥2 个独立来源：确认无误可以用 kb-ingest 带 tier:'verified' 升档（正文一字不用改）。`);
+        }
+        if (result.tier === 'user' && hosts.length >= 2) {
+            lines.push("  · 已经数得出 ≥2 个独立来源：若它是检索回来的材料而不是用户给的，档位该用 'verified'。");
+        }
+    }
     if (result.unchanged !== true) {
         lines.push(`- 体积：${result.bytes} 字节 / ${result.chars} 字符；切块按结构（Markdown 标题路径 + 段落），块大小按来源分档。`);
     }
@@ -4242,6 +7252,13 @@ export function renderKbIngest(result) {
     }
     lines.push('- 读法：office_memory({ action: \'kb-read\', id: \'<文档 id 或块 id>\' })；清单：action:\'kb-list\'。');
     lines.push('- 依据引用：把块 id 写进 add 的 source —— 引用 unverified 的块会被当场拒绝（写入期硬规则）。');
+    const ai = result.ai;
+    if (ai !== undefined && ai !== null) {
+        lines.push(`- 模型：${ai.mode === 'off' ? '未启用' : `${ai.mode}${ai.model === '' ? '' : ` / ${ai.model}`}`}；切片 ${ai.chunking === true ? '开' : '关'} / 摘要 ${ai.summary === true ? '开' : '关'}；调用 ${ai.calls ?? 0} 次${ai.degraded > 0 ? `，降级 ${ai.degraded} 批（已按确定性规则回退，原文没丢）` : ''}`);
+        if (ai.summaries > 0) lines.push(`- 摘要 ${ai.summaries} 条另行存放（摘要不替代原文；检索命中会带原文块 id）。`);
+        if (Array.isArray(ai.errors) && ai.errors.length > 0) lines.push(`- 模型调用问题（可观察）：${ai.errors.slice(0, 3).join('；')}`);
+        if (ai.summaryError !== undefined) lines.push(`- 摘要保存失败：${ai.summaryError}`);
+    }
     return lines.join('\n');
 }
 
@@ -4255,7 +7272,7 @@ export function renderKbList(result) {
         return lines.join('\n');
     }
     for (const item of result.items) {
-        lines.push(`- [${tierTag(item.tier)}] ${item.id} ${item.path} —— ${item.title}（${item.chunks} 块，${item.bytes} 字节，${item.at}）`);
+        lines.push(`- [${tierTag(item.tier)}]${originTag(item.origin)} ${item.id} ${item.path} —— ${item.title}（${item.chunks} 块，${item.bytes} 字节，${item.at}）`);
     }
     if (result.truncated === true) lines.push(`- （只列了最近 ${result.items.length} 份，共 ${result.total} 份：要全看就按月份或路径自己挑。）`);
     lines.push('- 读一块：office_memory({ action: \'kb-read\', id: \'<块 id>\' })；读整份：id 用文档 id。');
@@ -4294,15 +7311,20 @@ export function renderKbSearch(result) {
     const hits = asArray(result.hits);
     const bounded = result.bounded === true;
     const scanned = `打开 ${result.docsRead ?? 0} 份文档 / 打分 ${result.chunks} 块`;
-    const head = result.reason === 'filter-empty'
-        ? `📚 kb 检索「${result.query}」：**筛选条件下一份文档都没有**（tier / path 把 ${result.docs ?? 0} 份文档全筛掉了）`
-        : result.reason === 'no-chunks'
-            ? `📚 kb 检索「${result.query}」：筛出的 ${result.docs} 份文档里**一块正文都读不到**（块文件缺失或坏了）`
-            : hits.length === 0
-                ? `📚 kb 检索「${result.query}」：**弃答**（${scanned}，没有一块的词表与查询重叠${bounded ? '；但这次**没扫完**，见下' : ''}）`
-                : `📚 kb 检索「${result.query}」：命中 ${result.matched} 块，给前 ${hits.length} 块（${scanned}）`;
+    const head = result.reason === 'no-docs'
+        ? `📚 kb 检索「${result.query}」：**库里还没有入库的文档**（一份都没有，与查询词无关）`
+        : result.reason === 'filter-empty'
+            ? `📚 kb 检索「${result.query}」：**筛选条件下一份文档都没有**（tier / path 把 ${result.docs ?? 0} 份文档全筛掉了）`
+            : result.reason === 'no-chunks'
+                ? `📚 kb 检索「${result.query}」：筛出的 ${result.docs} 份文档里**一块正文都读不到**（块文件缺失或坏了）`
+                : hits.length === 0
+                    ? `📚 kb 检索「${result.query}」：**弃答**（${scanned}，没有一块的词表与查询重叠${bounded ? '；但这次**没扫完**，见下' : ''}）`
+                    : `📚 kb 检索「${result.query}」：命中 ${result.matched} 块，给前 ${hits.length} 块（${scanned}）`;
     const lines = [head];
-    if (result.reason === 'filter-empty') {
+    if (result.reason === 'no-docs') {
+        lines.push('- 这不是「查不到这个词」，而是**知识库里一条来源都没有**：要查外部原文就先'
+            + 'kb-ingest 把材料入库；要找结论与约定，用 action:\'recall\'（先记忆层）或 read。');
+    } else if (result.reason === 'filter-empty') {
         lines.push('- 这不是「库里没有这份资料」，而是**筛选**把它排除了：去掉 tier / path 再查一次，'
             + '或先用 action:\'kb-list\' 看清单与每份文档的来源档。');
     } else if (result.reason === 'no-chunks') {
@@ -4311,7 +7333,15 @@ export function renderKbSearch(result) {
         lines.push('- 弃答是刻意的：kb 的检索是**词法**的（中文 bigram + BM25），查询与正文用词完全对不上时它给不出结果，');
         lines.push('  与其端出「最像的那块」当命中，不如说没有。换更贴近原文的词再试一次，或用 kb-list / kb-read 显式挑读。');
     } else {
-        lines.push('- 排序：正文与块头两路 BM25 各自归一化后加权（正文 0.75 / 块头 0.25）。分数是**同一批命中里的相对次序**，不是置信度。');
+        if (result.engine === 'sqlite-hybrid') {
+            lines.push('- 排序：SQLite 词法 BM25 + 向量余弦融合'
+                + `（词法 ${result.weights?.lexical ?? '?'} / 向量 ${result.weights?.vector ?? '?'}）`
+                + `；向量 ${result.embedding?.mode === 'local' ? '本地哈希模型' : '远端模型'}`
+                + `${result.selector?.applied === true ? `，已由筛选模型选中 ${result.selector?.selected ?? 0} 块` : '，未筛选'}。`
+                + '分数是**同一批命中里的相对次序**，不是置信度。');
+        } else {
+            lines.push('- 排序：正文与块头两路 BM25 各自归一化后加权（正文 0.75 / 块头 0.25）。分数是**同一批命中里的相对次序**，不是置信度。');
+        }
         lines.push('- 这里是预览（每块开头若干字符）。要逐字引用、要看 span 对应的原文，就用块 id 走 action:\'kb-read\' 读整块 —— 它有独立的读取额度。');
     }
     // 「没扫完」这一条**命中与没命中都要说**：没扫完时的「弃答」只说明「已扫过的那些里没有」。
@@ -4327,7 +7357,7 @@ export function renderKbSearch(result) {
     if (hits.length > 0) {
         for (const [index, hit] of hits.entries()) {
             lines.push('');
-            lines.push(`【${index + 1}｜分数 ${scoreText(hit.score)}（正文 ${scoreText(hit.scoreText)} / 块头 ${scoreText(hit.scoreHead)}）｜${hit.chunkId}｜${hit.path}｜第 ${hit.n} 块｜${hit.spanText}】`);
+            lines.push(`【${index + 1}｜分数 ${scoreText(hit.score)}（正文 ${scoreText(hit.scoreText)} / 块头 ${scoreText(hit.scoreHead)}）｜${hit.chunkId}｜${hit.path}${originTag(hit.origin)}｜第 ${hit.n} 块｜${hit.spanText}】`);
             lines.push(`来源档：${tierTag(hit.tier)}${hit.header === '' ? '' : `　${hit.header}`}`);
             lines.push(hit.preview);
         }
@@ -4338,91 +7368,95 @@ export function renderKbSearch(result) {
 /** 渲染 kb 删除的回执。 */
 export function renderKbDrop(result) {
     return [
-        `📚 kb 已删除：${result.title}（${result.path}）`,
+        `📚 kb 已删除：${result.title}（${result.path}）${originTag(result.origin)}`,
         `- 文档 id：${result.docId}；删掉 ${result.chunks} 块正文。`,
         `- 同事务清掉关系边 ${result.prunedLinks ?? 0} 条；留墓碑 ${result.tombstones ?? 0} 条（删掉的来源不会被旧 Pack 搬回来）。`,
     ].join('\n');
 }
 
-/** kb 五个动作的统一渲染入口（按结果里的 action 分派）。 */
+/** 渲染 kb 文档信息修改。 */
+export function renderKbUpdate(result) {
+    return [
+        `📚 kb 文档信息${result.changed === false ? '未变' : '已改'}：${result.title}（${result.path}）`,
+        `- 标题：${result.title}；文件夹：${result.folder === '' ? '根' : result.folder}；来源档：${tierTag(result.tier)}。`,
+        '- 只改文档级元数据，不重切块；改正文用 kb-edit。',
+    ].join('\n');
+}
+
+/** 渲染 kb 正文修改。 */
+export function renderKbEdit(result) {
+    return [
+        `📚 kb 正文已改并重新入库：${result.title}（${result.path}）`,
+        `- 文档 id：${result.docId}；${result.chunks} 块；${result.bytes} 字节。`,
+        '- 旧块与指向旧块的边已按换代规则清掉；新的块 id 请重新 kb-read。',
+    ].join('\n');
+}
+
+/** 渲染块间关系。 */
+export function renderKbLink(result) {
+    return [
+        `📚 块间关系已建立：${result.sourceId} —[${result.kind}]→ ${result.targetId}`,
+        result.note ? `- 备注：${result.note}` : '- 没写备注（note 可留空）。',
+        '- 关系双向：从任一端用 office_memory({ action: \'kb-related\', chunkId }) 都能走到对面。',
+    ].join('\n');
+}
+
+/** 渲染块邻居。 */
+export function renderKbRelated(result) {
+    const items = asArray(result.items);
+    if (items.length === 0) {
+        return [
+            `📚 块 ${result.chunkId} 没有相邻块。`,
+            '- 建边：office_memory({ action: \'kb-link\', sourceId, targetId, kind })；两端都要先入库。',
+        ].join('\n');
+    }
+    const lines = [`📚 块 ${result.chunkId} 的相邻块：${items.length} 条`];
+    for (const item of items) {
+        const label = item.title || item.path || item.docId || '（未命名文档）';
+        const preview = String(item.text ?? '').replace(/\s+/g, ' ').slice(0, 120);
+        lines.push(`- 第 ${item.hop} 跳 [${item.kind}] ${item.chunkId}｜${label} 第 ${item.n} 块${item.tier ? `（${tierTag(item.tier)}）` : ''}`);
+        if (preview !== '') lines.push(`  ${preview}${preview.length >= 120 ? '…' : ''}`);
+    }
+    lines.push('- 读整块：office_memory({ action: \'kb-read\', id: \'<块 id>\' })。');
+    return lines.join('\n');
+}
+
+/** 渲染摘要块。 */
+export function renderKbSummarize(result) {
+    return [
+        `📚 已生成摘要块：${result.title || '块摘要'}`,
+        `- 摘要 id：${result.id}；来源 ${asArray(result.chunkIds).length} 块（${asArray(result.chunkIds).slice(0, 6).join('、')}${asArray(result.chunkIds).length > 6 ? ' …' : ''}）。`,
+        '- 摘要作为独立块参与 kb-search；来源块仍各自保留。',
+    ].join('\n');
+}
+
+/** 渲染摘要清单。 */
+export function renderKbSummaries(result) {
+    const items = asArray(result.items);
+    if (items.length === 0) return '📚 还没有摘要块。用 kb-summarize 把多块合成一条。';
+    const lines = [`📚 摘要块：${items.length} 条`];
+    for (const item of items) {
+        const preview = String(item.text ?? '').replace(/\s+/g, ' ').slice(0, 100);
+        lines.push(`- ${item.id}｜${item.title || '块摘要'}｜来源 ${asArray(item.chunkIds).length} 块｜${item.createdAt}`);
+        if (preview !== '') lines.push(`  ${preview}${preview.length >= 100 ? '…' : ''}`);
+    }
+    return lines.join('\n');
+}
+
+/** kb 动作的统一渲染入口（按结果里的 action 分派）。 */
 export function renderKb(result) {
     if (result.action === 'kb-ingest') return renderKbIngest(result);
     if (result.action === 'kb-list') return renderKbList(result);
     if (result.action === 'kb-read') return renderKbRead(result);
     if (result.action === 'kb-search') return renderKbSearch(result);
     if (result.action === 'kb-drop') return renderKbDrop(result);
+    if (result.action === 'kb-update') return renderKbUpdate(result);
+    if (result.action === 'kb-edit') return renderKbEdit(result);
+    if (result.action === 'kb-link') return renderKbLink(result);
+    if (result.action === 'kb-related') return renderKbRelated(result);
+    if (result.action === 'kb-summarize') return renderKbSummarize(result);
+    if (result.action === 'kb-summaries') return renderKbSummaries(result);
     return `📚 kb：${JSON.stringify(result)}`;
-}
-
-/** 渲染建关系的回执。 */
-export function renderLink(result) {
-    const link = result.link ?? {};
-    const head = result.added === true
-        ? '📒 已建立关系'
-        : result.updated === true
-            ? '📒 这条关系已经存在，冲突状态已更新'
-            : '📒 这条关系已经存在（未重复写入）';
-    const lines = [
-        head,
-        `- ${link.id ?? ''} ${link.sourceId ?? ''} —[${link.kind ?? ''}]→ ${link.targetId ?? ''}${link.note ? `（${link.note}）` : ''}`,
-    ];
-    if (link.kind === 'contradicts') {
-        lines.push(`- 冲突：类别 ${link.conflictClass || '未分类'}，当前 ${conflictStateText(link.conflictState)}`
-            + '（保留双方、不做自动裁决；要改判断就再调一次 link，state 取 unresolved / prefer-source / prefer-target）。');
-    }
-    lines.push('- 关系是双向的：从任一端用 office_memory({ action: \'related\', id }) 都能走到对面。');
-    return lines.join('\n');
-}
-
-/** 渲染删关系的回执。 */
-export function renderUnlink(result) {
-    return `📒 已删除关系 ${result.link?.id ?? ''}（${result.link?.sourceId ?? ''} — ${result.link?.targetId ?? ''}）。`;
-}
-
-/** 渲染沿关系找相邻条目的结果。 */
-export function renderRelated(result) {
-    const lines = [`📒 关系遍历：${result.id}（${result.layer}）${result.text ? ` —— ${truncate(result.text, 80)}` : ''}`];
-    const dangling = result.dangling ?? [];
-    if (result.nodes.length === 0 && dangling.length === 0) {
-        lines.push('- 这条记忆还没有相邻条目。可以用 action:\'link\' 建一条关系。');
-        return lines.join('\n');
-    }
-    if (result.nodes.length > 0) {
-        lines.push(`- 相邻 ${result.nodes.length} 条（共 ${result.edges.length} 条边）：`);
-        for (const node of result.nodes) {
-            const conflict = node.via === 'contradicts' && node.conflictState ? `（冲突：${conflictStateText(node.conflictState)}）` : '';
-            lines.push(`  - [${node.layer}/${node.via}${node.hop > 1 ? ` ${node.hop}跳` : ''}] ${node.id}${originTag(node.origin)} ${truncate(node.text, 120)}${conflict}`);
-        }
-    }
-    if (dangling.length > 0) {
-        // 悬空边必须**报出来**，不能静默当没有邻居：它是「删了条目忘了清边」的证据。
-        lines.push(`- 另有 ${dangling.length} 处悬空（对端已经不在了，不会穿过它继续遍历）：`);
-        for (const edge of dangling.slice(0, 5)) {
-            lines.push(`  - ${edge.from} —[${edge.kind}]→ ${edge.to}（边 ${edge.id}）`);
-        }
-        lines.push(`  - 处理：把边删掉用 action:'unlink', id:'<边 id>'；或核对是不是某条记忆被删了没清边。`
-            + `库里的悬空边总数看 action:'status' 的 dangling（不变量：必须为 0）。`);
-    }
-    if (result.truncated === true) lines.push('- （已达条数上限：要看得更窄就带 kind。）');
-    return lines.join('\n');
-}
-
-/** 渲染实体视图。 */
-export function renderEntities(result) {
-    const lines = [`📒 实体视图（${result.total} 个）`];
-    if (result.items.length === 0) {
-        lines.push('- （还没有声明过任何实体。）');
-        lines.push('- 实体来自条目显式带的 entities 数组：add/replace 时传 entities: ["某某系统", "某某人"] 才会出现在这里。');
-        return lines.join('\n');
-    }
-    for (const item of result.items) {
-        lines.push(`- ${item.name}（${item.count} 条）`);
-        for (const ref of item.refs.slice(0, 3)) {
-            lines.push(`  - ${ref.id} [${ref.layer}] ${truncate(ref.text, 100)}`);
-        }
-    }
-    if (result.truncated === true) lines.push('- （已达条数上限。）');
-    return lines.join('\n');
 }
 
 /** 渲染 Pack 导出回执。 */
@@ -4465,6 +7499,19 @@ export function renderStatus(result) {
     for (const store of result.stores) {
         lines.push(`- ${store.id === 'global' ? '全局' : '工作区'} ${store.dir}：热记忆 ${store.hot} / 台账 ${store.ledger} / 归档 ${store.archive} / 关系 ${store.links}`);
     }
+    // 可见性（第五十四轮 19-7）：把分散在四个维度上的开关（根 / 目标 / 分区 / 来源档）
+    // 在一处说清 —— 读的人不该靠翻配置去猜「这个会话看得见什么」。模型见本包
+    // docs/memory-visibility-model.md；多用户身份 / ACL / 撤销 / 可写端点**没有**实现，
+    // 这一段把它写出来，免得读的人以为背后有一套权限系统。
+    // 知识库是单库（第八十八轮）：来源档分布挂在 result.kb 上，不再逐记忆根累加。
+    const tiers = result.kb?.tiers ?? {};
+    const roots = result.stores.map((store) => (store.id === 'global' ? '全局' : '工作区')).join(' + ');
+    lines.push(`- 可见性：读得到 ${roots}${result.stores.length > 1 ? '（全局在前、工作区在后：具体项目的说法覆盖通用偏好）' : ''}；`
+        + '目标 user / project 都进自动投影与显式 read；读时给 tags / entities 即按它**分区**（硬过滤，台账按 theme 算）。');
+    lines.push(`- 来源档：kb 用户提供 ${tiers.user ?? 0} / 已验证 ${tiers.verified ?? 0} / 待核 ${tiers.unverified ?? 0} —— `
+        + '待核只能 kb-read 逐字读（不得进热记忆的依据，也不得当作定论）；'
+        + 'read 台账那一层时会**现算**并标出用过的待核 / 找不到的引用（投影与面板只给路径，不含依据）。');
+    lines.push('- 没做的（照实写）：没有多用户身份、没有 ACL、没有授权撤销，也没有任何「分享 / 授权」可写端点 —— 见 docs/memory-visibility-model.md。');
     // 悬空引用是「有没有删干净」的唯一现成证据，恒定该是 0。
     lines.push(`- 引用完整性：悬空引用 ${result.dangling ?? 0} 条（不变量：必须为 0）/ 墓碑 ${result.tombstones ?? 0} 条`);
     return lines.join('\n');
@@ -4473,16 +7520,17 @@ export function renderStatus(result) {
 /**
  * 渲染紧凑摘要：挂在 office_help 与 office_run 的反馈里，等于「动笔前的记忆投影」。
  *
- * `hot: 'unchanged'` 是「只在变化时贴」用的形态：热记忆的**正文**换成一到两行
- * 说明（条数 + revision + 怎么读全文）。`ledger: 'unchanged'` 同理管台账部分
- * （第三十六轮：台账近况同样只在指纹变化时贴，两次交付之间不重复付这三行）。
+ * `hot: 'unchanged'` 是「只在变化时贴」用的形态：热记忆整段**不输出**（不加标题、
+ * 不写条数与 revision、也不带用量行）——未变化的部分不是信息，是每次调用都在付的
+ * 前缀税（第七十九轮用户要求：只保留记忆与台账的变动）。`ledger: 'unchanged'`
+ * 同理整段不输出；台账变化而热记忆没变时，投影里只剩台账的新行。
  * 决定贴哪种形态的是 projection.js，这里只负责渲染。
  *
  * `signal: { label, terms }`（第三十六轮：按需投影）= 「本次在做什么」的话题信号。
  * 给了信号且贴正文时，**只贴命中的条目**，其余折叠成一行（带条数与读取入口）——
- * 「需要用什么才给什么」。四条纪律：
+ * 「需要用什么才给什么」。三条纪律：
  *   1. 折叠行必须带读取入口：折叠是把选择权交回给模型，不是替它决定不需要；
- *   2. 用量行照旧给全量（容量是「记忆库多大」，不是「这次给了多少」）；
+ *   2. 贴了正文才带用量行（容量是「记忆库多大」，不是「这次给了多少」）；
  *   3. 信号匹配允许偏宽（一条记忆可能同时属于两个话题），误命中的代价只是多几行，
  *      漏命中的代价是模型看不到该看的约束。
  *   4. （第四十八轮 P0-2）`budget` 给定时条目正文有字节上限，`skip` 给定时不重复贴本会话
@@ -4513,83 +7561,74 @@ export function renderDigest(digest, {
     const label = signal !== null && signal !== undefined && typeof signal.label === 'string' && signal.label !== ''
         ? signal.label
         : '本次';
-    const writeRevision = String(digest.writeRevision ?? '').slice(0, 8);
-    const lines = [
-        omitted && ledgerOmitted
-            ? '📒 记忆（热记忆与最近台账都与上次投影相同，正文省略；要看：office_memory({ action: \'read\' })）'
-            : omitted
-                ? '📒 记忆（热记忆与上次投影相同，省略正文；用量与最近台账照旧）'
-                : `📒 记忆（${context === 'run' ? '本次调用后' : '动笔前'}先看这几条${terms === null ? '' : `；按「${label}」筛过，无关条目已折叠`}）`,
-    ];
+    const lines = [];
+    if (!omitted) {
+        lines.push('📒 记忆（' + (context === 'run' ? '本次调用后' : '动笔前')
+            + '先看这几条' + (terms === null ? '' : '；按「' + label + '」筛过，无关条目已折叠') + '）');
+    }
     // 预算（第四十八轮 P0-2）：整段投影共享一个字节额度，只作用于「条目正文」那一块。
     // null / 0 / 非有限值 = 不限（老行为）；显式给数才节流。
     let budgetLeft = Number.isFinite(budget) && budget > 0 ? budget : null;
     for (const target of MEMORY_TARGETS) {
         const items = target === 'user' ? digest.user : digest.project;
         if (items.length === 0) continue;
-        lines.push(`【${target === 'user' ? '用户偏好' : '项目与环境'}】`);
-        if (omitted) {
-            lines.push(`- 与上一次投影相同（${items.length} 条，revision ${writeRevision}），正文不再重复；要看：office_memory({ action: 'read', layer: 'hot' })`);
-        } else {
-            const matched = terms === null
-                ? items
-                : items.filter((entry) => matchScore(entrySignalText(entry), terms) > 0);
-            const seenBefore = skip instanceof Set
-                ? matched.filter((entry) => skip.has(entry.id))
-                : [];
-            const fresh = seenBefore.length === 0
-                ? matched
-                : matched.filter((entry) => !skip.has(entry.id));
-            // 排序：命中强度 → 重要度 → 写入时刻（新在前）。预算与折叠都按这个次序吃，
-            // 于是先被折叠的是「最不相关、最次要、最旧」的那些。没有信号时命中强度一律 0，
-            // 排序退化成「重要度 → 新在前」—— 预算有限时先给 critical 的那几条。
-            const scoreOf = (entry) => (terms === null ? 0 : matchScore(entrySignalText(entry), terms));
-            const ranked = [...fresh].sort((left, right) => {
-                const score = scoreOf(right) - scoreOf(left);
-                if (score !== 0) return score;
-                const rank = (IMPORTANCE_RANK[left.importance] ?? 1) - (IMPORTANCE_RANK[right.importance] ?? 1);
-                if (rank !== 0) return rank;
-                return String(right.updatedAt ?? '').localeCompare(String(left.updatedAt ?? ''));
-            });
-            let overBudget = 0;
-            for (const entry of ranked) {
-                const line = `- [${entry.importance}]${originTag(entry.origin)} ${entry.content.replace(/\s*\n\s*/g, ' ')}`;
-                if (budgetLeft !== null && byteLength(line) > budgetLeft) {
-                    // 放不下的不丢：记进折叠行的计数，入口照给
-                    overBudget += 1;
-                    continue;
-                }
-                if (budgetLeft !== null) budgetLeft -= byteLength(line) + 1;
-                lines.push(line);
-                if (Array.isArray(report?.printedIds)) report.printedIds.push(entry.id);
+        if (omitted) continue;
+        lines.push('【' + (target === 'user' ? '用户偏好' : '项目与环境') + '】');
+        const matched = terms === null
+            ? items
+            : items.filter((entry) => matchScore(entrySignalText(entry), terms) > 0);
+        const seenBefore = skip instanceof Set
+            ? matched.filter((entry) => skip.has(entry.id))
+            : [];
+        const fresh = seenBefore.length === 0
+            ? matched
+            : matched.filter((entry) => !skip.has(entry.id));
+        // 排序：命中强度 → 重要度 → 写入时刻（新在前）。预算与折叠都按这个次序吃，
+        // 于是先被折叠的是「最不相关、最次要、最旧」的那些。没有信号时命中强度一律 0，
+        // 排序退化成「重要度 → 新在前」—— 预算有限时先给 critical 的那几条。
+        const scoreOf = (entry) => (terms === null ? 0 : matchScore(entrySignalText(entry), terms));
+        const ranked = [...fresh].sort((left, right) => {
+            const score = scoreOf(right) - scoreOf(left);
+            if (score !== 0) return score;
+            const rank = (IMPORTANCE_RANK[left.importance] ?? 1) - (IMPORTANCE_RANK[right.importance] ?? 1);
+            if (rank !== 0) return rank;
+            return String(right.updatedAt ?? '').localeCompare(String(left.updatedAt ?? ''));
+        });
+        let overBudget = 0;
+        for (const entry of ranked) {
+            const line = `- [${entry.importance}]${originTag(entry.origin)} ${entry.content.replace(/\s*\n\s*/g, ' ')}`;
+            if (budgetLeft !== null && byteLength(line) > budgetLeft) {
+                // 放不下的不丢：记进折叠行的计数，入口照给
+                overBudget += 1;
+                continue;
             }
-            const unrelated = items.length - matched.length;
-            const parts = [];
-            if (unrelated > 0) parts.push(`${unrelated} 条与「${label}」无关`);
-            if (seenBefore.length > 0) parts.push(`${seenBefore.length} 条本会话已贴过`);
-            if (overBudget > 0) parts.push(`${overBudget} 条超出本次投影预算`);
-            if (parts.length > 0) {
-                lines.push(matched.length === 0
-                    ? `  与「${label}」相关的条目 0 条，${items.length} 条全部折叠；要看：office_memory({ action: 'read', layer: 'hot' })`
-                    : `  另有 ${parts.join('、')}，正文折叠；要看：office_memory({ action: 'read', layer: 'hot' })`);
-            }
+            if (budgetLeft !== null) budgetLeft -= byteLength(line) + 1;
+            lines.push(line);
+            if (Array.isArray(report?.printedIds)) report.printedIds.push(entry.id);
+        }
+        const unrelated = items.length - matched.length;
+        const parts = [];
+        if (unrelated > 0) parts.push(`${unrelated} 条与「${label}」无关`);
+        if (seenBefore.length > 0) parts.push(`${seenBefore.length} 条本会话已贴过`);
+        if (overBudget > 0) parts.push(`${overBudget} 条超出本次投影预算`);
+        if (parts.length > 0) {
+            lines.push(matched.length === 0
+                ? `  与「${label}」相关的条目 0 条，${items.length} 条全部折叠；要看：office_memory({ action: 'read', layer: 'hot' })`
+                : `  另有 ${parts.join('、')}，正文折叠；要看：office_memory({ action: 'read', layer: 'hot' })`);
         }
         lines.push(`  ${usageLine(target, digest.usage[target])}`);
     }
-    if (digest.ledger.length > 0) {
-        if (ledgerOmitted) {
-            lines.push(`【台账】共 ${digest.ledgerTotal} 条，最近 ${digest.ledger.length} 条与上次投影相同，正文省略；要看：office_memory({ action: 'read', layer: 'ledger' })`);
-        } else {
-            lines.push(`【台账】共 ${digest.ledgerTotal} 条，最近 ${digest.ledger.length} 条：`);
-            for (const record of digest.ledger) {
-                const badge = [record.format, record.theme].filter(Boolean).join(' · ');
-                lines.push(`- ${String(record.at).slice(0, 10)}${originTag(record.origin)} ${record.path}${badge ? `  [${badge}]` : ''}${record.purpose ? ` —— ${record.purpose}` : ''}`);
-            }
+    if (digest.ledger.length > 0 && !ledgerOmitted) {
+        lines.push('【台账】');
+        for (const record of digest.ledger) {
+            const badge = [record.format, record.theme].filter(Boolean).join(' · ');
+            lines.push('- ' + String(record.at).slice(0, 10) + originTag(record.origin) + ' ' + record.path
+                + (badge ? '  [' + badge + ']' : '') + (record.purpose ? ' —— ' + record.purpose : ''));
         }
     }
     // 固定的两条尾巴只在「这次贴了正文」时说：热记忆与台账都省略时，投影只剩几行
     // 状态，把同样的指引句重复贴进前缀是纯开销（它们在任何一次贴正文的形态里都有）。
-    if (!(omitted && ledgerOmitted)) {
+    if (!omitted) {
         lines.push(`- 完整读取与检索：office_memory({ action: 'read', layer: 'all'|'hot'|'ledger'|'archive', query? })`);
         if (digest.autoCapture === true) {
             lines.push('- 主动记录：用户在这一轮里说出的偏好、纠正、稳定事实，当场用 action:\'add\' 记一条；不必等他说「记住」。');
@@ -4598,7 +7637,7 @@ export function renderDigest(digest, {
     // 成本可见（第四十八轮 P0-2）：给了预算时把这次投影的实际字节印在首行 ——
     // 看不到成本就谈不上节流，排查时也不必再写一支探针。口径要写清：预算管的是
     // **条目正文**那一块，整段投影还包括用量行、折叠行与固定尾巴。
-    if (budgetLeft !== null) {
+    if (budgetLeft !== null && !omitted) {
         const entryUsed = budget - budgetLeft;
         lines[0] = `${lines[0].replace(/）$/, '')}；本次投影 ${byteLength(lines.join('\n'))} B，`
             + `其中条目 ${entryUsed} B（上限 ${budget} B））`;

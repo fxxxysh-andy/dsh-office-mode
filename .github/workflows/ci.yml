@@ -3,10 +3,15 @@ name: CI
 # 每次推到 main / 开 PR 就跑一遍「不依赖本机环境」的回归。
 #
 # 为什么只跑一部分：插件里有些套件是**量本机的**（preset-check 读 ~/.dsh 的
-# profile、preview / validate-libreoffice 要 LibreOffice、av 要 ffmpeg、
+# profile、preview / convert / validate-libreoffice 要 LibreOffice、av 要 ffmpeg、
 # python 要解释器、web-verify 要无头 Chrome、web-live 要能出网）。CI runner
 # 上它们必然红，红了也不说明代码有问题。这一批是纯 Node、零依赖、不联网的
 # 那一档，作为「改坏了没有」的守门。（第四十九轮实测：本机 14/14 exit=0。）
+#
+# 名单**不写在这里**（第五十六轮 S-06）：改成调 `run-suites.mjs --ci`，名单只有
+# `packages/dsh-office-mode/scripts/ci-suites.mjs` 一处真源 —— 从前 CI 与 release
+# 各手写一串名字，于是 format-excel / format-ppt / format-ppt-revise / chart
+# 这四个核心格式回归漏在守门之外十一轮，而两边都没报错。
 
 on:
   push:
@@ -32,8 +37,5 @@ jobs:
         with:
           node-version: '22'
 
-      - name: 跑套件
-        run: >-
-          node scripts/run-suites.mjs
-          smoke memory kb memory-recall memory-probes archive e2e sites seam
-          plain-default schema-format view format-ppt-math format-word
+      - name: 跑套件（名单见 scripts/ci-suites.mjs）
+        run: node scripts/run-suites.mjs --ci

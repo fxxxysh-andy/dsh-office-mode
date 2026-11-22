@@ -143,7 +143,7 @@ if (!ready) {
         for (const image of value.images) {
             assert.ok(image.width > 100 && image.height > 100, `尺寸异常：${JSON.stringify(image)}`);
             assert.ok(image.bytes > 1000, `图太小：${image.bytes}`);
-            assert.ok(!image.path.startsWith('.office/cache') === false, '预览图应当落在缓存目录');
+            assert.ok(!image.path.startsWith('.office/runtime/cache') === false, '预览图应当落在缓存目录');
             const absolute = join(root, image.path);
             assert.ok(existsSync(absolute), `图不在盘上：${image.path}`);
             assert.equal(statSync(absolute).size, image.bytes);
@@ -251,7 +251,7 @@ if (!ready) {
         // 不传 to 只放缓存。
         const cachedOnly = await runScript(`return await office.preview.pdf('报告.docx');`);
         assert.equal(cachedOnly.ok, true, cachedOnly.error?.message);
-        assert.ok(cachedOnly.returned.path.startsWith('.office/cache/preview/'), cachedOnly.returned.path);
+        assert.ok(cachedOnly.returned.path.startsWith('.office/runtime/cache/preview/'), cachedOnly.returned.path);
         return `${value.bytes}B`;
     });
 

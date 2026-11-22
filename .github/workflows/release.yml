@@ -39,12 +39,9 @@ jobs:
             exit 1
           fi
 
-      - name: 回归（发布守门）
+      - name: 回归（发布守门，名单见 scripts/ci-suites.mjs）
         working-directory: packages/dsh-office-mode
-        run: >-
-          node scripts/run-suites.mjs
-          smoke memory kb memory-recall memory-probes archive e2e sites seam
-          plain-default schema-format view format-ppt-math format-word
+        run: node scripts/run-suites.mjs --ci
 
       - name: 打包
         run: |

@@ -14,7 +14,7 @@
  *   3. 跨源核对。同一事实至少两个互不相关的来源确认；只有单一来源的说法
  *      必须标注「单一来源」。
  *
- * 表本身是数据，不是提示词：office_search_brief 从这里生成提纲，
+ * 表本身是数据，不是提示词：office_search_dispatch 从这里生成提纲，
  * office_parse_findings 从这里生成核对清单，两者不会各自漂移。
  *
  * @module dsh-office-mode/search-routes
@@ -331,12 +331,11 @@ export function materializeQueries(queries, topic) {
 }
 
 /**
- * 提纲里**跨主题、跨类型逐字相同**的两段（第十七轮悬案 №2 → 第十八轮 P2-1 → `17-3`）。
+ * 提纲里**跨主题、跨类型逐字相同**的两段（第十七轮悬案 №2 → 第十八轮 P2-1）。
  *
- * 它们与主题、类型、渠道都无关，所以第二次出提纲时对话里不必再贴一份 ——
- * `executeBrief` 用 `hintOnce` 一个会话只说一次，靠这两个常量做**精确切分**
- * （不去猜字符串，也不改动提纲正文）。提纲**文件**里始终是逐字全份：
- * 子代理读的是文件，不是主会话的对话。
+ * 它们与主题、类型、渠道都无关。第七十轮合并 office_search_brief 之后，提纲
+ * 不再整段进对话（只在 brief.md 里落盘），这两段也随之不再需要「一个会话只说
+ * 一次」的切分 —— 常量保留是因为它们仍是每份提纲正文的一部分。
  */
 export const BRIEF_FIXED_INTRO = [
     '第一条永远是泛搜——先用不限定来源的一轮搜索找准关键词与分歧点，再按下面的渠道深挖。',
@@ -353,15 +352,11 @@ export const BRIEF_FIXED_REQUIREMENTS = [
 ].join('\n');
 
 /**
- * 为一个主题生成检索提纲（office_search_brief 的正文）。
+ * 为一个主题生成检索提纲（office_search_dispatch 在 topic 直入时的正文）。
  *
  * 提纲是给子代理看的「派工单」：写清该搜哪些渠道、每个渠道为什么必要、
  * 查到什么程度算够、以及必须满足的核对项。子代理据此自己去调检索工具，
  * 主会话只收到它写下的结果文件路径。
- *
- * 返回值里的 `fixed` 是正文中那两段跨主题逐字相同的块（见上面的常量），
- * 给 `executeBrief` 做「一个会话只说一次」的精确切分用；`text` 仍是完整的
- * 提纲正文（写进文件的那一份，一字不少）。
  */
 export function buildBrief(topic, typeId, options = {}) {
     const clean = String(topic ?? '').trim();
@@ -433,6 +428,5 @@ export function buildBrief(topic, typeId, options = {}) {
         topic: clean,
         type,
         text: lines.join('\n'),
-        fixed: { intro: BRIEF_FIXED_INTRO, requirements: BRIEF_FIXED_REQUIREMENTS },
     };
 }

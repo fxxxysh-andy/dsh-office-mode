@@ -1,10 +1,10 @@
 /**
  * Word 格式引擎自测（SPEC §5）。
  *
- * 跑法：`node test/format-word.mjs`（加 `--keep` 则保留 .office/tmp/word/ 里的产物，
+ * 跑法：`node test/format-word.mjs`（加 `--keep` 则保留 .office/runtime/tmp/word/ 里的产物，
  * 供随后的 COM 校验用；默认跑完即清理，不留垃圾文件）。
  *
- * 产物统一落在仓库根的 .office/tmp/word/ 这个子目录里：COM 校验按目录扫 .docx，
+ * 产物统一落在仓库根的 .office/runtime/tmp/word/ 这个子目录里：COM 校验按目录扫 .docx，
  * 混着别的引擎的产物会把「这一轮改的东西」和旧文件搅在一起。
  *
  * 这里刻意生成的样例覆盖全部 builder 方法 + 全部 edit 操作，
@@ -16,14 +16,14 @@ import { deflateSync } from 'node:zlib';
 import { mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-import { createEnv } from '../src/engine/kit.js';
+import { createEnv, EMU_PER_CM, TWIPS_PER_CM } from '../src/engine/kit.js';
 import { crc32, unzip, zip } from '../src/engine/zip.js';
 import { attr, children, descendant, descendants, parseXml, textOf } from '../src/engine/xml.js';
 import { resolveTheme } from '../src/engine/theme.js';
 import { create, edit, read } from '../src/formats/word.js';
 
 const KEEP = process.argv.includes('--keep');
-const ROOT = fileURLToPath(new URL('../../../.office/tmp/word/', import.meta.url));
+const ROOT = fileURLToPath(new URL('../../../.office/runtime/tmp/word/', import.meta.url));
 const SAMPLE = 'word-full.docx';
 
 const failures = [];
@@ -1052,6 +1052,216 @@ check(!/w:fill=/.test(tableText), '默认主题的表格样例里出现了填充
     check(outlineLines.findIndex((line) => line.startsWith('题注 表 2')) > outlineLines.findIndex((line) => line.startsWith('表格 3×2')), 'outline 里表 2 的题注应排在表格行之后');
 }
 
+// ---------------------------------------------------------------- 图片网格（imageGrid）
+
+console.log('— 图片网格样例 —');
+
+const GRID_SOURCE = '测试素材库';
+
+/**
+ * 解包一份图片网格文档，做一遍「所有网格都该成立」的结构校验。
+ *
+ * 只钉通用不变量：一张无框表格、每行格数一致、drawing / a:blip / wp:docPr /
+ * wp:extent 一一对应，media 文件名与图片关系连续唯一，图片不溢出格宽、按原始
+ * 比例缩放。具体列数、宽度、图注由调用方按文档再查。
+ */
+function inspectGridDoc(name) {
+    const raw = unzip(env.readFile(name));
+    const decoder = new TextDecoder('utf-8');
+    const text = new Map([...raw].map(([partName, data]) => [partName, decoder.decode(data)]));
+    checkSchemaOrder(text);
+    checkNames(text);
+    const docText = text.get('word/document.xml');
+    const body = descendants(parseXml(docText).children[0], 'w:body')[0];
+    const tables = descendants(body, 'w:tbl');
+    checkEqual(tables.length, 1, `${name}: 图片网格文档应只有一张表格`);
+    const table = tables[0];
+    const tblPr = children(table, 'w:tblPr')[0];
+    checkEqual(children(tblPr).map((node) => node.name).join(','),
+        'w:tblW,w:tblBorders,w:tblLayout,w:tblCellMar,w:tblLook', `${name}: w:tblPr 子元素`);
+    // 无框表格：四条外框 + 两条内框都必须显式 nil，否则会继承表格样式的边框
+    const borders = descendants(tblPr, 'w:tblBorders')[0];
+    check(!!borders, `${name}: 缺少 w:tblBorders`);
+    checkEqual(borders.children.map((node) => node.name).join(','),
+        'w:top,w:left,w:bottom,w:right,w:insideH,w:insideV', `${name}: w:tblBorders 的六条边`);
+    for (const edge of borders.children) {
+        checkEqual(attr(edge, 'w:val'), 'nil', `${name}: ${edge.name} 必须是 nil（否则会被表格样式染上边框）`);
+        checkEqual(attr(edge, 'w:sz'), '0', `${name}: ${edge.name} 的 sz 应为 0`);
+    }
+    checkEqual(attr(first(tblPr, 'w:tblLayout'), 'w:type'), 'fixed', `${name}: 图片网格必须用固定列宽布局`);
+    const rows = children(table, 'w:tr');
+    const tcCounts = rows.map((row) => children(row, 'w:tc').length);
+    const columns = tcCounts[0] ?? 0;
+    for (const count of tcCounts) checkEqual(count, columns, `${name}: 每行的 w:tc 数应一致（末行补空保持栅格）`);
+    const gridCols = descendants(table, 'w:gridCol').map((node) => Number(attr(node, 'w:w')));
+    checkEqual(gridCols.length, columns, `${name}: w:gridCol 数应等于列数`);
+    const cellTw = gridCols[0];
+    const tblW = Number(attr(first(tblPr, 'w:tblW'), 'w:w'));
+    checkEqual(tblW, gridCols.reduce((sum, value) => sum + value, 0), `${name}: tblW 应等于各列宽之和`);
+    const cellMar = descendants(tblPr, 'w:tblCellMar')[0];
+    const marLeft = Number(attr(first(cellMar, 'w:left'), 'w:w'));
+    const marRight = Number(attr(first(cellMar, 'w:right'), 'w:w'));
+    checkEqual(Number(attr(first(cellMar, 'w:top'), 'w:w')), 0, `${name}: 单元格上边距应为 0`);
+    for (const cell of descendants(table, 'w:tc')) {
+        checkEqual(Number(attr(first(cellPr(cell), 'w:tcW'), 'w:w')), cellTw, `${name}: 每格宽度都应等于格宽`);
+    }
+    // drawing / blip / extent / docPr 一一对应，id 从 1 连续
+    const drawings = descendants(body, 'w:drawing');
+    const blips = descendants(body, 'a:blip');
+    const extents = descendants(body, 'wp:extent');
+    const docPrs = descendants(body, 'wp:docPr');
+    checkEqual(blips.length, drawings.length, `${name}: 每个 w:drawing 都应有 a:blip`);
+    checkEqual(extents.length, drawings.length, `${name}: 每个 drawing 都应有 wp:extent`);
+    checkEqual(docPrs.length, drawings.length, `${name}: 每个 drawing 都应有 wp:docPr`);
+    docPrs.forEach((node, index) => checkEqual(Number(attr(node, 'id')), index + 1, `${name}: wp:docPr id 应从 1 连续递增`));
+    const media = [...raw.keys()].filter((partName) => partName.startsWith('word/media/')).sort();
+    media.forEach((partName, index) => checkEqual(partName, `word/media/image${index + 1}.png`, `${name}: media 文件名应连续`));
+    const imageRels = [...text.get('word/_rels/document.xml.rels').matchAll(/<Relationship [^>]*Type="[^"]*\/image"[^>]*\/>/g)].map((match) => match[0]);
+    checkEqual(imageRels.length, drawings.length, `${name}: 图片关系数应等于图片数`);
+    checkEqual(new Set(imageRels.map((rel) => (rel.match(/Id="([^"]+)"/) ?? [])[1])).size, imageRels.length, `${name}: 图片 rId 必须唯一`);
+    for (const rel of imageRels) {
+        const target = (rel.match(/Target="([^"]+)"/) ?? [])[1];
+        check(raw.has(`word/${target}`), `${name}: 关系目标 ${target} 不在包内`);
+    }
+    for (const blip of blips) {
+        const embed = attr(blip, 'r:embed');
+        check(imageRels.some((rel) => rel.includes(`Id="${embed}"`)), `${name}: a:blip 的 r:embed=${embed} 找不到对应关系`);
+    }
+    for (const drawing of drawings) {
+        check(descendants(body, 'w:tc').some((cell) => descendants(cell, 'w:drawing').includes(drawing)),
+            `${name}: 网格里的图片必须落在 w:tc 内（并排靠表格实现）`);
+    }
+    // 图片不许溢出格宽（格宽减去左右边距），且必须按原始 240×160 等比缩放
+    const innerTw = cellTw - (marLeft + marRight);
+    for (const extent of extents) {
+        const cx = Number(attr(extent, 'cx'));
+        const cy = Number(attr(extent, 'cy'));
+        check(cx <= (innerTw * EMU_PER_CM) / TWIPS_PER_CM + 2, `${name}: 图片宽 ${cx} EMU 溢出了格宽（格内 ${innerTw} twips）`);
+        check(Math.abs(cy / cx - 160 / 240) < 1e-3, `${name}: 240×160 的图必须等比缩放（实际 ${cy}/${cx}）`);
+    }
+    check(!/<w:shd/.test(docText), `${name}: 默认主题不该给网格加底纹`);
+    check(!/w:tblStyle/.test(docText), `${name}: 网格表格不该挂表格样式（无框要显式写）`);
+    const paragraphText = descendants(body, 'w:t').map((node) => textOf(node));
+    const captionParas = descendants(body, 'w:p').filter((node) => attr(first(first(node, 'w:pPr'), 'w:pStyle'), 'w:val') === 'Caption');
+    return { raw, text, docText, body, table, rows, tcCounts, columns, cellTw, tblW, marLeft, marRight, drawings, blips, media, imageRels, paragraphText, captionParas };
+}
+
+function buildGrid(name, items, opts) {
+    const builder = create({ title: '图片网格', path: name }, env);
+    builder.heading('图片网格', 1).images(items, opts);
+    return { report: builder.save(), facts: inspectGridDoc(name) };
+}
+
+// 2 列 × 4 图：widthCm 显式 12cm；每格图 + 图注 + 来源
+const gridA = buildGrid('word-images-2col.docx', [
+    { path: 'assets/sample.png', caption: '图 1 甲', source: GRID_SOURCE },
+    { path: 'assets/sample.png', caption: '图 2 乙', source: GRID_SOURCE },
+    { path: 'assets/sample.png', caption: '图 3 丙', source: GRID_SOURCE },
+    { path: 'assets/sample.png', caption: '图 4 丁', source: GRID_SOURCE },
+], { columns: 2, widthCm: 12 });
+console.log(JSON.stringify({ warnings: gridA.report.warnings, stats: gridA.report.stats, outline: gridA.report.outline }, null, 2));
+checkEqual(gridA.report.warnings.length, 0, '2 列 4 图的网格不该有警告');
+checkEqual(gridA.facts.tcCounts.length, 2, '4 图 2 列应为 2 行');
+checkEqual(gridA.facts.tcCounts.join(','), '2,2', '每行 2 格');
+checkEqual(gridA.facts.tblW, 6804, 'widthCm:12 → tblW 6804 twips');
+checkEqual(gridA.facts.cellTw, 3402, '12cm 分 2 列，每列 3402 twips');
+checkEqual(gridA.facts.marLeft + gridA.facts.marRight, 227, '默认 gapCm 0.4 → 单元格左右边距合计 227 twips');
+checkEqual(gridA.facts.drawings.length, 4, 'drawing 数应等于图片数');
+checkEqual(gridA.facts.media.length, 4, 'word/media 部件数');
+checkEqual(gridA.facts.imageRels.length, 4, '图片关系数');
+checkEqual(gridA.facts.captionParas.length, 8, '4 条图注 + 4 条来源都应使用 Caption 样式');
+for (const caption of ['图 1 甲', '图 2 乙', '图 3 丙', '图 4 丁']) {
+    check(gridA.facts.paragraphText.includes(caption), `缺少图注 ${caption}`);
+}
+checkEqual(gridA.facts.paragraphText.filter((line) => line === `来源：${GRID_SOURCE}`).length, 4, '4 张图都应带来源小字');
+checkEqual(gridA.report.stats.tables, 1, 'stats.tables（图片网格按表格计）');
+checkEqual(gridA.report.stats.images, 4, 'stats.images');
+check(gridA.report.outline.includes('表格 2×2'), 'outline 应把网格记成 2×2 表格', gridA.report.outline.join('|'));
+{
+    const reread = read('word-images-2col.docx', env);
+    checkEqual(reread.stats.tables, 1, 'read() 的 stats.tables');
+    checkEqual(reread.stats.images, 4, 'read() 的 stats.images');
+    checkEqual(reread.warnings.length, 0, 'read() 不该因图片网格产生警告');
+}
+
+// 3 列 × 3 图：中间一张缺图 —— 该格留文字占位，其余照常
+const gridB = buildGrid('word-images-3col.docx', [
+    { path: 'assets/sample.png', caption: '图 A', source: GRID_SOURCE },
+    { path: 'assets/missing.png', caption: '图 B 缺图占位', source: '不存在的来源' },
+    { path: 'assets/sample.png', caption: '图 C', source: GRID_SOURCE },
+], { columns: 3 });
+console.log(JSON.stringify({ warnings: gridB.report.warnings, stats: gridB.report.stats, outline: gridB.report.outline }, null, 2));
+checkEqual(gridB.facts.tcCounts.length, 1, '3 图 3 列应为 1 行');
+checkEqual(gridB.facts.tcCounts[0], 3, '每行 3 格');
+checkEqual(gridB.facts.tblW, 8958, '未给 widthCm 时应铺满版心（8958 twips）');
+checkEqual(gridB.facts.cellTw, 2986, '8958 twips 分 3 列，每列 2986 twips');
+checkEqual(gridB.facts.drawings.length, 2, '缺图不应产生 drawing');
+checkEqual(gridB.facts.media.length, 2, '缺图不应产生 media 部件');
+checkEqual(gridB.facts.imageRels.length, 2, '缺图不应产生图片关系');
+check(gridB.facts.docText.includes('图片不可用：assets/missing.png'), '缺图格应留「图片不可用：<path>」文字占位');
+check(gridB.facts.paragraphText.includes('图 B 缺图占位'), '缺图格的图注也要保留');
+check(gridB.facts.paragraphText.includes('来源：不存在的来源'), '缺图格的来源也要保留');
+check(gridB.facts.paragraphText.includes('图 A') && gridB.facts.paragraphText.includes('图 C'), '一张缺图不该影响前后两张图的图注');
+checkEqual(gridB.facts.captionParas.length, 6, '3 格（含缺图格）的图注 + 来源共 6 段 Caption');
+check(gridB.report.warnings.some((line) => line.includes('图片网格「assets/missing.png」') && line.includes('已在该格留文字占位')),
+    '缺图要进 report.warnings', gridB.report.warnings.join(' / '));
+check(env.warnings.some((line) => line.startsWith('word：') && line.includes('图片不可用：assets/missing.png')),
+    '缺图要在构建期就双写 env.warn，而不是等 render()', env.warnings.join(' / '));
+checkEqual(gridB.report.stats.images, 2, 'stats.images 只数得到真正嵌入的图');
+checkEqual(gridB.report.stats.tables, 1, 'stats.tables');
+{
+    const reread = read('word-images-3col.docx', env);
+    checkEqual(reread.stats.tables, 1, 'read() 遇到缺图占位不能崩，且能数出表格');
+    checkEqual(reread.stats.images, 2, 'read() 的 stats.images');
+}
+
+// 非法参数回落：columns:5 → 2 列；gapCm:5 → 夹到 2cm；3 图要补一个空格子
+const gridC = buildGrid('word-images-pad.docx', ['assets/sample.png', 'assets/sample.png', 'assets/sample.png'],
+    { columns: 5, gapCm: 5 });
+console.log(JSON.stringify({ warnings: gridC.report.warnings, stats: gridC.report.stats }, null, 2));
+checkEqual(gridC.facts.tcCounts.length, 2, 'columns:5 回退 2 列后，3 图应为 2 行');
+checkEqual(gridC.facts.tcCounts.join(','), '2,2', '列数非法也要保持栅格（末行补空）');
+checkEqual(gridC.facts.marLeft, 567, 'gapCm 夹到 2cm 后单元格左边距 567 twips');
+checkEqual(gridC.facts.marLeft + gridC.facts.marRight, 1134, 'gapCm 2cm = 1134 twips');
+checkEqual(gridC.facts.drawings.length, 3, '3 张图都该嵌入');
+checkEqual(gridC.facts.media.length, 3, '3 张图的 media 部件');
+{
+    const paddingCell = children(gridC.facts.rows[1], 'w:tc')[1];
+    checkEqual(descendants(paddingCell, 'w:drawing').length, 0, '末行补的格子不该有图');
+    checkEqual(descendants(paddingCell, 'w:p').length, 1, '末行补的格子应只有一个空段落');
+    checkEqual(textOfNode(paddingCell), '', '补白格必须为空（不能留下占位文字）');
+}
+check(gridC.report.warnings.some((line) => line.includes('只支持 2 或 3 列') && line.includes('（收到 5）')),
+    '非法 columns 要告警并说明回退到 2 列', gridC.report.warnings.join(' / '));
+check(gridC.report.warnings.some((line) => line.includes('gapCm 5') && line.includes('已按 2cm 处理')),
+    'gapCm 越界要告警并说明夹取后的值', gridC.report.warnings.join(' / '));
+checkEqual(gridC.report.stats.images, 3, 'stats.images');
+
+// 不支持的格式：同样只占位 + 告警，不打断整篇
+{
+    env.writeFile('assets/not-image.txt', '这不是图片');
+    const unsupported = create({ title: '非图片素材', path: 'word-images-unsupported.docx' }, env);
+    unsupported.heading('非图片素材', 1).images([
+        { path: 'assets/sample.png', caption: '图 1', source: GRID_SOURCE },
+        { path: 'assets/not-image.txt', caption: '图 2 非图片' },
+    ], { columns: 2 });
+    const unsupportedReport = unsupported.save();
+    const unsupportedText = new TextDecoder().decode(unzip(env.readFile('word-images-unsupported.docx')).get('word/document.xml'));
+    check(unsupportedReport.warnings.some((line) => line.includes('不是 PNG/JPEG')), '非 PNG/JPEG 素材要告警', unsupportedReport.warnings.join(' / '));
+    check(unsupportedText.includes('图片不可用：assets/not-image.txt'), '非 PNG/JPEG 素材要留文字占位');
+    checkEqual(unsupportedReport.stats.images, 1, '非图片素材不该被计入 stats.images');
+}
+
+// 空输入：链式调用不被打断，只留一条告警
+{
+    const empty = create({ title: '空网格', path: 'word-images-empty.docx' }, env);
+    empty.heading('空网格', 1).images([]);
+    const emptyReport = empty.save();
+    check(emptyReport.warnings.some((line) => line.includes('images(): 没有传入任何图片，已跳过')),
+        'images([]) 应给出告警而不是抛错', emptyReport.warnings.join(' / '));
+    checkEqual(emptyReport.stats.tables, 0, 'images([]) 不该产生表格');
+}
+
 // ---------------------------------------------------------------- edit 追加公式 / 合并表格
 
 const appendReport = edit('word-table.docx', [
@@ -1090,15 +1300,73 @@ checkEqual(appendReport.stats.tables, 3, '追加表格后的 stats.tables');
     checkEqual(externalReport.stats.formulas, appendReport.stats.formulas + 1, '外部文档追加公式后的公式数');
 }
 
+// ------------------------------------------------- 短公式兜底（第五十八轮 新-23）
+//
+// 要钉的正是「公式压根没进 math 通道」：`r=q·r0` 里一个反斜杠都没有，第四十八轮的
+// looksLikeLatex 看不见它。同时钉住第二件事：走 math 通道的公式、Windows 路径、
+// 中文散文里的等号、配置式**不许**被算进来 —— 这条计数一旦掺假，模型就会学会忽略它。
+{
+    const buildDeck = (path, asMath) => {
+        const builder = create({ title: '短公式兜底', path, footer: false }, env);
+        builder.heading('短公式兜底', 1)
+            .para(asMath ? [{ math: 'r=qr_0' }] : 'r=q·r0')
+            .para('欧姆定律 r=q·r0')   // 中文夹带：命中
+            .para('E = mc²')           // 带空格的 Unicode 角标：命中
+            .para('合计 = 1200 元')     // 中文散文里的等号：不判
+            .para('D:\\work\\demo1')    // Windows 路径：不判
+            .para('key=value')         // 配置式（左边超长）：不判
+            .para('x = 1');            // 带空格且右边不是字母：不判
+        return builder.save();
+    };
+    const hit = buildDeck('word-plain-formula.docx', false);
+    checkEqual(hit.stats.plainFormulas, 3, '写侧只该命中三条（r=q·r0 / 中文夹带 / E = mc²）');
+    checkEqual(hit.stats.formulas, 0, '对照组：这三条都不是公式通道里的公式');
+    check(hit.warnings.some((m) => m.includes('短公式同样要走 math 通道')), '写侧要点名「短公式要走 math 通道」');
+    check(hit.warnings.some((m) => m.includes('r=q·r0')), '写侧要带出原文，模型才知道改哪一句');
+
+    const reread = read('word-plain-formula.docx', env);
+    checkEqual(reread.stats.plainFormulas, hit.stats.plainFormulas, '读侧与写侧同名同口径');
+    check(reread.warnings.some((m) => m.includes('短公式同样要走 math 通道')), '读侧同样要点名');
+
+    // 反向控制：同一份稿子把第一段改走 math 通道，计数必须少一条（判据要有鉴别力）
+    const control = buildDeck('word-plain-formula-control.docx', true);
+    checkEqual(control.stats.plainFormulas, hit.stats.plainFormulas - 1, '走了 math 通道的那条不许再算短公式');
+    checkEqual(control.stats.formulas, 1, '对照稿里公式通道那条仍然是公式');
+
+    // 覆盖面对齐（复核 P2-1 / P2-2）：表格单元格与「同段混排」两处从前都漏
+    const cover = create({ title: '覆盖面', path: 'word-plain-formula-cover.docx', footer: false }, env);
+    cover.heading('覆盖面', 1)
+        // 同段：一个 math run + 明文短公式（`mathText === ''` 那道旧门会整段漏掉）
+        .para([{ math: 'r=qr_0' }, { text: ' 其中 r=q·r0 是近似' }])
+        // 表格单元格：PPT 侧算、Word 侧从前不算
+        .table({ columns: ['式', '值'], rows: [['r=q·r0', '1'], ['E=mc²', '2'], ['id=abc', '3']] });
+    const coverReport = cover.save();
+    checkEqual(coverReport.stats.plainFormulas, 3, '混排段落 1 条 + 表格单元格 2 条（id=abc 不判）');
+    check(coverReport.warnings.some((m) => m.includes('表格的单元格')), '表格单元格要单独点名（不是「第 N 段」）');
+    const coverBack = read('word-plain-formula-cover.docx', env);
+    checkEqual(coverBack.stats.plainFormulas, coverReport.stats.plainFormulas, '覆盖面的读侧与写侧一致');
+
+    // 复核 P1-2 的回归：解析失败的 math run 回落原文**只**进 formulaErrors，不许同时进 plainFormulas
+    const failed = create({ title: '解析失败', path: 'word-plain-formula-failed.docx', footer: false }, env);
+    failed.heading('解析失败', 1).formula('E=mc^2 \\foo');
+    const failedReport = failed.save();
+    checkEqual(failedReport.stats.formulaErrors, 1, '解析失败要计进 formulaErrors');
+    checkEqual(failedReport.stats.plainFormulas, 0, '解析失败的回落原文不许再计进 plainFormulas');
+}
+
 // ---------------------------------------------------------------- 结果
 
 if (!KEEP) {
-    // .office/tmp 是与 Excel/PPT 引擎共用的目录，只能删自己产出的文件，
+    // .office/runtime/tmp 是与 Excel/PPT 引擎共用的目录，只能删自己产出的文件，
     // 绝不能整个 rmSync —— 那会把别的引擎正在跑的产物一起清掉
-    for (const name of [SAMPLE, 'word-draft.docx', 'word-formula.docx', 'word-table.docx', 'word-external.docx']) env.remove(name);
+    for (const name of [SAMPLE, 'word-draft.docx', 'word-formula.docx', 'word-table.docx', 'word-external.docx',
+        'word-plain-formula.docx', 'word-plain-formula-control.docx', 'word-plain-formula-cover.docx',
+        'word-plain-formula-failed.docx', 'word-images-2col.docx', 'word-images-3col.docx',
+        'word-images-pad.docx', 'word-images-empty.docx', 'word-images-unsupported.docx']) env.remove(name);
     env.remove('assets/sample.png');
+    env.remove('assets/not-image.txt');
     if (env.list('assets').length === 0) env.remove('assets');
-    console.log('已清理本次产物（保留 .office/tmp 下其他文件）');
+    console.log('已清理本次产物（保留 .office/runtime/tmp 下其他文件）');
 } else {
     console.log(`保留产物：${ROOT}`);
 }

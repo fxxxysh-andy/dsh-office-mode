@@ -19,9 +19,9 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 
-import { createMemory, READ_LIMITS, renderRead } from '../src/memory.js';
+import { createMemory, GATE_VERDICT_TEXT, gateVerdictOf, READ_LIMITS, renderRead } from '../src/memory.js';
 
-const TMP = fileURLToPath(new URL('../../../.office/tmp/memory-recall/', import.meta.url));
+const TMP = fileURLToPath(new URL('../../../.office/runtime/tmp/memory-recall/', import.meta.url));
 
 const results = [];
 async function check(name, fn) {
@@ -58,7 +58,7 @@ await rm(TMP, { recursive: true, force: true });
  * 2. **数量要够**，所以 project 与 user 都要填：只填 project 撑不满（见上）。
  *
  * 这条夹具的判据不是「看起来够长」，而是：**旧实现下热记忆恰好用满 4,000 字、台账与归档
- * 各 0 条**（`.office/tmp/r24-impl/debug-starve.mjs` 在两版代码上分别量过）。
+ * 各 0 条**（`.office/runtime/tmp/r24-impl/debug-starve.mjs` 在两版代码上分别量过）。
  */
 const longEntry = (n) => {
     let text = `第 ${n} 条项目约定：`;
@@ -89,7 +89,7 @@ const LEDGER = [
     ['packages/dsh-office-mode/lib/client.js', '浏览器半侧单文件 bundle：记忆浏览面板的视觉重做'],
     ['docs/第十一轮-办公插件恢复Python计算与绘图.md', '为什么落点是 office.python、六条实现硬约束'],
     ['packages/dsh-office-mode/src/python.js', 'office.python 的实现：解释器探测 / run / file / check'],
-    ['.office/tmp/python-e2e/Python计算与绘图.pptx', '端到端样例：numpy 计算 + matplotlib 中文图嵌进 PPT'],
+    ['.office/runtime/tmp/python-e2e/Python计算与绘图.pptx', '端到端样例：numpy 计算 + matplotlib 中文图嵌进 PPT'],
     ['办公模式示例/季度回顾.docx', '第十轮用修复后的引擎重新生成的样例'],
     ['办公模式示例/经营回顾.pptx', '第十轮重新生成的样例'],
     ['办公模式示例/分月明细.xlsx', '第十轮重新生成的样例'],
@@ -116,9 +116,9 @@ const LABELED = [
     ['语音转写', ['docs/第二十一轮-语音输入SenseVoice能否用于音频处理.md'], '改写（正文写「语音输入」「音频转写」）'],
     ['提示词准确性', ['docs/第十八轮-提示词与工具调用准确性与有效性策略研究.md', 'docs/第十七轮-提示词注入瘦身与缓存归因.md'], '词序 + 拆分'],
     ['隐私清理', ['docs/第二十三轮-隐私清理与发布.md'], '整串命中'],
-    ['python 绘图', ['docs/第十一轮-办公插件恢复Python计算与绘图.md', '.office/tmp/python-e2e/Python计算与绘图.pptx'], '中英混排'],
-    ['python绘图', ['docs/第十一轮-办公插件恢复Python计算与绘图.md', '.office/tmp/python-e2e/Python计算与绘图.pptx'], '中英黏连（必须分段处理）'],
-    ['计算与绘图', ['docs/第十一轮-办公插件恢复Python计算与绘图.md', '.office/tmp/python-e2e/Python计算与绘图.pptx'], '整串命中'],
+    ['python 绘图', ['docs/第十一轮-办公插件恢复Python计算与绘图.md', '.office/runtime/tmp/python-e2e/Python计算与绘图.pptx'], '中英混排'],
+    ['python绘图', ['docs/第十一轮-办公插件恢复Python计算与绘图.md', '.office/runtime/tmp/python-e2e/Python计算与绘图.pptx'], '中英黏连（必须分段处理）'],
+    ['计算与绘图', ['docs/第十一轮-办公插件恢复Python计算与绘图.md', '.office/runtime/tmp/python-e2e/Python计算与绘图.pptx'], '整串命中'],
     ['季度回顾', ['办公模式示例/季度回顾.docx'], '整串命中'],
     ['样例 重新生成', ['办公模式示例/季度回顾.docx', '办公模式示例/经营回顾.pptx', '办公模式示例/分月明细.xlsx'], '多词，各自命中'],
     ['结构记忆系统', ['docs/第十九轮-记忆系统结构优化与知识库结合.md'], '词序颠倒'],
@@ -313,6 +313,282 @@ await check('B2 切词边界：标点分隔、大小写、单字回落、纯英�
 
     const latin = await memory.read({ layer: 'ledger', query: 'token' });
     assert.equal(latin.ledger.matched, 1, '纯英文整词匹配');
+});
+
+// ── C 组：读侧主题分区（第五十四轮 新-12） ──────────────────────────────────
+//
+// 守的是「tags / entities 从**只参与匹配**变成**参与隔离**」这条改动：从前正文里出现
+// 关键词就算命中（软），现在没**显式声明**过这些标签 / 实体的条目一律不出现（硬）。
+// 这条判据最容易退化的三处：只判热记忆、把合取写成「任一命中」、把分区当排序键。
+
+await check('C1 分区是硬过滤：正文里有那个词但没声明过标签 / 实体的条目不出现', async () => {
+    const { memory } = await freshRoot();
+    await memory.mutate({ action: 'add', target: 'project', content: '发布流程：先过评审再发。', tags: ['发布'], entities: ['发布流程'] });
+    await memory.mutate({ action: 'add', target: 'project', content: '这条正文里也写着发布两个字，但没声明标签。', tags: ['财务'] });
+    await memory.mutate({ action: 'add', target: 'project', content: '既没有标签也没有实体的条目。' });
+
+    const all = await memory.read({ layer: 'hot' });
+    assert.equal(all.hot.items.length, 3, '不给分区就是老行为：全给');
+    assert.equal(all.partition, undefined, '没给分区时结果里不该有 partition');
+
+    const published = await memory.read({ layer: 'hot', tags: ['发布'] });
+    assert.equal(published.hot.items.length, 1, '只给**声明过**该标签的那一条（正文命中不算）');
+    assert.ok(published.hot.items[0].text.includes('发布流程：先过评审'), '命中的是声明过标签的那条');
+    assert.equal(published.hot.partitionFiltered, 2, '隔掉的条数要如实报');
+    assert.equal(published.hot.total, 3, 'total 是**分区前**的条数（与台账 / 归档同口径）');
+    assert.deepEqual(published.partition.tags, ['发布']);
+
+    const byEntity = await memory.read({ layer: 'hot', entities: ['发布流程'] });
+    assert.equal(byEntity.hot.items.length, 1, '实体分区同理');
+
+    const miss = await memory.read({ layer: 'hot', tags: ['不存在的分区'] });
+    assert.equal(miss.hot.items.length, 0);
+    const text = renderRead(miss);
+    assert.match(text, /^分区：标签 不存在的分区/m, '回执首部要自报分区口径（谁隔掉了条目）');
+    assert.ok(text.includes('没有声明所给的分区标签/实体'), '一条都没给时要说是分区挡的，不是「记忆里没有」');
+});
+
+await check('C2 多个词是合取（都要声明过），大小写与首尾空白归一、重复键去重', async () => {
+    const { memory } = await freshRoot();
+    await memory.mutate({ action: 'add', target: 'project', content: '两个标签都有的条目。', tags: ['发布', '模板'] });
+    await memory.mutate({ action: 'add', target: 'project', content: '只有发布标签的条目。', tags: ['发布'] });
+    await memory.mutate({ action: 'add', target: 'project', content: '大小写不同的标签。', tags: ['Release'] });
+
+    const both = await memory.read({ layer: 'hot', tags: ['发布', '模板'] });
+    assert.equal(both.hot.items.length, 1, '两个标签都要声明过（合取，不是「任一命中」）');
+
+    const one = await memory.read({ layer: 'hot', tags: ['发布'] });
+    assert.equal(one.hot.items.length, 2, '只给一个标签时给两条');
+
+    const lower = await memory.read({ layer: 'hot', tags: [' release '] });
+    assert.equal(lower.hot.items.length, 1, '分区键去首尾空白 + 大小写不敏感');
+
+    const dup = await memory.read({ layer: 'hot', tags: ['发布', '发布', ' 发布 '] });
+    assert.equal(dup.hot.items.length, 2, '重复的分区键归一成一条（合取里不影响结果）');
+
+    // 空白的分区键**不是**「没给分区」（复核 P3-2）：静默当没给，回执里连分区行都不印，
+    // 读的人会把「没过滤」当成「这一类只有这些」。要「不过滤」就传空数组。
+    await assert.rejects(() => memory.read({ layer: 'hot', tags: ['', '  '] }), /分区键不能是空串/,
+        '空白的分区键要拒绝，不静默变成「不过滤」');
+    assert.equal((await memory.read({ layer: 'hot', tags: [] })).hot.items.length, 3, '空数组 = 不过滤');
+});
+
+await check('C3 台账的分区键是 theme；拿实体分区时如实报「分区外的条目」', async () => {
+    const { memory } = await freshRoot();
+    await memory.log([
+        { path: 'a.md', format: 'md', theme: '发布', purpose: '发布流程说明' },
+        { path: 'b.md', format: 'md', theme: '财务', purpose: '财务口径' },
+        { path: 'c.md', format: 'md', purpose: '没有主题的台账行' },
+    ]);
+
+    const themed = await memory.read({ layer: 'ledger', tags: ['发布'] });
+    assert.equal(themed.ledger.items.length, 1, '台账按 theme 参与分区');
+    assert.equal(themed.ledger.partitionFiltered, 2, 'theme 不是「发布」的两条被隔掉');
+
+    // 同一维度里给两个词是合取 —— 台账一行只有一个 theme，所以必然 0 条。这条钉住
+    // 「合取不因为层不同就变成析取」（两层各写一套判据是这类改动最常见的退化）。
+    const two = await memory.read({ layer: 'ledger', tags: ['发布', '财务'] });
+    assert.equal(two.ledger.items.length, 0, '给两个标签仍然要同时满足（合取）');
+
+    const byEntity = await memory.read({ layer: 'ledger', entities: ['发布流程'] });
+    assert.equal(byEntity.ledger.items.length, 0, '台账没有实体，实体分区挡掉全部');
+    assert.ok(renderRead(byEntity).includes('分区外的条目'), '要说清是分区挡的，不是「台账里没有」');
+});
+
+await check('C4 归档条目带标签下沉后仍按分区可读，隔掉的条数能对账', async () => {
+    const { memory } = await freshRoot({ projectLimitBytes: 320, archiveKeep: 10 });
+    await memory.mutate({ action: 'add', target: 'project', content: `要保住的那条：${'重'.repeat(30)}`, importance: 'critical', tags: ['保留'] });
+    for (let i = 0; i < 6; i += 1) {
+        await memory.mutate({ action: 'add', target: 'project', content: `会下沉 ${i}：${'旧'.repeat(30)}`, importance: 'low', tags: [i < 3 ? '发布' : '财务'] });
+    }
+
+    const all = await memory.read({ layer: 'archive' });
+    assert.ok(all.archive.items.length >= 3, `下沉后归档里应有多条（实际 ${all.archive.items.length}）`);
+
+    const published = await memory.read({ layer: 'archive', tags: ['发布'] });
+    assert.ok(published.archive.items.length >= 1, '归档里的条目按它自己的 tags 参与分区');
+    assert.ok(published.archive.items.every((item) => (item.tags ?? []).includes('发布')), '分区外的归档条目不许出现');
+    assert.ok(published.archive.items.every((item) => !String(item.text).includes('财务')), '隔掉的那一半不能漏进来');
+    assert.equal(published.archive.partitionFiltered + published.archive.matched, all.archive.matched,
+        '「隔掉的 + 命中的」要等于分区前的条数（账要对得上）');
+});
+
+await check('C6 归档层的「为什么没给」也要对：分区清空归档时说分区，不说额度', async () => {
+    const { memory } = await freshRoot({ projectLimitBytes: 320, archiveKeep: 10 });
+    for (let i = 0; i < 6; i += 1) {
+        await memory.mutate({ action: 'add', target: 'project', content: `会下沉 ${i}：${'旧'.repeat(30)}`, importance: 'low', tags: ['发布'] });
+    }
+    const all = await memory.read({ layer: 'archive' });
+    assert.ok(all.archive.items.length >= 3, `夹具要先真的沉下去（实际 ${all.archive.items.length}）`);
+
+    // 归档那一层的「分区前条数」字段叫 items_total（热记忆与台账叫 total）：只认 total 的
+    // 判据会 `>= undefined` 恒为假，于是归档永远掉到最后那句假的「额度被占满」（复核 P1-1）。
+    const miss = await memory.read({ layer: 'archive', tags: ['根本没有这个分区'] });
+    assert.equal(miss.archive.items.length, 0, '分区外的归档条目不该给出来');
+    const text = renderRead(miss);
+    assert.ok(text.includes('分区外的条目'), `归档层要说是分区挡的：${text}`);
+    assert.ok(!text.includes('被更长的条目占满'), `不许把分区说成额度：${text}`);
+
+    // 带 query 时同理：真因是分区，不是关键词。
+    const withQuery = await memory.read({ layer: 'archive', tags: ['根本没有这个分区'], query: '会下沉' });
+    assert.ok(renderRead(withQuery).includes('分区外的条目'), '带 query 时也要说是分区挡的');
+});
+
+await check('C7 热记忆的排序不随 query 变：low 的笔记命中更多词也压不过 critical', async () => {
+    const { memory } = await freshRoot();
+    // 关键的一条：critical 是**约束**，low 只是一条笔记。命中数更多也不该把约束挤下去 ——
+    // 第五十四轮初版让命中强度当主键，`limit:1` 时这条约束会直接消失（复核 P1-4）。
+    await memory.mutate({ action: 'add', target: 'project', content: '永远不要把草稿发给客户。', importance: 'critical' });
+    await memory.mutate({ action: 'add', target: 'project', content: '草稿发给客户之前，客户名与日期都要再核一遍，草稿的版本号也要写。', importance: 'low' });
+
+    const ranked = await memory.read({ layer: 'hot', query: '草稿 客户' });
+    assert.equal(ranked.hot.items.length, 2, '两条都命中，都要给出来');
+    assert.equal(ranked.hot.items[0].importance, 'critical', '重要度仍是主键（命中更多词不改变它）');
+
+    const top = await memory.read({ layer: 'hot', query: '草稿 客户', limit: 1 });
+    assert.equal(top.hot.items.length, 1);
+    assert.ok(top.hot.items[0].text.includes('永远不要'), 'limit 截断时留下的必须是那条约束');
+
+    // 同族两版：旧版命中词更多也不该冒到当前版前面（第四十二轮量到增益才落地的契约）。
+    const older = await memory.mutate({ action: 'add', target: 'project', content: '发布窗口：旧版写着周三，发布窗口的细节在旧版里更全。', importance: 'normal' });
+    await new Promise((resolve) => { setTimeout(resolve, 5); });
+    const newer = await memory.mutate({ action: 'add', target: 'project', content: '发布窗口：当前版写着周五。', importance: 'normal' });
+    const family = await memory.read({ layer: 'hot', query: '发布窗口' });
+    const order = family.hot.items.map((item) => item.id);
+    assert.ok(order.indexOf(newer.entry.id) < order.indexOf(older.entry.id),
+        `同重要度里当前版要在旧版前面（实测次序 ${order.join(' > ')}）`);
+});
+
+await check('C5 分区与 query 同时给：先分区后过滤，命中相同时重要度仍是主键', async () => {
+    const { memory } = await freshRoot();
+    await memory.mutate({ action: 'add', target: 'project', content: '甲：季度回顾用模板 A。', tags: ['发布'], importance: 'low' });
+    await memory.mutate({ action: 'add', target: 'project', content: '乙：月度经营简报用模板 B。', tags: ['发布'], importance: 'critical' });
+    await memory.mutate({ action: 'add', target: 'project', content: '丙：季度回顾用模板 A，但不在这个分区。', tags: ['财务'], importance: 'critical' });
+
+    const hit = await memory.read({ layer: 'hot', tags: ['发布'], query: '季度' });
+    assert.equal(hit.hot.items.length, 1, '分区先过滤：财务那条即使命中关键词也不出现');
+    assert.ok(hit.hot.items[0].text.includes('甲'), '留下的是分区内的那条');
+
+    const both = await memory.read({ layer: 'hot', tags: ['发布'], query: '模板' });
+    assert.equal(both.hot.items.length, 2, '两条都在分区里');
+    assert.equal(both.hot.items[0].importance, 'critical', '命中强度相同时重要度仍是主键（不是时间倒序）');
+
+    // 带 query 就是检索：一个词都没命中的条目与台账 / 归档同口径地不出现。
+    const none = await memory.read({ layer: 'hot', tags: ['发布'], query: '量子纠缠' });
+    assert.equal(none.hot.items.length, 0, '没命中就不给');
+    assert.ok(renderRead(none).includes('没有命中关键词'), '要说清是关键词没命中（换词），不是分区挡的');
+});
+
+// ── D 组（第五十七轮 P2-8）：统一入口路由的「记忆够答吗」门控 ─────────────────
+
+/*
+ * 判据是**纯函数**（`gateVerdictOf`），所以这里可以逐档钉住它；`read` 侧只负责
+ * 把三样现算出来的事实（命中条数 / 查询词覆盖 / 最高重要度）交给它。
+ * 之所以两层分开：门控一旦混进「读」的实现里，就没有任何东西能挡住下一轮
+ * 悄悄把某一档改成别的意思 —— 而这一档决定的是「要不要再花一次 kb 配额」。
+ */
+
+await check('D1 门控四档：纯判据逐档可核对（顺序即优先级）', () => {
+    assert.equal(gateVerdictOf({ terms: ['甲', '乙'], covered: 0, hits: 0, topImportance: '' }), 'empty');
+    // 命中 0 条时连「覆盖」都不看：没有命中就一定是 empty。
+    assert.equal(gateVerdictOf({ terms: ['甲', '乙'], covered: 2, hits: 0, topImportance: 'critical' }), 'empty');
+    assert.equal(gateVerdictOf({ terms: ['甲', '乙'], covered: 1, hits: 3, topImportance: 'critical' }), 'partial');
+    assert.equal(gateVerdictOf({ terms: ['甲', '乙'], covered: 2, hits: 3, topImportance: 'normal' }), 'weak');
+    assert.equal(gateVerdictOf({ terms: ['甲', '乙'], covered: 2, hits: 3, topImportance: 'low' }), 'weak');
+    assert.equal(gateVerdictOf({ terms: ['甲', '乙'], covered: 2, hits: 3, topImportance: 'critical' }), 'enough');
+    // 四档的中文说法与判据同源（回执与测试不各写各的）。
+    for (const verdict of ['empty', 'partial', 'weak', 'enough']) {
+        assert.equal(typeof GATE_VERDICT_TEXT[verdict], 'string', `缺 ${verdict} 的中文说法`);
+    }
+    return '4 档 + 1 条边界';
+});
+
+await check('D2 read 现算门控：命中数、查询词覆盖与最高重要度都来自真的命中', async () => {
+    const { memory } = await freshRoot();
+    await memory.mutate({ action: 'add', target: 'project', content: '发布流程：打包前必须跑回归。', importance: 'critical' });
+    await memory.mutate({ action: 'add', target: 'project', content: '主题色用 plain。', importance: 'normal' });
+
+    // 一条约束级 + 词全覆盖 → 够答。
+    const enough = await memory.read({ query: '发布流程' });
+    assert.equal(enough.gate.verdict, 'enough', JSON.stringify(enough.gate));
+    assert.equal(enough.gate.hits, 1);
+    assert.equal(enough.gate.topImportance, 'critical');
+    assert.equal(enough.gate.covered.length, enough.gate.terms.length);
+    assert.deepEqual(enough.gate.missing, []);
+
+    // 记忆里没有这件事 → empty（不是「额度吃掉」也不是「分区挡的」）。
+    const empty = await memory.read({ query: '量子纠缠' });
+    assert.equal(empty.gate.verdict, 'empty');
+    assert.equal(empty.gate.hits, 0);
+    assert.deepEqual(empty.gate.covered, []);
+    assert.equal(empty.gate.missing.length, empty.gate.terms.length);
+
+    // 半边对上：命中里有一半词对不上 → partial（并且点出缺的是哪几个词）。
+    const partial = await memory.read({ query: '发布流程 量子计算' });
+    assert.equal(partial.gate.verdict, 'partial', JSON.stringify(partial.gate));
+    assert.ok(partial.gate.missing.includes('量子'), JSON.stringify(partial.gate.missing));
+    assert.ok(partial.gate.covered.includes('发布'));
+
+    // 词全覆盖但没有约束级 → weak（「有相关内容」不等于「够答」）。
+    const weak = await memory.read({ query: '主题色' });
+    assert.equal(weak.gate.verdict, 'weak', JSON.stringify(weak.gate));
+    assert.equal(weak.gate.topImportance, 'normal');
+
+    // 不带 query 的浏览没有门控这回事（省掉无意义的字段）。
+    const browse = await memory.read({ layer: 'hot' });
+    assert.equal(browse.gate, undefined, '不带 query 不该给门控');
+});
+
+await check('D3 门控只做过滤不做重排：带 query 的次序 = 不带 query 的次序去掉没命中的那些', async () => {
+    const { memory } = await freshRoot();
+    // 夹具要能让**两种排法的结果不同**，断言才有鉴别力（独立复核 P1-1 打穿了初版：
+    // 拿同一次调用的两份拷贝互比，任何实现下都成立）：甲是 low、命中两个词、且**更旧**；
+    // 乙是 critical、只命中一个词、且**更新**。按「命中强度」排会得到 [甲, 乙]，
+    // 按「重要度是主键」排必须得到 [乙, 甲]；recency 也只会把甲往前推，
+    // 所以这一条真的能红。
+    await memory.mutate({ action: 'add', target: 'project', content: '甲：交付档命名口径要带当天日期。', importance: 'low' });
+    await new Promise((resolve) => { setTimeout(resolve, 5); });
+    await memory.mutate({ action: 'add', target: 'project', content: '乙：交付档不要沿用上一轮。', importance: 'critical' });
+
+    const ranked = await memory.read({ layer: 'hot', query: '交付档 命名' });
+    assert.equal(ranked.hot.items.length, 2, '两条都命中');
+    assert.equal(ranked.hot.items[0].importance, 'critical', '重要度仍是主键（命中更多词、更旧都不改变它）');
+
+    // 与「不带 query 的浏览」对账：把没命中的那些去掉，次序必须逐字一致 ——
+    // 门控的作用是**缩小集合**，不是重排（第五十四轮 P1-4 的契约）。
+    const browse = await memory.read({ layer: 'hot' });
+    const browsedIds = browse.hot.items.map((item) => item.id);
+    const rankedIds = ranked.hot.items.map((item) => item.id);
+    assert.deepEqual(rankedIds, browsedIds.filter((id) => rankedIds.includes(id)),
+        `带 query 的次序必须是浏览次序的子序列（浏览 ${browsedIds.join(' >')} / 命中 ${rankedIds.join(' >')}）`);
+    assert.equal(browse.gate, undefined, '不带 query 的浏览没有门控这回事');
+
+    // 换了 query（门控原料跟着变）也不许改变同一批条目的相对次序。
+    const other = await memory.read({ layer: 'hot', query: '上一轮' });
+    assert.deepEqual(other.hot.items.map((item) => item.id), [rankedIds[0]], '只有乙命中「上一轮」');
+});
+
+await check('D4 归档里的 critical 也算得上门控的「约束级」（否则回执会否认自己正文）', async () => {
+    // 独立复核 P2-1：门控最初只从热记忆层取最高重要度，于是 `layer:'archive'` 永远到不了
+    // enough，判定行写「命中的没有约束级条目」——而紧跟的那行正文就印着 `热记忆（…/critical）`。
+    const { memory } = await freshRoot({ projectLimitBytes: 320, archiveKeep: 10 });
+    for (let i = 0; i < 6; i += 1) {
+        await memory.mutate({ action: 'add', target: 'project', content: `硬约束 ${i}：永远不要把草稿发给客户，编号 ${i}。`, importance: 'critical' });
+    }
+    const archived = await memory.read({ layer: 'archive' });
+    assert.ok(archived.archive.items.length >= 1, '夹具要先真的沉下去');
+    assert.ok(archived.archive.items.some((item) => item.importance === 'critical'), '归档里那条确实是 critical');
+
+    const hit = await memory.read({ layer: 'archive', query: '草稿 客户' });
+    assert.equal(hit.archive.items.length >= 1, true, '要能命中');
+    assert.equal(hit.gate.topImportance, 'critical', `归档 hot-kind 的重要度要算进门控：${JSON.stringify(hit.gate)}`);
+    assert.equal(hit.gate.verdict, 'enough', '词全覆盖 + 归档里那条 critical ⇒ 够答');
+
+    // 台账条目本来没有重要度字段：拿它当唯一命中时，不该凭空判出约束级。
+    await memory.log([{ path: 'docs/x.md', format: 'markdown', theme: '甲', purpose: '台账条目：草稿与客户' }]);
+    const ledgerOnly = await memory.read({ layer: 'ledger', query: '草稿 客户' });
+    assert.equal(ledgerOnly.gate.topImportance, '', '台账没有重要度字段，不该凭空算出一个');
+    assert.equal(ledgerOnly.gate.verdict, 'weak', '词对上但没有约束级 ⇒ weak（下探 kb 是合理的）');
 });
 
 // ── 汇总 ───────────────────────────────────────────────────────────────────

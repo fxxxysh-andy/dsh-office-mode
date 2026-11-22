@@ -22,7 +22,7 @@
  */
 
 /** 一次回溯最多扫多少条事件：超长回合也不会因此变慢。 */
-const MAX_SCAN = 600;
+export const QUOTA_MAX_SCAN = 600;
 
 /** 会话缓存：sessionId → { count, turn }。只在事件数变化时重扫。 */
 const turnCache = new Map();
@@ -61,7 +61,13 @@ export function turnKeyOf(exec) {
     const cached = turnCache.get(sessionId);
     let turn = cached?.turn ?? 0;
     if (cached === undefined || cached.count !== events.length) {
-        const floor = cached === undefined ? Math.max(0, events.length - MAX_SCAN) : Math.max(0, Math.min(cached.count, events.length - MAX_SCAN));
+        // 起点取**两者更靠后**的那个（第五十六轮修正 A-01）：`cached.count` 是上次扫到哪儿，
+        // `events.length - QUOTA_MAX_SCAN` 是「这次最多往回看多少条」。从前写成
+        // `Math.min(cached.count, …)`，于是「缓存 100 条 → 现在 5000 条、新增段里没有
+        // turn/start」时会从 4999 一路扫到 100（4900 条）—— 「最多扫 MAX_SCAN 条」这句
+        // 声明当场不成立。取 max 之后新段照扫、但总量恒被 MAX_SCAN 封顶；结果不变
+        // （找不到新的就沿用缓存里的 turn 号），变的只是「有界」这句话真的成立。
+        const floor = Math.max(0, cached?.count ?? 0, events.length - QUOTA_MAX_SCAN);
         for (let i = events.length - 1; i >= floor; i -= 1) {
             const event = events[i];
             if (event?.type !== 'turn/start') continue;

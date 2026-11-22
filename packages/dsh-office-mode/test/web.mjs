@@ -23,9 +23,9 @@ import {
     inspectFetchedPage,
     isPublicAddress,
     looksLikePdf,
-    mapSearchResponse,
+    mapDeepSeekApiResponse,
     mergeSources,
-    resolveBuiltinOptions,
+    resolveWebOptions,
     searchProvider,
     summarizeWebFailures,
     validateUrl,
@@ -119,21 +119,19 @@ await check('接缝报错时自动回落到自带实现（并把接缝的失败�
         search: async () => { throw new Error('WEB_PROVIDER_UNAVAILABLE: 没有可用的 provider'); },
         fetch: async () => { throw new Error('不可用'); },
     };
-    const access = createWebAccess(cordisLikeCtx({ web: seam }), { apiKey: 'test-key' }, {
+    const access = createWebAccess(cordisLikeCtx({ web: seam }), {
+        provider: 'deepseek-api',
+        providers: { 'deepseek-api': { apiKey: 'test-key' } },
+    }, {
         fetch: async (url, init) => {
             fetched += 1;
-            assert.ok(String(url).endsWith('/messages'), '自带检索要打 /messages 端点');
-            assert.equal(init.headers['x-api-key'], 'test-key');
+            assert.ok(String(url).endsWith('/search'), '直连通道要打 /search 端点');
+            assert.equal(init.headers.authorization, 'Bearer test-key');
             return {
                 ok: true,
                 status: 200,
                 async json() {
-                    return {
-                        content: [
-                            { type: 'web_search_tool_result', content: [{ type: 'web_search_result', url: 'https://c.example.com/3', title: '来源丙' }] },
-                            { type: 'text', text: '概览', citations: [{ url: 'https://c.example.com/3', cited_text: '被引用的那句话' }] },
-                        ],
-                    };
+                    return { results: [{ title: '来源丙', url: 'https://c.example.com/3', snippet: '被引用的那句话' }] };
                 },
             };
         },
@@ -150,20 +148,25 @@ await check('接缝报错时自动回落到自带实现（并把接缝的失败�
 
 await check('两边都不可用时，报错里同时点明接缝与内置的原因', async () => {
     const seam = { search: async () => { throw new Error('没有可用 provider'); }, fetch: async () => { throw new Error('x'); } };
-    const access = createWebAccess(cordisLikeCtx({ web: seam }), { apiKeyEnv: 'OFFICE_TEST_MISSING_KEY' }, { fetch: async () => { throw new Error('不该走到这里'); } });
+    const access = createWebAccess(cordisLikeCtx({ web: seam }), {
+        provider: 'auto',
+        providerOrder: ['deepseek-api', 'seam'],
+        providers: { 'deepseek-api': { apiKeyEnv: 'OFFICE_TEST_MISSING_KEY' } },
+    }, { fetch: async () => { throw new Error('不该走到这里'); } });
     await assert.rejects(() => access.search('某事件'), (error) => {
         assert.ok(error instanceof WebAccessError);
         assert.match(error.message, /宿主 web 服务/);
         assert.match(error.message, /OFFICE_TEST_MISSING_KEY/);
         return true;
     });
+    // 失败缓存会带进 probe：刚试过的两条都被记为不可用，报错原因里仍要点名接缝。
     const status = await access.probe();
     assert.equal(status.ok, false);
     assert.match(status.reason, /宿主 web 服务/);
 });
 
-await check('没有接缝、但有 Key 时，probe 报自带检索可用', async () => {
-    const access = createWebAccess(cordisLikeCtx({}), { apiKey: 'k' });
+await check('没有接缝、但 deepseek-api 配了 Key 时，probe 报自带检索可用', async () => {
+    const access = createWebAccess(cordisLikeCtx({}), { provider: 'deepseek-api', providers: { 'deepseek-api': { apiKey: 'k' } } });
     const status = await access.probe();
     assert.equal(status.ok, true);
     assert.equal(status.engine, WEB_ENGINE_BUILTIN);
@@ -171,25 +174,23 @@ await check('没有接缝、但有 Key 时，probe 报自带检索可用', async
 
 // ── 响应映射 ──────────────────────────────────────────────────────────────
 
-await check('响应映射：按 URL 去重、引用片段贴在对应来源上、概览单独给', () => {
-    const mapped = mapSearchResponse({
-        content: [
-            { type: 'web_search_tool_result', content: [
-                { type: 'web_search_result', url: 'https://a.example.com/1', title: '甲', page_age: '2026-01-01' },
-                { type: 'web_search_result', url: 'https://a.example.com/1', title: '甲的重复' },
-                { type: 'web_search_result', url: 'https://b.example.com/2', title: '乙' },
-            ] },
-            { type: 'text', text: '一句话概览', citations: [{ url: 'https://b.example.com/2', cited_text: '乙的引用' }] },
+await check('DeepSeek Search API 响应映射：snippet 空时退回 summary，date 进 publishedAt', () => {
+    const mapped = mapDeepSeekApiResponse({
+        results: [
+            { title: '甲', url: 'https://a.example.com/1', snippet: '片段甲', date: '2026-01-01' },
+            { title: '乙', url: 'https://b.example.com/2', summary: '摘要乙' },
+            { title: '丙', url: 'https://a.example.com/1', snippet: '重复 URL' },
         ],
     });
     assert.equal(mapped.sources.length, 2, '重复 URL 只留一条');
+    assert.equal(mapped.sources[0].snippet, '片段甲');
     assert.equal(mapped.sources[0].publishedAt, '2026-01-01');
-    assert.equal(mapped.sources[1].snippet, '乙的引用');
-    assert.equal(mapped.content, '一句话概览');
+    assert.equal(mapped.sources[1].snippet, '摘要乙', 'snippet 缺省时用 summary 当摘录');
 });
 
-await check('没有 web_search_tool_result 块时明确报错，而不是拿正文凑数', () => {
-    assert.throws(() => mapSearchResponse({ content: [{ type: 'text', text: '我没搜' }] }), /没有触发原生检索/);
+await check('DeepSeek Search API 空数组算成功（没结果 ≠ 解析失败）', () => {
+    const mapped = mapDeepSeekApiResponse({ results: [] });
+    assert.deepEqual(mapped.sources, []);
 });
 
 await check('多查询结果合并去重后按上限截断', () => {
@@ -470,6 +471,25 @@ await check('点名通道时不会先去试接缝（用户选了哪条就走哪�
     assert.equal(result.sources[0].url, 'https://a.example.com/1');
 });
 
+await check('DeepSeek Search API：POST /search、Bearer 鉴权、body 带 query/count、不跑辅助模型', async () => {
+    const { result, calls } = await runChannel('deepseek-api', { apiKey: 'ds-key' }, jsonReply({
+        results: [
+            { title: '甲', url: 'https://a.example.com/1', snippet: '摘要甲', date: '2026-02-02' },
+            { title: '乙', url: 'https://b.example.com/2', summary: '摘要乙' },
+        ],
+    }), { maxResults: 4 });
+    assert.equal(calls[0].url, 'https://api.deepseek.com/v1/tools/search');
+    assert.equal(calls[0].init.method, 'POST');
+    assert.equal(calls[0].init.headers.authorization, 'Bearer ds-key');
+    const body = JSON.parse(calls[0].init.body);
+    assert.equal(body.query, '某事件');
+    assert.equal(body.count, 4, '请求里的 maxResults 要传成 count');
+    assert.equal(body.need_content, false, '搜索阶段不搬正文');
+    assert.equal(result.sources.length, 2);
+    assert.equal(result.sources[0].snippet, '摘要甲');
+    assert.equal(result.sources[0].publishedAt, '2026-02-02');
+});
+
 await check('Tavily：POST /search、api_key 在体里、解析 results[].content 当摘录', async () => {
     const { result, calls } = await runChannel('tavily', { apiKey: 'tv-key' }, jsonReply({
         answer: '',
@@ -571,33 +591,33 @@ await check('DuckDuckGo：抓 HTML 结果页、解开 uddg 跳转、解析不出
 });
 
 await check('auto：按顺序试通道，第一条成功的就用它；全失败时逐条给出原因', async () => {
-    // 只有 tavily 配了 Key：anthropic 会当场失败（不联网），tavily 命中。
+    // 只有 tavily 配了 Key：deepseek-api 会当场失败（不联网），tavily 命中。
     const http = fakeHttp(jsonReply({ results: [{ title: '甲', url: 'https://a.example.com/1', content: '摘要' }] }));
     const access = createWebAccess(cordisLikeCtx({}), {
         provider: 'auto',
-        providerOrder: ['anthropic', 'tavily'],
-        providers: { anthropic: { apiKeyEnv: 'OFFICE_TEST_MISSING_KEY' }, tavily: { apiKey: 'tv-key' } },
+        providerOrder: ['deepseek-api', 'tavily'],
+        providers: { 'deepseek-api': { apiKeyEnv: 'OFFICE_TEST_MISSING_KEY' }, tavily: { apiKey: 'tv-key' } },
     }, { fetch: http.fetch });
     const result = await access.search('某事件');
     assert.equal(result.provider, 'tavily');
-    assert.equal(http.calls.length, 1, 'anthropic 没配 Key 时不该发请求');
+    assert.equal(http.calls.length, 1, 'deepseek-api 没配 Key 时不该发请求');
 
     const dead = createWebAccess(cordisLikeCtx({}), {
         provider: 'auto',
-        providerOrder: ['anthropic', 'tavily'],
-        providers: { anthropic: { apiKeyEnv: 'OFFICE_TEST_MISSING_KEY' }, tavily: { apiKeyEnv: 'OFFICE_TEST_MISSING_KEY_2' } },
+        providerOrder: ['deepseek-api', 'tavily'],
+        providers: { 'deepseek-api': { apiKeyEnv: 'OFFICE_TEST_MISSING_KEY' }, tavily: { apiKeyEnv: 'OFFICE_TEST_MISSING_KEY_2' } },
     }, { fetch: async () => { throw new Error('不该走到这里'); } });
     await assert.rejects(() => dead.search('某事件'), (error) => {
-        assert.match(error.message, /Anthropic 兼容/);
+        assert.match(error.message, /DeepSeek Search API/);
         assert.match(error.message, /Tavily/);
         assert.match(error.message, /配置缺失/);
         return true;
     });
     // probe 也只看这次真的会试的那几条：点名一条没配好的通道，必须报不可用。
-    const pinned = createWebAccess(cordisLikeCtx({}), { provider: 'anthropic', providers: { anthropic: { apiKeyEnv: 'OFFICE_TEST_MISSING_KEY' } } }, { fetch: async () => { throw new Error('x'); } });
+    const pinned = createWebAccess(cordisLikeCtx({}), { provider: 'deepseek-api', providers: { 'deepseek-api': { apiKeyEnv: 'OFFICE_TEST_MISSING_KEY' } } }, { fetch: async () => { throw new Error('x'); } });
     const status = await pinned.probe();
-    assert.equal(status.ok, false, '点名 anthropic 但没 Key 时不能说「可用」');
-    assert.match(status.reason, /Anthropic 兼容/);
+    assert.equal(status.ok, false, '点名 deepseek-api 但没 Key 时不能说「可用」');
+    assert.match(status.reason, /DeepSeek Search API/);
 });
 
 // ── 失败分类与自检的如实性（第三十三轮）──────────────────────────────────
@@ -640,6 +660,154 @@ await check('probe 不把「只判过配置」的通道说成「可用」', asyn
     const seam = createWebAccess(cordisLikeCtx({ web: { search: async () => ({ sources: [] }), fetch: async () => ({}) } }), { provider: 'seam' });
     const seamStatus = await seam.probe();
     assert.equal(seamStatus.verified, true, '接缝是问过运行时的');
+});
+
+// ── 失败状态分层（第七十八轮 S-07）────────────────────────────────────────
+//
+// 旧版一张 failed 表、以 provider id 为键、检索与取正文共用：一个页面被目标站拒绝，
+// 整条接缝就被判死（同批其它 URL 不再兜底、后续检索也跳过它）。现在拆成
+// 检索通道 / 取正文通道 / 页面 URL 三份状态，下面这些用例钉住分层边界。
+
+await check('S-07：一个页面被拒，不阻止同批第二个正常页面走接缝兜底', async () => {
+    const seamCalls = [];
+    const seam = {
+        search: async () => ({ sources: [] }),
+        fetch: async (request) => {
+            seamCalls.push(request.url);
+            if (request.url === 'https://blocked.example.com/1') {
+                return {
+                    url: request.url,
+                    statusCode: 200,
+                    body: { kind: 'html', content: '<html><head><title>拦截</title></head><body>Just a moment...</body></html>' },
+                };
+            }
+            return {
+                url: request.url,
+                statusCode: 200,
+                body: { kind: 'html', content: '<html><head><title>页面乙</title></head><body><p>这是第二个页面的正文段落，长度足够当摘录用的一行。</p></body></html>' },
+            };
+        },
+    };
+    const access = createWebAccess(cordisLikeCtx({ web: seam }), { apiKey: 'k', maxRedirects: 0 }, {
+        lookup: async () => [{ address: '93.184.216.34', family: 4 }],
+        fetch: async () => { throw new Error('自带抓取连不上'); },
+    });
+    await assert.rejects(() => access.fetch('https://blocked.example.com/1'), (error) => {
+        assert.equal(error.code, 'OFFICE_WEB_BLOCKED');
+        assert.match(error.message, /人机校验页|目标站拒绝/);
+        return true;
+    });
+    const page = await access.fetch('https://ok.example.com/2');
+    assert.equal(page.provider, 'seam', '第二个页面仍要走接缝兜底');
+    assert.match(page.content, /第二个页面/);
+    assert.deepEqual(seamCalls, ['https://blocked.example.com/1', 'https://ok.example.com/2'], '两个页面各试一次接缝');
+});
+
+await check('S-07：页面级失败不把检索通道判死，后续搜索仍走接缝', async () => {
+    const seam = {
+        search: async () => ({ content: '', sources: [{ url: 'https://news-a.example.com/1', title: '来源甲' }] }),
+        fetch: async (request) => ({
+            url: request.url,
+            statusCode: 200,
+            body: { kind: 'html', content: '<html><body>Just a moment...</body></html>' },
+        }),
+    };
+    const access = createWebAccess(cordisLikeCtx({ web: seam }), { provider: 'seam', apiKey: 'k', maxRedirects: 0 }, {
+        lookup: async () => [{ address: '93.184.216.34', family: 4 }],
+        fetch: async () => { throw new Error('自带抓取连不上'); },
+    });
+    await assert.rejects(() => access.fetch('https://blocked.example.com/1'), /人机校验页/);
+    const result = await access.search('再查一次');
+    assert.equal(result.engine, WEB_ENGINE_SEAM, '页面失败不该跳过后面的检索');
+    assert.equal(result.sources[0].url, 'https://news-a.example.com/1');
+});
+
+await check('S-07：检索通道失败不牵连取正文（两份健康分开记）', async () => {
+    const seam = {
+        search: async () => { throw new Error('WEB_PROVIDER_UNAVAILABLE: 没有可用的 provider'); },
+        fetch: async (request) => ({
+            url: request.url,
+            statusCode: 200,
+            body: { kind: 'html', content: '<html><head><title>页面丙</title></head><body><p>接缝取正文仍然可用，这段正文足够长，可以当摘录。</p></body></html>' },
+        }),
+    };
+    const access = createWebAccess(cordisLikeCtx({ web: seam }), {
+        provider: 'auto',
+        providerOrder: ['seam', 'deepseek-api'],
+        providers: { 'deepseek-api': { apiKey: 'k' } },
+    }, {
+        lookup: async () => [{ address: '93.184.216.34', family: 4 }],
+        fetch: async (url) => {
+            if (String(url).endsWith('/search')) {
+                return {
+                    ok: true,
+                    status: 200,
+                    async json() { return { results: [{ title: '来源甲', url: 'https://a.example.com/1' }] }; },
+                };
+            }
+            throw new Error('自带抓取连不上');
+        },
+    });
+    const found = await access.search('某事件');
+    assert.equal(found.provider, 'deepseek-api', '接缝检索失败后应由直连通道兜住');
+    const page = await access.fetch('https://ok.example.com/1');
+    assert.equal(page.provider, 'seam', '检索失败不该让取正文跳过接缝');
+    assert.match(page.content, /接缝取正文仍然可用/);
+});
+
+await check('S-07：接缝服务本身不可用时仍记通道失败，同一次调用不再撞第二次', async () => {
+    let seamFetches = 0;
+    const seam = {
+        search: async () => ({ sources: [] }),
+        fetch: async () => { seamFetches += 1; throw new Error('服务尚未就绪，请重试'); },
+    };
+    const access = createWebAccess(cordisLikeCtx({ web: seam }), { apiKey: 'k', maxRedirects: 0 }, {
+        lookup: async () => [{ address: '93.184.216.34', family: 4 }],
+        fetch: async () => { throw new Error('自带抓取连不上'); },
+    });
+    await assert.rejects(() => access.fetch('https://a.example.com/1'), /服务尚未就绪/);
+    await assert.rejects(() => access.fetch('https://b.example.com/2'), /服务尚未就绪/);
+    assert.equal(seamFetches, 1, '确定不可用的接缝在本次调用里不再重复试');
+});
+
+await check('S-07：同一个 URL 的页面级失败不重复打接缝', async () => {
+    let seamFetches = 0;
+    const seam = {
+        search: async () => ({ sources: [] }),
+        fetch: async (request) => {
+            seamFetches += 1;
+            return { url: request.url, statusCode: 200, body: { kind: 'html', content: '<html><body>Just a moment...</body></html>' } };
+        },
+    };
+    const access = createWebAccess(cordisLikeCtx({ web: seam }), { apiKey: 'k', maxRedirects: 0 }, {
+        lookup: async () => [{ address: '93.184.216.34', family: 4 }],
+        fetch: async () => { throw new Error('自带抓取连不上'); },
+    });
+    await assert.rejects(() => access.fetch('https://blocked.example.com/1'), /人机校验页/);
+    await assert.rejects(() => access.fetch('https://blocked.example.com/1'), /人机校验页/);
+    assert.equal(seamFetches, 1, '页面级失败按 URL 缓存，同一个坏页面只试一次接缝');
+});
+
+await check('S-07：一次查询空手不把通道判死（empty 是查询级，不是通道级）', async () => {
+    let calls = 0;
+    const access = createWebAccess(cordisLikeCtx({}), { provider: 'duckduckgo' }, {
+        fetch: async () => {
+            calls += 1;
+            const html = calls === 1
+                ? '<html><body><p>没有解析出任何结果</p></body></html>'
+                : '<html><body><div class="result"><a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fh.example.com%2F8">辛</a></div></body></html>';
+            return {
+                ok: true,
+                status: 200,
+                async text() { return html; },
+                async json() { throw new Error('不是 JSON'); },
+            };
+        },
+    });
+    await assert.rejects(() => access.search('第一次'), /没拿到结果/);
+    const result = await access.search('第二次');
+    assert.equal(result.sources[0].url, 'https://h.example.com/8', '第二条查询仍要试这条通道');
+    assert.equal(calls, 2, '通道没坏，不该因一次空手被跳过');
 });
 
 // ── 网页预处理（第二十轮）────────────────────────────────────────────────
@@ -930,20 +1098,30 @@ await check('取正文：PDF 文本很短时给提醒（不判失败），响应
 
 // ── 配置收敛 ──────────────────────────────────────────────────────────────
 
-await check('内置检索配置在安全区间内收敛，坏值退回默认', () => {
-    const options = resolveBuiltinOptions({ maxResults: 999, fetchTimeoutMs: 1, maxRedirects: -3, baseURL: 'https://x.example.com/v1/', apiKeyEnv: '  K  ', searchTimeoutMs: '不是数字' });
+await check('取正文配置在安全区间内收敛，坏值退回默认', () => {
+    const options = resolveWebOptions({ maxResults: 999, fetchTimeoutMs: 1, maxRedirects: -3 });
     assert.equal(options.maxResults, 20, '超上限的被夹到 20');
     assert.equal(options.fetchTimeoutMs, 5_000, '低于下限的被抬到 5 秒');
     assert.equal(options.maxRedirects, 0, '负数夹到 0（等于不跟随跳转）');
-    assert.equal(options.searchTimeoutMs, 60_000, '解析不出来的退回默认');
-    assert.equal(options.baseURL, 'https://x.example.com/v1', '末尾斜杠要去掉，避免拼出 //messages');
-    assert.equal(options.apiKeyEnv, 'K');
     // 第二十九轮：PDF 两项也要收敛（1 MB 下限 / 128 MB 上限 / 500 页上限）。
-    const pdf = resolveBuiltinOptions({ pdfMaxBytes: 1, pdfMaxPages: 9_999 });
+    const pdf = resolveWebOptions({ pdfMaxBytes: 1, pdfMaxPages: 9_999 });
     assert.equal(pdf.pdfMaxBytes, 1024 * 1024, '低于下限抬到 1 MB');
     assert.equal(pdf.pdfMaxPages, 500, '超上限夹到 500 页');
-    assert.equal(resolveBuiltinOptions({}).pdfMaxBytes, 24 * 1024 * 1024, '默认 24 MB');
-    assert.equal(resolveBuiltinOptions({}).pdfMaxPages, 30, '默认 30 页');
+    assert.equal(resolveWebOptions({}).pdfMaxBytes, 24 * 1024 * 1024, '默认 24 MB');
+    assert.equal(resolveWebOptions({}).pdfMaxPages, 30, '默认 30 页');
+    // 整个 search 段也认：取正文上限从 fetch 子对象来，编排字段原样带出。
+    const whole = resolveWebOptions({
+        provider: 'deepseek-api',
+        providerOrder: ['deepseek-api', 'seam'],
+        fetch: { maxResults: 5, fetchPages: 0 },
+    });
+    assert.equal(whole.maxResults, 5);
+    assert.equal(whole.fetchPages, 0);
+    assert.equal(whole.provider, 'deepseek-api');
+    assert.deepEqual(whole.providerOrder, ['deepseek-api', 'seam']);
+    // 旧的 search.builtin 形状不再被当作编排配置（第六十五轮删掉老入口）。
+    const legacy = resolveWebOptions({ builtin: { maxResults: 3 } });
+    assert.equal(legacy.maxResults, 8, '老入口不再生效，按默认值处理');
 });
 
 // ── 收尾 ──────────────────────────────────────────────────────────────────

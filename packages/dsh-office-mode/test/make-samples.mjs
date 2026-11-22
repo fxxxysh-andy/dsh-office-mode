@@ -6,7 +6,7 @@
  * 前者是现在的默认观感（无背景填充），后者用来看主题模板还在不在。
  *
  * 样例刻意覆盖本轮新增的能力：Excel 统计块与分组汇总、Word 公式与合并单元格表格、
- * PPT 一页多图。图片素材由脚本即时生成到 <仓库根>/.office/tmp/sample-assets/，
+ * PPT 一页多图。图片素材由脚本即时生成到 <仓库根>/.office/runtime/tmp/sample-assets/，
  * 不往交付目录里塞资源文件。
  *
  * 用法：node test/make-samples.mjs [输出目录]       默认 ./办公模式示例
@@ -26,7 +26,7 @@ mkdirSync(outDir, { recursive: true });
 
 // ---------------------------------------------------------------- 素材
 
-const assetDir = fileURLToPath(new URL('../../../.office/tmp/sample-assets/', import.meta.url));
+const assetDir = fileURLToPath(new URL('../../../.office/runtime/tmp/sample-assets/', import.meta.url));
 mkdirSync(assetDir, { recursive: true });
 
 /** 生成一张纯色/柱状 PNG（真魔数，不是占位文件）。 */

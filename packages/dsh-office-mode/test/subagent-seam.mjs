@@ -157,7 +157,7 @@ await check('缺服务的组合给出的是可执行的降级说明，而不是�
     await fiber;
     // 没有 subagents、又没有联网通道时，才该整条失败：第二十轮起要**显式点名**一条
     // 没配好的通道（auto 顺序里还有免 Key 的 duckduckgo / searxng，它们会让派工跑起来）。
-    const barren = { search: { provider: 'anthropic', builtin: { apiKeyEnv: 'OFFICE_TEST_MISSING_KEY' } } };
+    const barren = { search: { provider: 'deepseek-api', providers: { 'deepseek-api': { apiKeyEnv: 'OFFICE_TEST_MISSING_KEY' } } } };
     await assert.rejects(
         () => dispatchSearch({ briefPath, outputPaths: outputs }, exec, barren, undefined),
         (error) => {

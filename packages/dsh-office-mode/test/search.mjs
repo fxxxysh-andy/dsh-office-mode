@@ -275,10 +275,10 @@ await check('平台渠道的任务书写明 site: 限定与兜底', () => {
     assert.ok(prompt.includes('勾股定理 维基百科'), '要给出具体兜底查询');
 });
 
-// ── 落盘与三步走的接缝 ────────────────────────────────────────────────────
+// ── 落盘与渠道覆盖检索的接缝 ────────────────────────────────────────────────
 //
 // 这一节是补的：以前只测了 buildBrief（纯函数），没人真的执行过 writeBrief
-// 与 office_search_brief 工具，所以「参数 text 遮蔽同名辅助函数、调用它时报
+// 与派工链路，所以「参数 text 遮蔽同名辅助函数、调用它时报
 // text is not a function」这种一到手就整条失效的 bug 一路漏到了用户面前。
 
 await check('writeBrief 能落盘，并按 outputDir 与主题收敛路径', async () => {
@@ -295,32 +295,41 @@ await check('writeBrief 能落盘，并按 outputDir 与主题收敛路径', asy
     assert.ok(custom.includes(join('我的提纲', 'a-b-c-d', 'brief.md')), `自定义目录与 slug 不对：${custom}`);
 });
 
-await check('office_search_brief 端到端：出提纲、落盘、给出下一步', async () => {
-    const tools = buildTools(resolveConfig({}));
-    const tool = tools.find((t) => t.name === 'office_search_brief');
-    const exec = { agent: { session: { header: { cwd: root } } } };
-    const value = await tool.execute({ topic: '某地化工厂爆炸', type: 'hotspot', audience: '写一份 12 页汇报' }, exec);
+await check('office_search_dispatch topic 直入端到端：自动出提纲、落盘、逐渠道执行', async () => {
+    // 第七十轮合并：出提纲不再是独立工具。给 topic 一次调用就该落盘 brief.md
+    // 并把渠道铺出去 —— 反馈里要说清提纲落在哪（复用与改渠道都靠它）。
+    const ctx = cordisLikeCtx({
+        subagents: {
+            async start() {
+                return { result: Promise.resolve({ stopReason: 'completed' }), dispose: async () => {} };
+            },
+        },
+    });
+    const out = await dispatchSearch(
+        { topic: '某地化工厂爆炸', type: 'hotspot', audience: '写一份 12 页汇报' },
+        { agent: { session: { header: { cwd: root } } }, signal: new AbortController().signal },
+        {},
+        ctx,
+    );
 
-    assert.equal(value.ok, true);
-    assert.equal(value.type, 'hotspot');
-    assert.equal(value.typeName, '热点事件');
-    assert.ok(value.briefPath.endsWith('brief.md'), `briefPath 不对：${value.briefPath}`);
-    const onDisk = readFileSync(join(root, value.briefPath), 'utf8');
+    assert.equal(out.ok, true);
+    assert.equal(out.topic, '某地化工厂爆炸');
+    assert.equal(out.briefWritten, true, 'topic 直入要标记「提纲是这次写的」');
+    assert.ok(out.brief.replace(/\\/g, '/').endsWith('某地化工厂爆炸/brief.md'), `brief 落点不对：${out.brief}`);
+    const onDisk = readFileSync(join(root, out.brief), 'utf8');
     assert.ok(onDisk.includes('检索提纲：某地化工厂爆炸'), '落盘内容要含主题');
     assert.ok(onDisk.includes('★'), '落盘内容要含必须覆盖标记');
-    assert.ok(value.text.includes(value.briefPath), '反馈里要写清提纲落在哪');
-    assert.ok(value.text.includes('office_search_dispatch'), '反馈要指向派工这一步');
+    const rendered = renderDispatch(out);
+    assert.ok(rendered.includes('提纲已写入'), '反馈里要写清提纲落在哪');
+    assert.ok(out.jobs.length > 0, '渠道要真的铺出去');
 });
 
-await check('brief 落盘的提纲能被派工读回（第一步与第二步的接缝）', async () => {
+await check('brief 落盘的提纲能被派工读回（提纲与执行的接缝）', async () => {
     // 派工不单独收主题与类型，是回头从提纲文件里正则反推的。这一条钉的就是
     // 「写出来的提纲，读得回来」——两边的格式约定一旦漂移，这里先红。
-    const tools = buildTools(resolveConfig({}));
-    const tool = tools.find((t) => t.name === 'office_search_brief');
-    const exec = { agent: { session: { header: { cwd: root } } } };
-    const brief = await tool.execute({ topic: '某地化工厂爆炸', type: 'hotspot' }, exec);
+    const { topic, type, text } = buildBrief('某地化工厂爆炸', 'hotspot');
+    const briefPath = await writeBrief(root, topic, type.id, undefined, text, '.office/search');
 
-    const type = contentType('hotspot');
     const outputs = type.channels.map((_, i) => `seam-${i}.md`);
     const ctx = cordisLikeCtx({
         subagents: {
@@ -330,13 +339,49 @@ await check('brief 落盘的提纲能被派工读回（第一步与第二步的�
         },
     });
     const out = await dispatchSearch(
-        { briefPath: brief.briefPath, outputPaths: outputs },
-        { agent: exec.agent, signal: new AbortController().signal },
+        { briefPath, outputPaths: outputs },
+        { agent: { session: { header: { cwd: root } } }, signal: new AbortController().signal },
         {},
         ctx,
     );
     assert.equal(out.topic, '某地化工厂爆炸', '派工要从提纲文件里反推出主题');
     assert.equal(out.jobs.length, type.channels.length, '渠道数要与提纲一致');
+    assert.equal(out.briefWritten, false, 'briefPath 复用时不算「这次写的」');
+});
+
+await check('office_search_dispatch：outputPaths 不给就按渠道数自动生成', async () => {
+    const ctx = cordisLikeCtx({
+        subagents: {
+            async start() {
+                return { result: Promise.resolve({ stopReason: 'completed' }), dispose: async () => {} };
+            },
+        },
+    });
+    const out = await dispatchSearch(
+        { topic: '某地化工厂爆炸', type: 'manual' },
+        { agent: { session: { header: { cwd: root } } }, signal: new AbortController().signal },
+        {},
+        ctx,
+    );
+    const type = contentType('manual');
+    assert.equal(out.jobs.length, type.channels.length);
+    for (const path of out.jobs.map((job) => job.path)) {
+        assert.ok(/-channel\.md$/.test(path), `默认结果路径要按渠道编号：${path}`);
+    }
+});
+
+await check('office_search_dispatch：topic 与 briefPath 都不给时给出可照抄的形状', async () => {
+    const error = await dispatchSearch(
+        {},
+        { agent: { session: { header: { cwd: root } } }, signal: new AbortController().signal },
+        {},
+        {},
+    ).then(() => null, (thrown) => thrown);
+    assert.ok(error !== null, '缺提纲来源必须报错');
+    const text = String(error.message);
+    for (const section of ['【哪一步错】', '【下一步传什么】', '【可照抄的形状】', 'topic']) {
+        assert.ok(text.includes(section), `错误文案缺：${section}`);
+    }
 });
 
 // ── 结果解析 ──────────────────────────────────────────────────────────────
@@ -422,13 +467,21 @@ await check('渲染摘要是紧凑的，不是原文搬运', () => {
 
 // ── 派工与多文件解析 ──────────────────────────────────────────────────────
 
-await check('派工拒绝空 outputPaths（先出提纲是硬约束）', async () => {
+await check('派工的空 outputPaths 按渠道数自动生成（第七十轮起不再硬性拒绝）', async () => {
     const briefPath = join(root, 'brief.md');
     writeFileSync(briefPath, '# 检索提纲\n\n检索提纲：某事件\n内容类型：热点事件（hotspot）\n', 'utf8');
-    await assert.rejects(
-        () => dispatchSearch({ briefPath, outputPaths: [] }, { agent: {}, signal: new AbortController().signal }, {}, undefined),
-        /outputPaths 不能为空/,
+    const type = contentType('hotspot');
+    const out = await dispatchSearch(
+        { briefPath, outputPaths: ['', '  '] },
+        { agent: { session: { header: { cwd: root } } }, signal: new AbortController().signal },
+        SEAM_ONLY,
+        cordisLikeCtx({ web: fakeSeam() }),
     );
+    assert.equal(out.ok, true, '空白项被滤掉后走自动生成，不该报「不能为空」');
+    assert.equal(out.jobs.length, type.channels.length, '自动生成的路径数等于渠道数');
+    for (const [index, job] of out.jobs.entries()) {
+        assert.ok(/-channel\.md$/.test(job.path.replace(/\\/g, '/')), `默认结果路径要按渠道编号：${job.path}`);
+    }
 });
 
 await check('outputPaths 与渠道数对不上时明确报错', async () => {
@@ -617,7 +670,7 @@ await check('子代理与内置检索都没有时，仍给出可执行的替代�
     // 没有 subagents、没有 web 接缝，Key 名指向一个不存在的变量 → 两边都不行。
     // 第二十轮起要**显式点名通道**：auto 顺序里还有免 Key 的 duckduckgo / searxng，
     // 「一条都不行」只可能发生在指名选了一条没配好的通道时。
-    const barren = { search: { provider: 'anthropic', builtin: { apiKeyEnv: 'OFFICE_TEST_MISSING_KEY' } } };
+    const barren = { search: { provider: 'deepseek-api', providers: { 'deepseek-api': { apiKeyEnv: 'OFFICE_TEST_MISSING_KEY' } } } };
     await assert.rejects(() => dispatchSearch({ briefPath, outputPaths: outputs }, exec, barren, cordisLikeCtx({})), /没有 subagents 服务/);
     await assert.rejects(() => dispatchSearch({ briefPath, outputPaths: outputs }, exec, barren, undefined), /没有 subagents 服务/);
     // 失败说明必须把降级路径写清楚：办公模式里 Agent Teams 是默认开的，
@@ -792,12 +845,13 @@ await check('全部文件都读不到时报错，并提示确认子代理已写�
     );
 });
 
-await check('工具面里有检索三件套与两个抓取工具，且派工是排他的', () => {
+await check('工具面里有检索工具与两个抓取工具，且派工是排他的', () => {
     const tools = buildTools(resolveConfig({}));
     const names = tools.map((t) => t.name);
-    for (const wanted of ['office_web_search', 'office_web_fetch', 'office_search_run', 'office_search_brief', 'office_search_dispatch', 'office_parse_findings']) {
+    for (const wanted of ['office_web_search', 'office_web_fetch', 'office_search_run', 'office_search_dispatch', 'office_parse_findings']) {
         assert.ok(names.includes(wanted), `工具面缺 ${wanted}`);
     }
+    assert.ok(!names.includes('office_search_brief'), '第七十轮起 brief 已并进 dispatch，不该再注册');
     const dispatch = tools.find((t) => t.name === 'office_search_dispatch');
     assert.equal(dispatch.isConcurrencySafe(), false, '派工要写文件，不能并发跑');
 });
@@ -988,7 +1042,7 @@ await check('office_search_run 的落盘文件能被 office_parse_findings 读�
 
 await check('office_search_run 在通道不可用时说清原因，而不是静默返回空', async () => {
     // 指名一条没配好的通道：这时才真的「一条都不行」（auto 下还有免 Key 的通道可试）。
-    const config = resolveConfig({ search: { provider: 'anthropic', builtin: { apiKeyEnv: 'OFFICE_TEST_MISSING_KEY' } } });
+    const config = resolveConfig({ search: { provider: 'deepseek-api', providers: { 'deepseek-api': { apiKeyEnv: 'OFFICE_TEST_MISSING_KEY' } } } });
     const tools = buildTools(config, cordisLikeCtx({}));
     const tool = tools.find((t) => t.name === 'office_search_run');
     const exec = { agent: { session: { header: { cwd: root } } }, signal: new AbortController().signal };
@@ -1017,7 +1071,7 @@ await check('office_search_run 能按次点名通道，并在反馈里写出用�
 await check('内置通道把取正文失败按分类写进渠道文件（原先被静默吞掉）', async () => {
     const channel = contentType('hotspot').channels[0];
     // 检索成功、取正文被目标站拒绝：403 这一类必须能被分开数出来。
-    const access = createWebAccess(cordisLikeCtx({}), { apiKey: 'k' }, {
+    const access = createWebAccess(cordisLikeCtx({}), { provider: 'deepseek-api', providers: { 'deepseek-api': { apiKey: 'k' } } }, {
         lookup: async () => [{ address: '93.184.216.34', family: 4 }],
         fetch: async (url, init) => {
             if (init?.method === 'POST') {
@@ -1026,12 +1080,7 @@ await check('内置通道把取正文失败按分类写进渠道文件（原先�
                     status: 200,
                     headers: { get: (name) => (name === 'content-type' ? 'application/json' : null) },
                     async json() {
-                        return {
-                            content: [{
-                                type: 'web_search_tool_result',
-                                content: [{ type: 'web_search_result', url: 'https://blocked.example.com/a', title: '被挡的来源' }],
-                            }],
-                        };
+                        return { results: [{ url: 'https://blocked.example.com/a', title: '被挡的来源' }] };
                     },
                 };
             }
@@ -1072,13 +1121,13 @@ await check('office_search_run 把取正文失败摆到反馈里，不再静默�
 await check('office_search_run 能被设置页关掉', () => {
     const tools = buildTools(resolveConfig({ tools: { office_search_run: false } }));
     assert.ok(!tools.map((t) => t.name).includes('office_search_run'));
-    assert.ok(tools.map((t) => t.name).includes('office_search_brief'), '关一个不该连带关别的');
+    assert.ok(tools.map((t) => t.name).includes('office_search_dispatch'), '关一个不该连带关别的');
 });
 
-await check('office_help 的 search 话题讲清了三步与分流规则', async () => {
+await check('office_help 的 search 话题讲清了两步与分流规则', async () => {
     const help = await buildHelp('search');
     assert.equal(help.topic, 'search');
-    for (const wanted of ['office_search_brief', 'office_search_dispatch', 'office_parse_findings', '茧房', '泛搜']) {
+    for (const wanted of ['office_search_dispatch', 'office_parse_findings', '提纲', '茧房', '泛搜']) {
         assert.ok(help.text.includes(wanted), `search 话题缺 ${wanted}`);
     }
     // 第二十九轮起内置通道也能吃 PDF、出口代理可在设置页填，第三十轮起抓取工具
@@ -1090,35 +1139,7 @@ await check('office_help 的 search 话题讲清了三步与分流规则', async
     assert.ok(index.text.includes('search：'), '索引里要能查到 search');
 });
 
-// ── 提示词与工具面（第四十三轮：17-3 / 18-10 / 18-11 / 18-13）────────────────
-
-await check('office_search_brief：跨主题相同的骨架一个会话只说一次（17-3）', async () => {
-    // 口径：提纲**文件**里始终是逐字全份（子代理读文件）；省掉的只是对话里那份
-    // 逐字重复的副本。两次的 type 不同，正是第十七轮量到 1,172 B 逐行相同的那种情形。
-    const tools = buildTools(resolveConfig({}));
-    const tool = tools.find((t) => t.name === 'office_search_brief');
-    const exec = { agent: { session: { id: 's-brief-skeleton', header: { cwd: root } } } };
-    const first = await tool.execute({ topic: '某地化工厂爆炸', type: 'hotspot' }, exec);
-    const second = await tool.execute({ topic: '量子计算是什么', type: 'knowledge' }, exec);
-
-    for (const needle of ['第一条永远是泛搜', '每个结论都要带来源 URL']) {
-        assert.ok(first.text.includes(needle), `第一次要给骨架：${needle}`);
-    }
-    for (const needle of ['第一条永远是泛搜', '每个结论都要带来源 URL', '不要只用一个渠道就把结论定下来']) {
-        assert.ok(!second.text.includes(needle), `第二次不该重复逐字相同的骨架：${needle}`);
-    }
-    assert.ok(second.text.includes('同上一份提纲'), '第二次要给一行指路');
-    assert.ok(second.text.includes(second.briefPath), '第二次仍要指到提纲文件');
-    assert.ok(second.text.includes('office_search_dispatch'), '第二次仍要指向派工');
-    assert.ok(second.text.includes('渠道数：'), '可变部分（渠道数）照旧要给');
-    assert.ok(
-        Buffer.byteLength(second.text, 'utf8') < Buffer.byteLength(first.text, 'utf8'),
-        '第二次的反馈要更短',
-    );
-    const onDisk = readFileSync(join(root, second.briefPath), 'utf8');
-    assert.ok(onDisk.includes('第一条永远是泛搜') && onDisk.includes('固定要求'),
-        '提纲文件里必须一字不少（省的是对话里的副本，不是文件）');
-});
+// ── 提示词与工具面（第四十三轮：18-10 / 18-11 / 18-13；17-3 随第七十轮合并废止）──
 
 await check('派工路径数与渠道数对不上：错误里给算出来的差异与可照抄形状（18-13）', async () => {
     const topic = '某地化工厂爆炸';
@@ -1150,15 +1171,14 @@ await check('派工路径数与渠道数对不上：错误里给算出来的差�
         '形状行里的路径条数必须正好等于渠道数（可照抄 = 不用自己再数）');
 });
 
-await check('office_search_* 四兄弟：首句写清「链路哪一段、输入从哪来」（18-11）', () => {
+await check('office_search_* 三件：首句写清「链路哪一段、输入从哪来」（18-11）', () => {
     const tools = buildTools(resolveConfig({}));
     const firstSentenceOf = (name) => String(tools.find((t) => t.name === name)?.description ?? '').split('。')[0];
     // 每条通道的「首句里认得出自己」的词表。要求这些词**出现在首句**里 ——
     // 模型选错工具最常见的原因就是名字相近而首句都在讲「做什么」。
     const ROUTES = {
-        office_search_brief: ['第 1 段', '出提纲', '提纲文件'],
-        office_search_dispatch: ['第 2 段', 'briefPath', '执行提纲'],
-        office_parse_findings: ['第 3 段', '收口', 'paths', '摘要'],
+        office_search_dispatch: ['topic', '出提纲', 'briefPath'],
+        office_parse_findings: ['收口', 'paths', '摘要'],
         office_search_run: ['旁路', '直查', '来源清单'],
     };
     for (const [name, words] of Object.entries(ROUTES)) {
@@ -1168,31 +1188,26 @@ await check('office_search_* 四兄弟：首句写清「链路哪一段、输入
             assert.ok(first.includes(word), `${name} 的首句缺路由词「${word}」：${first}`);
         }
     }
-    // 名字混淆测试：20 条请求，每条只差一个词；用上面那套词表当路由器，
+    // 名字混淆测试：15 条请求，每条只差一个词；用上面那套词表当路由器，
     // 断言**有且只有**一个工具命中，且命中正确的那一个。
     const CASES = [
-        ['给个主题出提纲', 'office_search_brief'],
-        ['按内容类型生成提纲文件', 'office_search_brief'],
-        ['这个热点事件该走哪些渠道，先出提纲', 'office_search_brief'],
-        ['把提纲文件写出来', 'office_search_brief'],
-        ['三步走第一步，先出提纲', 'office_search_brief'],
-        ['照 briefPath 执行提纲', 'office_search_dispatch'],
-        ['把提纲里的渠道按第 2 段执行', 'office_search_dispatch'],
-        ['按第 2 段把渠道跑一遍', 'office_search_dispatch'],
-        ['执行提纲，材料写进结果文件', 'office_search_dispatch'],
-        ['渠道太多，分批执行提纲', 'office_search_dispatch'],
+        ['给个 topic，自动出提纲并逐渠道跑', 'office_search_dispatch'],
+        ['topic 直入：出提纲落盘再执行', 'office_search_dispatch'],
+        ['按内容类型出提纲，渠道覆盖检索', 'office_search_dispatch'],
+        ['复用 briefPath 重跑渠道检索', 'office_search_dispatch'],
+        ['照上一轮的 briefPath 改渠道重跑', 'office_search_dispatch'],
         ['把结果文件收口成一份摘要', 'office_parse_findings'],
         ['用 paths 读回摘要', 'office_parse_findings'],
         ['写文档前先收口', 'office_parse_findings'],
-        ['第 3 段：收口成摘要', 'office_parse_findings'],
-        ['把第 3 段的产物读成摘要', 'office_parse_findings'],
+        ['最后一段：收口成摘要', 'office_parse_findings'],
+        ['把派工的产物读成摘要', 'office_parse_findings'],
         ['直查一轮，不用提纲', 'office_search_run'],
         ['旁路查一下，只要来源清单', 'office_search_run'],
         ['给几条查询直查一轮', 'office_search_run'],
         ['旁路直查，落盘取证', 'office_search_run'],
         ['只查一两个事实点，走旁路', 'office_search_run'],
     ];
-    assert.equal(CASES.length, 20, '名字混淆测试要 20 条');
+    assert.equal(CASES.length, 15, '名字混淆测试要 15 条');
     for (const [request, expected] of CASES) {
         const hits = Object.entries(ROUTES)
             .filter(([, words]) => words.some((word) => request.includes(word)))

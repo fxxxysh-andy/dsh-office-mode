@@ -2,7 +2,7 @@
  * 统一缓存目录：所有中间产物（预览、临时导出、渲染出来的页面图）都只写到这里。
  *
  * 办公模式的一条硬规则：工作目录里不出现任何临时文件。需要落地的东西进
- * `.office/cache/`，交付物才写工作目录。
+ * `.office/runtime/cache/`，交付物才写工作目录。
  *
  * 2026-09-23 改的是**生命周期**：以前每次调用开始清空、结束再清空，缓存等于
  * 一次性的 —— 于是任何跨调用复用的东西（最典型的是把 PDF 页面渲染成图片，
@@ -17,8 +17,9 @@
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { displayPath } from './kit.js';
+import { CACHE_DIR } from '../office-paths.js';
 
-export const DEFAULT_CACHE_DIR = '.office/cache';
+export const DEFAULT_CACHE_DIR = CACHE_DIR;
 
 /** 把一段名字收敛成单层文件名，禁止子目录与向上跳。 */
 function safeName(name) {

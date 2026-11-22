@@ -3,8 +3,8 @@
  *
  * ## 为什么单独一个模块
  *
- * 第二十轮起联网通道不再只有一条：宿主 web 接缝（seam）、Anthropic 兼容 +
- * 原生 web_search、OpenAI 兼容、Tavily、Brave、博查、Exa、Serper、SearXNG、
+ * 第二十轮起联网通道不再只有一条：宿主 web 接缝（seam）、DeepSeek Search
+ * API（直连）、OpenAI 兼容、Tavily、Brave、博查、Exa、Serper、SearXNG、
  * DuckDuckGo…… 通道实现各自 throw，但「失败该怎么说」必须是**通道无关**的
  * —— 反馈层（office_search_run / 派工结果文件）不该为每个通道写一套措辞，
  * 也不该因为换了通道就把「配置缺失」说成「没搜到」。

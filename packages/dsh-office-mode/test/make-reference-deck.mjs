@@ -5,7 +5,7 @@
  *   封面（满页照片 + 压遮罩 + 校徽）→ 目录（2×2 大号编号）→ 章节页 → 卡片网格 →
  *   对比双栏 → 编号流程 → 合并单元格表格 → 图+文 → KPI → 时间线 → 图标网格 → 结束页。
  *
- * 素材由脚本即时生成到 <仓库根>/.office/tmp/ref-assets/，不往交付目录塞资源文件。
+ * 素材由脚本即时生成到 <仓库根>/.office/runtime/tmp/ref-assets/，不往交付目录塞资源文件。
  * 用法：node test/make-reference-deck.mjs [输出目录]
  */
 import { mkdirSync, statSync, writeFileSync } from 'node:fs';
@@ -23,7 +23,7 @@ mkdirSync(outDir, { recursive: true });
 
 // ---------------------------------------------------------------- 素材
 
-const assetDir = fileURLToPath(new URL('../../../.office/tmp/ref-assets/', import.meta.url));
+const assetDir = fileURLToPath(new URL('../../../.office/runtime/tmp/ref-assets/', import.meta.url));
 mkdirSync(assetDir, { recursive: true });
 
 /** 生成 RGBA PNG。painter(x, y, w, h) 返回 [r,g,b,a]。 */

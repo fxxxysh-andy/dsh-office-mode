@@ -132,10 +132,10 @@ await check('配置：默认主题跟随 DEFAULT_THEME_ID', () => {
 });
 
 await check('缓存：写入 / 列出 / 清空', () => {
-    const cache = createCache({ root, dir: '.office/cache' });
+    const cache = createCache({ root, dir: '.office/runtime/cache' });
     cache.write('preview.html', '<html/>');
     assert.equal(cache.list().length, 1);
-    assert.equal(cache.rel, '.office/cache');
+    assert.equal(cache.rel, '.office/runtime/cache');
     assert.ok(existsSync(cache.path('preview.html')));
     // 2026-09-23：列表要带修改时间（TTL 清理与「这是不是刚渲染的」都靠它）。
     assert.equal(typeof cache.list()[0].modifiedMs, 'number');
@@ -151,7 +151,7 @@ await check('缓存：写入 / 列出 / 清空', () => {
 
 await check('配置：非法值报错，环境变量可兜底', () => {
     const conf = resolveConfig({});
-    assert.equal(conf.cacheDir, '.office/cache');
+    assert.equal(conf.cacheDir, '.office/runtime/cache');
     assert.equal(conf.injectGuide, false);
     assert.throws(() => resolveConfig({ defaultTheme: '不存在' }), /defaultTheme/);
     assert.throws(() => resolveConfig({ cacheDir: 5 }), /cacheDir/);
@@ -241,7 +241,9 @@ await check('office_run：无 process / require / fs', async () => {
 });
 
 await check('office_run：空脚本与超长脚本被拒绝', async () => {
-    await assert.rejects(() => executeRun({ script: '  ' }, {}, resolveConfig({})), /script 不能为空/);
+    // 第五十一轮起 script 不再是 schema 里的必填项（多了 scriptFile 这条来源），
+    // 所以「两个都没给」由执行侧报错，文案要点名两条路。
+    await assert.rejects(() => executeRun({ script: '  ' }, {}, resolveConfig({})), /script 或 scriptFile 必须给一个/);
     await assert.rejects(
         () => executeRun({ script: 'x'.repeat(2000) }, {}, resolveConfig({ maxScriptChars: 1000 })),
         /script 太长/,
@@ -402,6 +404,26 @@ return { main: t.main, chapters: report.stats.chapters, kind: report.kind, esc, 
     rmSync(join(root, 'thesis'), { recursive: true, force: true });
 });
 
+await check('office.convert 暴露 check / file（SDK 挂载面不能静默丢失）', async () => {
+    // 转换那半的重活在外部引擎上（pandoc / TeX / LibreOffice），几十条真转的断言在
+    // test/convert.mjs（那一套依赖本机引擎，不进 CI）。这里只钉**挂载面**：
+    // office.convert 经 sdk.js 挂上去，改个名就会让脚本拿到 undefined，
+    // 而插件照常加载、别的格式毫发无损 —— 正是最该被断言钉住的一类。
+    const result = await executeRun({
+        script: `
+const c = await office.convert.check();
+office.assert(typeof office.convert.file === 'function', 'file 不是函数');
+return { targets: c.targets, sources: c.sources.length, matrix: c.matrix.length, available: c.available };
+`,
+        purpose: 'office.convert 冒烟',
+    }, { agent: { session: { header: { cwd: root } } } }, resolveConfig({}));
+    assert.equal(result.ok, true, result.error?.message);
+    assert.deepEqual(result.returned.targets, ['md', 'docx', 'tex', 'pdf']);
+    assert.ok(result.returned.sources >= 6, `能读的源太少：${result.returned.sources}`);
+    assert.equal(result.returned.matrix, result.returned.sources, '矩阵要覆盖每一类源');
+    assert.equal(typeof result.returned.available, 'boolean');
+});
+
 await check('缓存：默认保留中间文件（跨调用复用），keepCache:false 才清空', async () => {
     const result = await executeRun({
         script: `office.cache.write('tmp.json', {a:1}); return office.cache.list().filter((f) => !f.dir).length;`,
@@ -410,8 +432,8 @@ await check('缓存：默认保留中间文件（跨调用复用），keepCache:
     assert.equal(result.returned, 1);
     assert.equal(result.cache.clearedAfter, false);
     assert.equal(result.cache.kept, 1);
-    assert.equal(existsSync(join(root, '.office/cache', 'tmp.json')), true);
-    assert.match(renderRun(result), /保留 1 个中间文件/);
+    assert.equal(existsSync(join(root, '.office/runtime/cache', 'tmp.json')), true);
+    assert.ok(!renderRun(result).includes('缓存：'), '没有命中 / 清理时，缓存行属于未变化信息，不再重复');
 
     const cleared = await executeRun({
         script: `return office.cache.list().filter((f) => !f.dir).length;`,
@@ -420,7 +442,7 @@ await check('缓存：默认保留中间文件（跨调用复用），keepCache:
     assert.equal(cleared.ok, true, cleared.error?.message);
     assert.equal(cleared.returned, 1, '清空前脚本仍然看得见上一次的缓存');
     assert.equal(cleared.cache.clearedAfter, true);
-    assert.equal(existsSync(join(root, '.office/cache')), false);
+    assert.equal(existsSync(join(root, '.office/runtime/cache')), false);
     assert.match(renderRun(cleared), /已清空/);
 });
 
@@ -446,7 +468,7 @@ await check('office_run 脚本失败：守卫把它换成宿主认识的 isError
         notes: [],
         warnings: ['这次调用没有写出任何文件。'],
         error: { name: 'TypeError', message: 'w.titel is not a function', line: 3, column: 9, stack: [] },
-        cache: { dir: '.office/cache', kept: 0, keptBytes: 0, hits: 0, pruned: [], ttlMinutes: 720 },
+        cache: { dir: '.office/runtime/cache', kept: 0, keptBytes: 0, hits: 0, pruned: [], ttlMinutes: 720 },
         elapsedMs: 5,
     };
 

@@ -21,7 +21,14 @@ export function localName(name) {
     return at === -1 ? name : name.slice(at + 1);
 }
 
-function decodeEntities(text) {
+/**
+ * 反转义五个预定义实体与数字实体。
+ *
+ * 导出是给「按字符串扫 XML」的调用方用的（解析器自己走 appendText，不经过这里）：
+ * 例如 ppt.js 从 shape XML 里按正则抽 `<a:t>` 文本时，必须先反转义，
+ * 否则 `&amp;` 会当成长度为 5 的字面量参与判据。
+ */
+export function decodeXmlEntities(text) {
     if (text.indexOf('&') === -1) return text;
     return text.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (whole, body) => {
         if (body[0] === '#') {
@@ -45,7 +52,7 @@ function parseAttrs(source) {
     const re = /([^\s=/]+)\s*=\s*("([^"]*)"|'([^']*)')/g;
     let match;
     while ((match = re.exec(source)) !== null) {
-        attrs[match[1]] = decodeEntities(match[3] !== undefined ? match[3] : match[4]);
+        attrs[match[1]] = decodeXmlEntities(match[3] !== undefined ? match[3] : match[4]);
     }
     return attrs;
 }
@@ -125,7 +132,7 @@ export function parseXml(source) {
 
 function appendText(node, raw) {
     if (node === undefined) return;
-    const text = decodeEntities(raw);
+    const text = decodeXmlEntities(raw);
     if (text !== '') node.text += text;
 }
 

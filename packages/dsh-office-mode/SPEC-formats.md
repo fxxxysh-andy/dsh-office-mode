@@ -9,7 +9,14 @@
 - ESM，零第三方依赖。可用 `node:fs` / `node:path` / `node:zlib` 等标准库。
 - 只通过 `src/engine/zip.js`、`src/engine/xml.js`、`src/engine/kit.js`、
   `src/engine/theme.js` 里的能力读写 OOXML。先读这四个文件的实际导出。
-- 生成结果必须能被真实 Microsoft Office 打开（交付前用 COM 验证一次）。
+- 生成结果必须能被真实 Microsoft Office 打开。**这一条的验收分两档**（第五十六轮 S-06 明确，
+  从前 §0 写「必须」而 §5 写「可选」，两处口径不一致）：
+  - **发布（打 `v*` tag）前 required**：必须有一次真实 Office / WPS 的打开记录，结果如实
+    写进 Release 说明或当轮交付档；没做过的发布不许声称「已兼容真实 Office」。
+  - **日常开发 optional**：开发机没装 Office（Linux / CI / 干净环境）时，跑
+    `node scripts/run-suites.mjs --ci` 的**结构回归**（XML、关系目标、枚举取值、读回统计）
+    就算过；结构通过**不等于**真实 Office 通过，交付说明里要分开写。
+  真实 Office 校验的边界见 §5 末尾。
 - 代码注释用中文，风格与 `src/engine/*.js` 一致：解释「为什么」，不复述代码。
 - 不做垃圾文件：测试产物写到 `test/.tmp/`，验证完自己删掉。
 
@@ -222,9 +229,10 @@ LaTeX（`tex.js`）沿用同一形状，另加 `kind: 'main' | 'fragment'` 与 `
   单元格为 string 或 `{text, runs, colSpan, rowSpan, fill, color, bold, align, link}`；
   合并写 `a:tc` 的 `gridSpan`/`rowSpan` 与覆盖格的 `hMerge="1"`/`vMerge="1"`（见 docs/ooxml-pitfalls.md）
 - `deck.quote({text, by})` / `deck.statement({text, sub})`
-- `deck.image({path, title, caption, fit, widthCm, heightCm, align, frame, fullBleed})`
+- `deck.image({path, title, caption, fit, widthCm, heightCm, align, frame, fullBleed, x, y, w, h, ratio})`
   `fit`: `contain`（默认，等比放进内容区）/ `cover`（铺满内容区，超出用 `a:srcRect` 裁切）/ `natural`（按 96 DPI 原始像素折算）；
-  `align`: `left|center|right`；`frame` 加细边框；`fullBleed` 铺满整页（可当背景图）
+  `align`: `left|center|right`；`frame` 加细边框；`fullBleed` 铺满整页（可当背景图）；
+  `x/y/w/h`（厘米）显式摆位、`ratio` 分栏比例 —— 见下面「与版式共存」一条
 - `deck.images(items, {title, columns=2, gapCm, fit})` 一页多图网格，`items: [{path, caption}]`
 - **绘制层**：`deck.shape({preset, x, y, w, h, fill, line, rotate, radius, shadow, text, textOpts})`
   （32 个 preset；`fill` 支持纯色 / `{color, alpha}` / `{type:'gradient', stops, angle}` / `'none'`；
@@ -234,10 +242,23 @@ LaTeX（`tex.js`）沿用同一形状，另加 `kind: 'main' | 'fragment'` 与 `
   `deck.cards({title, items, columns, cardFill, cardLine, radius, gapCm, numbered, iconSizeCm})`、
   `deck.steps({title, items, direction, numbered, arrows})`、`deck.compare({title, left, right, divider})`、
   `deck.kpi({title, items, columns})`、`deck.imageText({image, title, items, text, side, ratio})`、
-  `deck.timeline({title, items, direction})`、`deck.iconGrid({title, items, columns})`
+  `deck.timeline({title, items, direction})`、`deck.iconGrid({title, items, columns})`、
+  `deck.agenda({title, items, numbered, active})`（目录：`items:[{text, desc, active}]`，只认第一条 active，顶层 `active: n` 是快捷写法；`numbered:false` 改画左侧强调条）、
+  `deck.gallery({title, items, columns, ratio, fit})`（图片墙：`items:[{path, caption, badge, alt, source}]`，`ratio` 为图框高/宽默认 0.62，缺图/坏图照画占位框，`alt` 写进图片的 `cNvPr descr`）、
+  `deck.roadmap({title, phases})`（阶段路线图：`phases:[{label, items, progress, accent}]`，横排 1~5 列并自动加箭头，`progress` 0~1 画进度条）、
+  `deck.matrix({title, xAxis, yAxis, items})`（2×2 象限：`items:[{x, y, text, desc}]`，坐标归一化 0~1、原点左下角，越界钳制并告警）
 - **元素级助手**（画在当前页，与 `deck.shape` 同级）：`deck.panel({title, text, runs, x, y, w, h, fill, line, radius, sizePt})`、
   `deck.banner({text, sub, x, y, w, h, fill, gradient, color, sizePt})`
-  助手页与自由页共用同一条画布通道：`cards()` 后接 `banner()/panel()/shape()` 落在同一页，`deck.page()` 才换页
+  版式助手页、自由页与内容版式页（`bullets`/`table`/`quote`/`statement`/`image`/`images`/`chart`）共用同一条画布通道：
+  `cards()` 或 `bullets()` 后接 `banner()/panel()/shape()` 落在同一页，`deck.page()` 才换页；
+  `cover`/`section`/`closing` 不开放画布（接在后面的元素级助手另起一页）
+- **与版式共存**（第五十二轮 `新-6`）：`deck.image()` 接在版式助手页后面且不给坐标时自动分栏 ——
+  图占版心右侧 `ratio`（默认 0.42），助手排版收到左栏；给了 `x/y/w/h` 就按给的摆位画
+  （`widthCm` / `heightCm` 照收，只给一个时按纵横比推另一个）。
+  **一页只自动分栏一次**：同一页上第二张不给坐标的配图另起一页（给了坐标仍可同页）。
+  接在其它版式页后面时只有给了 `x/y/w/h` 才同页，否则照旧另起一页；`fullBleed: true` 永远独占一页。
+  同页配图没有标题带（`title` 会被忽略并在 `warnings` 里说明），图与题注计入 `stats.images` 与
+  `read().pages[i].images`（**缺图占位框例外**：它是 `p:sp` 不是 `p:pic`，只有生成端数得到）
 - **母版层**：`deck.master({background, logo, header, footer, pageNumber, accent, skipLayouts})`、
   `deck.background(spec)`（只改当前页）；图层顺序 = 背景 → 内容 → logo/页眉/页脚/页码/装饰条
 - **富文本**：任意段落支持 `runs:[{text, bold, italic, underline, color, size, font, spacing}]`
@@ -385,16 +406,22 @@ missingChars, overfullSamples, tail}, support, hint, diagnosis}`。
 5. `read()` 回去，核对 `stats` 与预期一致；
 6. 打印 `PASS <id> bytes=… parts=… warnings=…`，失败时打印具体差异并以非零码退出。
 
-再跑一次真实 Office 校验（可选但强烈建议，Windows 上装了 Office）：
+再跑一次真实 Office 校验。**分档口径见 §0**：发布前 required，日常开发 optional
+（Windows 上装了 Office 就顺手跑）：
 
 ```powershell
 $app = New-Object -ComObject PowerPoint.Application   # 或 Excel.Application / Word.Application
 $doc = $app.Presentations.Open("D:\path\file.pptx", $true, $false, $false)
-"$($doc.Slides.Count)"; $doc.Close(); $app.Quit()
+"($($doc.Slides.Count))"; $doc.Close(); $app.Quit()
 ```
 
 COM 可能弹窗卡住：给命令 90 秒超时，超时就 `Stop-Process -Name POWERPNT,WINWORD,EXCEL -Force`
-并如实报告「COM 校验未完成」，不要假装通过。
+并如实报告「COM 校验未完成」，不要假装通过。**「自研 `read()` 通过」不能代替这一条** ——
+第五十五轮结构审查把这两层证据的差别写进了 §S-06：结构回读有价值，但它是另一层证据。
+
+不依赖本机环境的这一批（含核心 Excel / PPT 的结构回归）进 CI 与发布守门，名单只有一处真源
+（`scripts/ci-suites.mjs`，工作流调 `node scripts/run-suites.mjs --ci`）；要本机引擎 / 要出网 /
+要宿主安装的那一批**不进**守门，按名字单独跑，结果单独如实报告。
 
 ## 6. 交付说明格式
 

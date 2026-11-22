@@ -29,8 +29,6 @@ import { join } from 'node:path';
 import { availableHelpTopics, buildHelp } from '../src/docs.js';
 import { KB_TIERS, strictTierOf } from '../src/kb.js';
 import {
-    CONFLICT_CLASSES,
-    CONFLICT_STATES,
     DEFAULT_ENTRY_LIMIT_BYTES,
     DEFAULT_LAYERS,
     LINK_KINDS,
@@ -133,22 +131,6 @@ const tierRejects = (value) => {
     }
 };
 
-/**
- * link 的 conflict / state：探针要**认报错的原因**，不能只看「抛没抛」。
- *
- * 这两条的值域校验发生在 id 查找之前，而探针用的是假 id —— 合法值会继续往下走、
- * 最后因为「找不到 id」抛错。只判「抛没抛」的话合法用例也会被算成「被拒绝」，
- * 正向控制（合法用例不许被拒）就永远过不去，违反率也变成恒真。
- */
-const linkFieldRejects = (field) => async (value) => {
-    try {
-        await toolOf('office_memory').execute({ action: 'link', sourceId: 'a', targetId: 'b', [field]: value }, EXEC);
-        return false;
-    } catch (error) {
-        return new RegExp(`${field} 只支持`).test(String(error?.message ?? error));
-    }
-};
-
 // ── 登记表：描述里带格式约束的参数 ──────────────────────────────────────────
 //
 // 用例写 [值, 处理]：
@@ -230,21 +212,7 @@ const REGISTRY = [
         vocabulary: LINK_KINDS,
         valid: inList(LINK_KINDS),
         cases: [['related', 'ok'], ['contradicts', 'ok'], ['weird', 'tolerated'], ['', 'tolerated'], ['RELATED', 'tolerated']],
-        why: '认不出的关系类型退回 related（memory.js 的 link）——它只是边的标签；但冲突类的两个字段是例外，见下两条',
-    },
-    {
-        tool: 'office_memory', param: 'conflict',
-        vocabulary: CONFLICT_CLASSES,
-        valid: emptyOk(inList(CONFLICT_CLASSES)),
-        cases: [['context-memory', 'ok'], ['', 'ok'], ['weird', 'reject'], ['context', 'reject'], ['CONTEXT-MEMORY', 'reject']],
-        reject: linkFieldRejects('conflict'),
-    },
-    {
-        tool: 'office_memory', param: 'state',
-        vocabulary: CONFLICT_STATES,
-        valid: emptyOk(inList(CONFLICT_STATES)),
-        cases: [['unresolved', 'ok'], ['', 'ok'], ['weird', 'reject'], ['prefer-source', 'ok'], ['PREFER-SOURCE', 'reject']],
-        reject: linkFieldRejects('state'),
+        why: '认不出的关系类型退回 related（memory.js 的 kbLink）——它只是边的标签，多留一条边不丢数据',
     },
     {
         tool: 'office_memory', param: 'depth',
@@ -365,7 +333,7 @@ const REGISTRY = [
         why: '与 office_web_search 同一条口径：认不出的类型 id 等于不限定（site-catalog.js 只认 SITE_TYPE_IDS）',
     },
     {
-        tool: 'office_search_brief', param: 'type',
+        tool: 'office_search_dispatch', param: 'type',
         vocabulary: CONTENT_TYPE_IDS,
         valid: emptyOk(inList(CONTENT_TYPE_IDS)),
         cases: [['hotspot', 'ok'], ['mixed', 'ok'], ['', 'ok'], ['nope', 'tolerated'], ['Hotspot', 'tolerated']],
@@ -376,7 +344,7 @@ const REGISTRY = [
         vocabulary: CONTENT_TYPE_IDS,
         valid: emptyOk(inList(CONTENT_TYPE_IDS)),
         cases: [['knowledge', 'ok'], ['manual', 'ok'], ['', 'ok'], ['nope', 'tolerated'], ['KNOWLEDGE', 'tolerated']],
-        why: '与 office_search_brief 同一条：认不出就自动判断（search-routes.js 的 byId；这里的自动判断用于生成核对清单）',
+        why: '与 office_search_dispatch 同一条：认不出就自动判断（search-routes.js 的 byId；这里的自动判断用于生成核对清单）',
     },
 ];
 
@@ -386,8 +354,8 @@ const GENERIC_IGNORE = new Set([
     'true', 'false', 'default', 'file', 'files', 'path', 'paths', 'page', 'pages',
     // 参数名与用法提示（描述里说明「这个字段什么时候用」，不是值域）：
     'action', 'target', 'content', 'tier', 'oldtext', 'importance', 'entities', 'tags',
-    'layer', 'query', 'limit', 'since', 'until', 'sourceid', 'targetid', 'kind', 'conflict',
-    'state', 'depth', 'packpath', 'from', 'dryrun', 'format', 'theme', 'purpose', 'source',
+    'layer', 'query', 'limit', 'since', 'until', 'sourceid', 'targetid', 'kind',
+    'depth', 'packpath', 'from', 'dryrun', 'format', 'theme', 'purpose', 'source',
     'topic', 'type', 'audience', 'files', 'briefpath', 'outputpaths', 'maxparallel',
     'queries', 'out', 'maxresults', 'fetchpages', 'provider', 'preprocess', 'sites',
     'script', 'keepcache', 'detail', 'path', 'run', 'mode', 'text', 'log',
@@ -400,7 +368,12 @@ const ALL_VOCABULARY = new Set(REGISTRY.flatMap((entry) => entry.vocabulary ?? [
 function strayTokens(description, vocabulary) {
     let rest = String(description);
     for (const value of [...vocabulary].sort((left, right) => right.length - left.length)) {
-        rest = rest.split(value).join('\u0000');
+        // **按整词剥**，不是按子串剥（第五十七轮修）：词表里的值是英文标识（hot / all /
+        // kb-ingest），子串替换会把别的词咬掉一截 —— 实测 `recall` 里的 `all` 被剥走后
+        // 剩下 `rec`，于是一条**正确**的描述被判成「编了个值」。前后不许是英文词字符，
+        // 中文与标点照旧算边界。
+        const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        rest = rest.replace(new RegExp(`(?<![A-Za-z0-9_-])${escaped}(?![A-Za-z0-9_-])`, 'g'), '\u0000');
     }
     const tokens = [...rest.matchAll(/[A-Za-z][A-Za-z0-9_-]{1,}/g)].map((match) => match[0]);
     return [...new Set(tokens)].filter((token) => !GENERIC_IGNORE.has(token.toLowerCase())

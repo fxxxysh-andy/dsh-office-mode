@@ -136,14 +136,28 @@ export function kbDirOf(memoryDir) {
     return join(dirname(memoryDir), KB_DIR_NAME);
 }
 
-/** kb 一棵树的文件位置（manifest 是真源，index.json 只是投影）。 */
+/**
+ * kb 一棵树的文件位置（manifest 是真源，index.json 只是投影）。
+ *
+ * `pending`（第五十六轮）是**提交后清理的意图日志**：换代 / 删除这类「要动删除类操作」
+ * 的动作先把意图落在这里，再提交 manifest；提交之后的清边 / 墓碑 / 孤儿块清扫做完才删它。
+ * 崩在提交之前，它在下一次 kb 写操作时被丢弃（旧版本完整）；崩在提交之后，它被重放
+ * （新版本完整，旧边在该清的时候清掉）。见 memory.js 的 `replayKbPending`。
+ */
 export function kbPathsFor(memoryDir) {
-    const dir = kbDirOf(memoryDir);
+    return kbPathsAt(kbDirOf(memoryDir));
+}
+
+/** 直接给一个知识库根目录（第八十五轮：全局库目录可由设置指定）。 */
+export function kbPathsAt(dir) {
     return {
         dir,
         manifest: join(dir, 'manifest.jsonl'),
         chunks: join(dir, 'chunks'),
         index: join(dir, 'index.json'),
+        pending: join(dir, 'pending.json'),
+        // 单库之后 kb 的墓碑也落在这里（第八十八轮）：清理意图属于库，不属于某个记忆根。
+        tombstones: join(dir, 'tombstones.jsonl'),
     };
 }
 
@@ -160,6 +174,102 @@ export function chunkIdOf(docHash, n) {
 /** 块文件名（相对 chunks/ 目录，posix 写法，便于进 Pack 的键）。 */
 export function chunkRelOf(docHash, n) {
     return posix.join(asText(docHash), `${boundedInt(n, 0, 0, 1_000_000)}.json`);
+}
+
+// ── 虚拟文件夹（第八十四轮） ────────────────────────────────────────────────
+//
+// 知识库是**一棵全局树**，文档按虚拟路径归档；路径只存在于 manifest 的 `folder`
+// 字段里，不复制任何目录。这样同一份文档可以在面板里像文件资源管理器一样浏览，
+// 检索也能只在一个子树里做（folder 前缀），而不必把磁盘目录结构搬进 kb。
+//
+// 路径纪律：POSIX 分隔符、无首尾斜杠、拒绝 `..` 与绝对路径；空串 = 根。
+
+/** 规范化虚拟文件夹路径；非法路径抛错（写错路径不该静默落到根）。 */
+export function normalizeKbFolder(value) {
+    const raw = asText(value).replace(/\\/g, '/');
+    if (raw === '' || raw === '/') return '';
+    if (raw.startsWith('/') || /^[A-Za-z]:/.test(raw)) {
+        throw new Error(`folder 要是知识库里的相对虚拟路径（例：参考资料/合同），收到「${asText(value)}」。`);
+    }
+    const parts = [];
+    for (const part of raw.split('/')) {
+        const clean = part.trim();
+        if (clean === '' || clean === '.') continue;
+        if (clean === '..') {
+            throw new Error(`folder 里不能有「..」：收到「${asText(value)}」。`);
+        }
+        parts.push(clean);
+    }
+    return parts.join('/');
+}
+
+/** 文件夹的展示名（根叫「全部文档」）。 */
+export function kbFolderLabel(folder) {
+    const path = normalizeKbFolder(folder);
+    if (path === '') return '全部文档';
+    const parts = path.split('/');
+    return parts[parts.length - 1];
+}
+
+/** 一份文档的 folder 是否落在检索范围里。recursive=false 时只算直接子层。 */
+export function kbFolderInScope(rowFolder, scope, { recursive = true } = {}) {
+    const folder = normalizeKbFolder(scope);
+    const value = normalizeKbFolder(rowFolder);
+    if (folder === '') return true;
+    if (value === folder) return true;
+    return recursive && value.startsWith(`${folder}/`);
+}
+
+/**
+ * 从 manifest 行现算文件夹树（不落盘第二份真源）。
+ *
+ * 每个节点带 `docs / chunks / bytes`（含子树），`children` 按名字排序。
+ * 空文件夹没有 manifest 行就不可见 —— 这是有意的：树是「文档在哪」的投影，
+ * 不是另一份可以漂走的元数据。
+ */
+export function kbFolderTree(rows, { rootLabel = '全部文档' } = {}) {
+    const nodes = new Map();
+    const ensure = (path) => {
+        if (!nodes.has(path)) {
+            nodes.set(path, {
+                path,
+                name: path === '' ? rootLabel : kbFolderLabel(path),
+                docs: 0,
+                chunks: 0,
+                bytes: 0,
+                children: [],
+            });
+        }
+        return nodes.get(path);
+    };
+    ensure('');
+    for (const row of Array.isArray(rows) ? rows : []) {
+        let folder = '';
+        try { folder = normalizeKbFolder(row.folder); } catch { folder = ''; }
+        const chain = [''];
+        if (folder !== '') {
+            const parts = folder.split('/');
+            for (let i = 1; i <= parts.length; i += 1) chain.push(parts.slice(0, i).join('/'));
+        }
+        for (const path of chain) {
+            const node = ensure(path);
+            node.docs += 1;
+            node.chunks += Number.isFinite(row.chunks) ? row.chunks : 0;
+            node.bytes += Number.isFinite(row.bytes) ? row.bytes : 0;
+        }
+    }
+    for (const [path, node] of nodes) {
+        if (path === '') continue;
+        const parent = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+        ensure(parent).children.push(node);
+    }
+    const sortNode = (node) => {
+        node.children.sort((left, right) => left.name.localeCompare(right.name, 'zh-Hans-CN'));
+        for (const child of node.children) sortNode(child);
+    };
+    const root = ensure('');
+    sortNode(root);
+    return root;
 }
 
 /** 来源类别收敛：不认识的值按 user 处理（写坏配置不该产生一个不存在的档）。 */
@@ -198,10 +308,29 @@ export function chunkCharsFor(sourcePath) {
     return KB_CHUNK_CHARS_BY_KIND[kind] ?? KB_CHUNK_CHARS;
 }
 
+/**
+ * 相邻块的重叠字符数（第一百零一轮）：块大小的 1/8，夹在 60–300 之间。
+ *
+ * 为什么要重叠：结构切块把一段完整论证切在两块之间时，单看任一块都可能读不出
+ * 「这句话在讲谁」。检索命中一块时，没命中的邻居只差一个指代词 —— 重叠窗口让
+ * 命中块自带上一块的句尾上下文。代价是同一段正文出现在两个块里，检索结果需要
+ * 按块去重而不是按字符去重（打分仍按块算）。
+ *
+ * 为什么是「重叠字符数」而不是「重叠比例」：这个值必须进 docHash（见 kbHash 的
+ * 注释）。写成函数而不是配置项，是为了让「同一份内容 + 同一档」永远算得出同一个
+ * 重叠量；改成配置就得同步进 profile，否则换设置后旧块会被误判成同一档。
+ */
+export function chunkOverlapFor(chunkChars) {
+    const chars = boundedInt(chunkChars, KB_CHUNK_CHARS, 200, 8000);
+    return Math.min(300, Math.max(60, Math.floor(chars / 8)));
+}
+
 /** Markdown 标题行：切块的骨架。 */
 const HEADING = /^(#{1,6})[ \t]+(\S.*?)[ \t]*$/;
 /** 硬切时的可断点（往左找最近一个）。 */
 const BREAK_AFTER = /[\n。！？；：.!?;:、，,）)】」』]$/;
+/** 重叠退让时的边界（往左找最近一个；换行与句末标点）。 */
+const OVERLAP_BOUNDARY_AFTER = /[\n。！？；.!?;，、]/;
 
 /**
  * 把一段正文切成块（纯函数，确定性）。
@@ -214,8 +343,17 @@ const BREAK_AFTER = /[\n。！？；：.!?;:、，,）)】」』]$/;
  *
  * 返回的 `span` 是**源正文的字符区间**，且满足 `text === source.slice(start, end)`
  * —— 这条等式就是「span 可回溯」的全部含义，测试里逐块断言。
+ *
+ * **相邻块重叠**（第一百零一轮）：切完之后，除第一块外，每块的起点再向前退不超过
+ * `overlap` 个字符，停在句末 / 换行这类边界上。退让**不进到上一块起点之前**，所以
+ * 重叠窗口最多覆盖上一块的尾部，不会出现「一块正文整个落在另一块里」。
+ * span 等式仍然成立（`span` 随退让一起左移），检索按块去重即可。
+ *
+ * @param {string} text 源正文
+ * @param {{chunkChars?: number, overlap?: number|null}} [options]
+ *   `overlap` 缺省（null）时按块大小算 `chunkOverlapFor(limit)`；显式 0 关闭重叠。
  */
-export function splitDocument(text, { chunkChars = KB_CHUNK_CHARS } = {}) {
+export function splitDocument(text, { chunkChars = KB_CHUNK_CHARS, overlap = null } = {}) {
     const source = typeof text === 'string' ? text : '';
     const limit = Math.max(200, boundedInt(chunkChars, KB_CHUNK_CHARS, 200, 8000));
     /** 每行连同它在源正文里的区间（行尾的 \r 不进正文）。 */
@@ -328,7 +466,58 @@ export function splitDocument(text, { chunkChars = KB_CHUNK_CHARS } = {}) {
             outline: piece.outline,
         });
     }
-    return out;
+    return overlapChunks(source, out, overlap === null ? chunkOverlapFor(limit) : overlap);
+}
+
+/**
+ * 把一批相邻块的起点各自向前退 `overlap` 个字符（就地修改 `span` 与 `text`）。
+ *
+ * 单独的导出（而不是只藏在 `splitDocument` 里）：模型切片走的是
+ * `kb-llm.chunksFromGroups`，它按小节分组建块、与 Markdown 结构切块互不相干；
+ * 两条路径必须用**同一个**重叠实现，否则「模型切块没有重叠」这件事会悄悄成立。
+ *
+ * 三条边界：
+ *   - 退让不超过上一块的起点（避免一块正文整个被另一块包住）；
+ *   - 退让尽量停在边界（换行 / 句末标点）上，找不到就按窗口原样切；
+ *   - 退让后去掉开头的空白 —— span 与正文仍然逐字相等。
+ */
+export function overlapChunks(source, chunks, overlap) {
+    const text = typeof source === 'string' ? source : '';
+    const list = Array.isArray(chunks) ? chunks : [];
+    const gap = boundedInt(overlap, 0, 0, 2000);
+    if (gap === 0 || list.length < 2) return list;
+    for (let index = 1; index < list.length; index += 1) {
+        const chunk = list[index];
+        const prev = list[index - 1];
+        if (chunk === null || typeof chunk !== 'object' || prev === null || typeof prev !== 'object') continue;
+        const span = chunk.span !== null && typeof chunk.span === 'object' ? chunk.span : null;
+        if (span === null || !Number.isFinite(span.start) || !Number.isFinite(span.end)) continue;
+        const start = Math.trunc(span.start);
+        const end = Math.trunc(span.end);
+        if (end <= start) continue;
+        const prevStart = prev.span !== null && typeof prev.span === 'object' && Number.isFinite(prev.span.start)
+            ? Math.trunc(prev.span.start)
+            : 0;
+        const floor = Math.max(0, Math.min(prevStart, start - 1));
+        let from = Math.max(floor, start - gap);
+        if (from >= start) continue;
+        // 从窗口最左往右找**第一个**边界：起点要尽量靠前（重叠最大），但绝不能
+        // 落在原起点上 —— 模型分组通常紧接句末标点，从 `start` 起往回找会把
+        // 边界判在原起点，重叠等于没加（第 101 轮亲眼踩到）。
+        // 另一个坑：边界后面只剩空白（正文段之间的「。\n\n」）时，跳过空白就
+        // 又回到原起点，重叠同样归零；这种边界不算数，继续往左找。
+        for (let at = from + 1; at < start; at += 1) {
+            if (!OVERLAP_BOUNDARY_AFTER.test(text.slice(at - 1, at))) continue;
+            if (text.slice(at, start).trim() === '') continue;
+            from = at;
+            break;
+        }
+        while (from < start && /\s/.test(text[from])) from += 1;
+        if (from >= start) continue;
+        chunk.span = { start: from, end };
+        chunk.text = text.slice(from, end);
+    }
+    return list;
 }
 
 /**
@@ -485,9 +674,18 @@ export function normalizeManifestRow(raw) {
     const hash = asText(raw.hash);
     const path = asText(raw.path);
     if (id === '' || hash === '') return null;
+    let folder = '';
+    try { folder = normalizeKbFolder(raw.folder); } catch { folder = ''; }
+    // 图片资产（第八十九轮上传）：只认知识库自己的 assets/ 相对路径，别的一律丢掉。
+    // 上游写进来的是 posix 相对路径；这里也顺手挡住 `../`，免得 manifest 被手改后
+    // 面板把一个站外路径当图片端出来。
+    const images = (Array.isArray(raw.images) ? raw.images : [])
+        .map((item) => asText(item))
+        .filter((item) => item.startsWith('assets/') && !item.split('/').includes('..'));
     return {
         id,
         path,
+        folder,
         hash,
         title: asText(raw.title) || path,
         bytes: finiteNumber(raw.bytes),
@@ -495,7 +693,20 @@ export function normalizeManifestRow(raw) {
         chunks: boundedInt(raw.chunks, 0, 0, 100_000),
         tier: kbTierOf(raw.tier),
         at: asText(raw.at),
+        ...(images.length > 0 ? { images } : {}),
+        // 正文来自 OCR（第一百零一轮）：`{ at, chars }`。只认识字面量，坏值整个丢掉 ——
+        // 面板拿它写「识别于某时、N 字」，写不了就退回普通文档的样子，不该报错。
+        ...ocrOf(raw.ocr),
     };
+}
+
+/** manifest 行里的 OCR 标记：`{ at, chars }`，字段不全就当没有。 */
+function ocrOf(raw) {
+    if (raw === null || typeof raw !== 'object') return {};
+    const at = asText(raw.at);
+    const chars = finiteNumber(raw.chars);
+    if (at === '' || chars <= 0) return {};
+    return { ocr: { at, chars } };
 }
 
 /** 块文件的规范化。

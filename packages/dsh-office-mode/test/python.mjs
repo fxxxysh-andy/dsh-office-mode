@@ -218,7 +218,7 @@ await check('office.python：matplotlib 出图，产物落缓存并标成 image'
     assert.equal(returned.files.length, 1, JSON.stringify(returned.files));
     const file = returned.files[0];
     assert.equal(file.kind, 'image');
-    assert.match(file.path, /^\.office\/cache\/python\/out\/trend\.png$/);
+    assert.match(file.path, /^\.office\/runtime\/cache\/python\/out\/trend\.png$/);
     // 真图，不是 0 字节的壳：PNG 魔数 + 合理体积。
     const absolute = join(runRoot, file.path);
     const bytes = readFileSync(absolute);
@@ -234,9 +234,9 @@ await check('office.python：产物只报这一次跑出来的（上一次的图
     if (!hasPython) skip(note);
     const runRoot = mkdtempSync(join(tmpdir(), 'office-py-diff-'));
     const first = await runScript(runRoot, 'open(OUT_DIR + "/a.txt", "w", encoding="utf-8").write("a")');
-    assert.deepEqual(first.returned.files.map((file) => file.path), ['.office/cache/python/out/a.txt']);
+    assert.deepEqual(first.returned.files.map((file) => file.path), ['.office/runtime/cache/python/out/a.txt']);
     const second = await runScript(runRoot, 'open(OUT_DIR + "/b.txt", "w", encoding="utf-8").write("b")');
-    assert.deepEqual(second.returned.files.map((file) => file.path), ['.office/cache/python/out/b.txt']);
+    assert.deepEqual(second.returned.files.map((file) => file.path), ['.office/runtime/cache/python/out/b.txt']);
     cleanup(runRoot);
 });
 

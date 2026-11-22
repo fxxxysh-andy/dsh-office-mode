@@ -18,6 +18,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { resolveShippedBundle } from './host-modules.mjs';
 import { CAPABILITY_VARIABLE } from '../src/capabilities.js';
+import { HOT_MEMORY_VARIABLE } from '../src/memory.js';
 
 /** UTF-8 字节（persona 预算按字节算，与工具面预算同一口径）。 */
 export function bytes(text) {
@@ -118,9 +119,17 @@ export function personaToolBullets(section) {
     return String(section ?? '').split(/\r?\n/).filter((line) => line.trim().startsWith('- ')).length;
 }
 
-/** 把 persona 里的能力地图变量换成给定文本（渲染后的真身）。 */
-export function renderPersona(prefix, map) {
-    return String(prefix ?? '').split(`{{${CAPABILITY_VARIABLE}}}`).join(map);
+/**
+ * 把 persona 里的能力地图变量换成给定文本（渲染后的真身）。
+ *
+ * 传了 `hot` 就把开场记忆变量也换掉：预算守门要算的是**每一次请求**都带着的
+ * 那一份，而 `{{office_hot_memory}}` 在 preset 文件里只是个 21 B 的占位符
+ * （第七十七轮实测：真实 HOT.md 767 B、最坏 919 B，旧守门看不见这 897 B）。
+ */
+export function renderPersona(prefix, map, { hot } = {}) {
+    let text = String(prefix ?? '').split(`{{${CAPABILITY_VARIABLE}}}`).join(map);
+    if (hot !== undefined) text = text.split(`{{${HOT_MEMORY_VARIABLE}}}`).join(hot);
+    return text;
 }
 
 /** persona 的语义指纹：扰动回归比的就是它（排版变了、这组东西不该变）。 */

@@ -21,18 +21,17 @@
  *
  * @module dsh-office-mode/formats/ppt
  */
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { isAbsolute } from 'node:path';
+import { createHash } from 'node:crypto';
 import { zip, unzip } from '../engine/zip.js';
-import { parseXml, descendants, children as xmlChildren, textOf, normalizeSpace } from '../engine/xml.js';
+import { parseXml, descendants, children as xmlChildren, textOf, normalizeSpace, decodeXmlEntities } from '../engine/xml.js';
 import {
     EMU_PER_PT, cmToEmu, estimateEm, wrapText, asArray, asNumber, asString,
-    normalizeColumns, cellType, createEnv, displayPath, ensureExtension, slugify,
+    normalizeColumns, cellType, createEnv, assertInsideRoot, displayPath, ensureExtension, slugify,
     basename, join,
 } from '../engine/kit.js';
 import { DEFAULT_THEME_ID, resolveTheme, toHex } from '../engine/theme.js';
 import { chartSpaceXml, normalizeChartSpec, presentationChartFrame } from './chart.js';
-import { latexToMath, looksLikeLatex, mathPlain } from './ppt-math.js';
+import { latexToMath, looksLikeLatex, looksLikePlainFormula, mathPlain } from './ppt-math.js';
 
 // ───────────────────────────────────────────────────────────────────────────
 // 常量：OOXML 里写死的固定部分
@@ -105,7 +104,7 @@ const LAYOUT_KEYS = LAYOUTS.map((item) => item.key);
 
 /**
  * 版式助手：一次调用生成一整页的常用汇报页（卡片网格、编号流程、对比双栏、
- * KPI 大数字、图文、时间线、图标网格）。
+ * KPI 大数字、图文、时间线、图标网格、目录、图片墙、路线图、矩阵）。
  *
  * 为什么它们要自成一类 kind，而不是「往自由绘制页里塞形状」：
  * 1. stats.layouts / outline 里必须能看出这一页用的是哪种助手
@@ -116,7 +115,38 @@ const LAYOUT_KEYS = LAYOUTS.map((item) => item.key);
  *
  * 名单顺序 = read() 的识别优先级，见 HELPER_MARKERS。
  */
-const HELPER_KINDS = ['cards', 'steps', 'compare', 'kpi', 'imageText', 'timeline', 'iconGrid'];
+const HELPER_KINDS = [
+    'cards', 'steps', 'compare', 'kpi', 'imageText', 'timeline', 'iconGrid',
+    'agenda', 'gallery', 'roadmap', 'matrix',
+];
+
+/**
+ * 允许在同一页继续落「叠加层 / 配图」的版式（第五十二轮 `新-6`）。
+ *
+ * 从前只有自由绘制页与助手页开放画布：`deck.bullets()` 之后写 `deck.banner()`
+ * 会另起一页空白页，`deck.cards()` 之后写 `deck.image()` 也只能另起一页 ——
+ * 「版式 + 配图」这种最常见的成稿方式反而要手工摆形状。
+ * 现在内容型版式一律开放：叠加层画在版式之后（图层顺序 = 调用顺序）。
+ * 封面 / 章节页 / 结束页仍然不开放 —— 它们是整页构图，塞东西进去只会压标题。
+ */
+const CANVAS_HOST_KINDS = new Set([
+    'shape', ...HELPER_KINDS,
+    'bullets', 'table', 'quote', 'statement', 'image', 'images', 'chart',
+]);
+
+/**
+ * 反过来：不开放画布的版式（整页构图，塞东西进去只会压标题）。
+ * read() 用它判断「基础版式页之后的自由绘制页」这条告警还成不成立。
+ */
+const CANVAS_CLOSED_KINDS = ['cover', 'section', 'closing'];
+
+/**
+ * 画布配图与版式共存时的默认分栏：图占版心右侧这一比例，宿主版式用剩下的左栏。
+ * 只在调用方没给 `x/y/w/h` 时生效；给了显式摆位就完全按调用方给的画。
+ */
+const CANVAS_IMAGE_SPLIT_RATIO = 0.42;
+/** 分栏时版式与配图之间的间隙（厘米）。 */
+const CANVAS_IMAGE_SPLIT_GAP_CM = 0.6;
 
 /** 画布尺寸（EMU）。16:9 与 4:3 是 SPEC 指定的两档。 */
 const SIZES = {
@@ -722,6 +752,21 @@ function runXml(run, font, base = run, scope = {}) {
     // a:hlinkClick 排在 latin/ea/cs 之后（CT_TextCharacterProperties 的顺序）
     const relId = run.linkRelId ?? base.linkRelId;
     const link = relId === undefined || relId === '' ? '' : `<a:hlinkClick r:id="${escapeAttr(relId)}"/>`;
+    // 短公式兜底（第五十八轮 新-23）：走到这里的都是**真·文本** run（math run 在上面就返回了），
+    // 所以「看着像公式的短文本」能当场报出来，位置精确到「哪一页、哪个形状、第几个 run」。
+    // 计数不在这里做：sink.push 按最终 XML 数一遍（同一个 run 走两次渲染也只算一条）。
+    // 这里**不做本地去重**（逐条 push）：同一个形状里三条相同的要点是三个位置，
+    // 而 compile 的 `warn()` 本来就会把逐字相同的告警并成一条（引擎既有口径），
+    // 所以「重复文本只报一条告警」发生在那一层，`stats.plainFormulas` 照实报条数。
+    if (scope.notes !== undefined && looksLikePlainFormula(run.text)) {
+        const page = asNumber(scope.page, 0);
+        const shape = asString(scope.shape);
+        const runIndex = asNumber(scope.runIndex, 0);
+        const where = `第 ${page} 页${shape === '' ? '' : `形状「${shape}」`}`
+            + `${runIndex > 0 ? ` 第 ${runIndex} 个 run ` : ''}`;
+        scope.notes.push(`${where}看着是公式却写成了普通文本（「${asString(run.text).trim().slice(0, 32)}」）：`
+            + "短公式同样要走 math 通道，写成 runs:[{math:'r=qr_0'}]；确实要当文字用可以忽略这条");
+    }
     return `<a:r><a:rPr ${attrs}>${fill}${faces}${link}</a:rPr><a:t>${escapeAttr(asString(run.text))}</a:t></a:r>`;
 }
 
@@ -883,7 +928,9 @@ function paragraphXml(para, font, scope = {}) {
     } else if (para.text === undefined || para.text === '') {
         body = `<a:endParaRPr lang="zh-CN" sz="${size}"/>`;
     } else {
-        body = runXml(para, font);
+        // 旧写法（一段一个 run）也要带 scope：短公式告警与公式失败告警都靠它定位到
+        // 「哪一页、哪个形状、第几个 run」；不传的话这一档会静默（参数含义与原地一致）。
+        body = runXml(para, font, para, { ...scope, runIndex: 1 });
     }
     return `<a:p><a:pPr${attrs.length ? ` ${attrs.join(' ')}` : ''}>${kids.join('')}</a:pPr>${body}</a:p>`;
 }
@@ -899,6 +946,37 @@ function textBodyXml(paras, font, opts = {}) {
     return `<p:txBody>${bodyPr}<a:lstStyle/>${list === '' ? '<a:p><a:pPr><a:buNone/></a:pPr><a:endParaRPr lang="zh-CN"/></a:p>' : list}</p:txBody>`;
 }
 
+// ─── 短公式兜底（第五十八轮 新-23） ────────────────────────────────────────
+//
+// 为什么写侧与读侧各扫一遍：写侧（run 通道）能给出「哪一页、哪个形状、第几个 run」的
+// 精确位置，读侧（a:t 节点）覆盖别人写的老稿子与第三方文件。
+// 两处都**必须剔除 mc:Fallback** —— 那是公式成功解析后留给不认 a14 的阅读器的纯文本近似
+// （`E = mc²`），把它当成「写成文字的公式」会得到一条永远甩不掉的假告警。
+const PPT_MC_FALLBACK = /<mc:Fallback>[\s\S]*?<\/mc:Fallback>/g;
+const PPT_A_T = /<a:t(?:\s[^>]*)?>([\s\S]*?)<\/a:t>/g;
+
+/** 从一段 shape / slide XML 字符串里抽出真·普通文本（剔除 mc:Fallback，反转义实体）。 */
+function plainTextsOfXml(xml) {
+    const out = [];
+    for (const match of String(xml ?? '').replace(PPT_MC_FALLBACK, '').matchAll(PPT_A_T)) {
+        out.push(decodeXmlEntities(match[1]));
+    }
+    return out;
+}
+
+/**
+ * 从**解析后**的一页 XML 里收集普通文本节点：同样跳过 mc:Fallback 子树。
+ * 解析树没有父指针，所以判据只能是「走到 Fallback 就不往下走」，不能事后按祖先过滤。
+ */
+function plainTextNodesOfTree(node, out = []) {
+    for (const child of node?.children ?? []) {
+        if (child.name === 'mc:Fallback') continue;
+        if (child.name === 'a:t') out.push(child);
+        else plainTextNodesOfTree(child, out);
+    }
+    return out;
+}
+
 /** 滑动形状收集器：负责 id 自增、rel 自增、文本面积记账。 */
 function createSink() {
     return {
@@ -912,6 +990,12 @@ function createSink() {
         imageCount: 0,
         // 原生公式数（a14:m）：报告里要能看出「这页有没有公式、有几个」
         formulas: 0,
+        // 看着像公式却写成了普通文本的条数（第五十八轮 新-23）。三个公式口径是三件事，
+        // 处置办法完全不同，合在一起等于都答不清：formulas = 写成了公式；
+        // formulaErrors = 想写成公式但**解析失败**（改命令）；plainFormulas = **压根没走**
+        // 公式通道（改成 {math:…}）。
+        plainFormulas: 0,
+        plainFormulaSamples: [],
         nextId() {
             this.id += 1;
             return this.id;
@@ -921,6 +1005,11 @@ function createSink() {
         },
         push(xml) {
             this.formulas += (xml.match(/<a14:m[ >]/g) ?? []).length;
+            const plain = plainTextsOfXml(xml).filter((text) => looksLikePlainFormula(text));
+            this.plainFormulas += plain.length;
+            for (const text of plain) {
+                if (this.plainFormulaSamples.length < 8) this.plainFormulaSamples.push(text.trim());
+            }
             this.shapes.push(xml);
         },
     };
@@ -1519,18 +1608,21 @@ function addFooter(sink, ctx, label, options = {}) {
     if (ctx.master !== undefined) return;
     const color = options.color ?? pal.footer;
     const lineColor = options.lineColor ?? pal.bandLine;
+    // 页脚是页面级装饰：分栏页（新-6）上仍横贯整幅版心，不跟着收窄
+    const fullW = g.fullContentW ?? g.contentW;
+    const fullRight = g.fullContentRight ?? g.contentRight;
     addRect(sink, {
-        x: g.margin, y: g.footerY - cmToEmu(0.20), w: g.contentW, h: 9525,
+        x: g.margin, y: g.footerY - cmToEmu(0.20), w: fullW, h: 9525,
         fill: lineColor, name: 'Footer Rule',
     });
     addText(sink, ctx, {
-        x: g.margin, y: g.footerY, w: Math.round(g.contentW * 0.7), h: g.footerH,
+        x: g.margin, y: g.footerY, w: Math.round(fullW * 0.7), h: g.footerH,
         anchor: 't', name: 'Footer Text', autofit: false,
         paras: [{ text: label, sizePt: 10, color, lineSpacing: 1 }],
     });
     addText(sink, ctx, {
-        x: g.contentRight - Math.round(g.contentW * 0.3), y: g.footerY,
-        w: Math.round(g.contentW * 0.3), h: g.footerH, anchor: 't', name: 'Page Number', autofit: false,
+        x: fullRight - Math.round(fullW * 0.3), y: g.footerY,
+        w: Math.round(fullW * 0.3), h: g.footerH, anchor: 't', name: 'Page Number', autofit: false,
         paras: [{ text: `${ctx.page} / ${ctx.total}`, sizePt: 10, color, align: 'r', lineSpacing: 1 }],
     });
 }
@@ -1543,7 +1635,8 @@ function addContentChrome(sink, ctx, title, options = {}) {
         x: 0, y: g.titleBandH - cmToEmu(0.04), w: g.cx, h: cmToEmu(0.04),
         fill: pal.bandLine, name: 'Title Band Rule',
     });
-    const boxW = g.contentW - cmToEmu(1.4);
+    // 标题同样横贯整幅版心：分栏页上标题缩到半幅会显得整页没对齐（新-6）
+    const boxW = (g.fullContentW ?? g.contentW) - cmToEmu(1.4);
     const fit = fitTitle(title, boxW, g.titleH);
     addText(sink, ctx, {
         x: g.margin, y: g.titleY, w: boxW, h: g.titleH, anchor: 'ctr',
@@ -2137,7 +2230,10 @@ function addPicture(sink, ctx, box, counts = true) {
     const covered = box.crop !== undefined && box.crop.l > 0;
     const line = box.frame === true && !covered ? { line: pal.border, lineW: 9525 } : {};
     const name = box.name ?? (box.fullBleed === true ? `Picture Full Bleed ${id}` : `Picture ${sink.imageCount}`);
-    sink.push(`<p:pic><p:nvPicPr><p:cNvPr id="${id}" name="${name}"/>`
+    // alt 写进 cNvPr 的 descr：这是 PowerPoint「设置替代文字」用的同一个字段，
+    // 图片墙的语义信息（alt）因此不丢，且不需要新增 rel 或额外形状
+    const altAttr = asString(box.alt) === '' ? '' : ` descr="${escapeAttr(asString(box.alt))}"`;
+    sink.push(`<p:pic><p:nvPicPr><p:cNvPr id="${id}" name="${name}"${altAttr}/>`
         + `<p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr><p:nvPr/></p:nvPicPr>`
         + `<p:blipFill><a:blip r:embed="${rel.id}"/>${srcRectXml(box.crop)}`
         + '<a:stretch><a:fillRect/></a:stretch></p:blipFill>'
@@ -2411,6 +2507,48 @@ function contentBox(ctx) {
     };
 }
 
+/**
+ * 一页的几何计划（第五十二轮 `新-6`：版式与配图共存）。
+ *
+ * 页面上有「没给摆位的画布配图」时按分栏处理：图占版心右侧 `ratio`（默认 0.42），
+ * 宿主版式收进剩下的左栏。**只对版式助手页生效**（全部助手的几何都经 `contentBox(ctx)`
+ * 取宽度，所以收窄 `ctx.g` 一处就整页生效）；基础版式页与自由绘制页上的配图都要求显式摆位，
+ * 没有「版心该收多窄」这个问题可算（见下面的早退）。
+ *
+ * 自由绘制页（kind='shape'）尤其不能分栏：那一页的形状由调用方自己摆位，
+ * 没有「版心」这个概念可收。
+ *
+ * @param {object} g 版心几何（EMU）
+ * @param {object} source 这一页的 slide 数据
+ * @returns {{geom: object, rects: Array}} geom 是本页实际用的几何（含 fullContentW），
+ *   rects 按 canvas 下标给出各张配图的矩形（厘米），没分栏的位置是 undefined
+ */
+function planPageGeometry(g, source) {
+    // fullContentW / fullContentRight：页面级装饰（标题带、页脚、母版）要的整幅宽度。
+    // 分栏只收版心，标题与页脚仍横贯页面 —— 否则半个页面的标题带看着像画错了
+    const geom = { ...g, fullContentW: g.contentW, fullContentRight: g.contentRight };
+    const rects = [];
+    const canvas = asArray(source.canvas);
+    // 分栏只在版式助手上发生：基础版式页与自由绘制页上的配图都要求显式摆位，
+    // 没有「版心该收多窄」这个问题可算
+    if (!HELPER_KINDS.includes(source.kind)) return { geom, rects };
+    const at = canvas.findIndex((entry) => entry?.type === 'image' && entry?.spec?.split === true);
+    if (at < 0) return { geom, rects };
+    const ratio = Math.min(0.7, Math.max(0.2, asNumber(canvas[at].spec.ratio, CANVAS_IMAGE_SPLIT_RATIO)));
+    const gap = CANVAS_IMAGE_SPLIT_GAP_CM;
+    const boxW = emuToCm(g.contentW);
+    const leftW = Math.max(2, boxW * (1 - ratio) - gap / 2);
+    geom.contentW = cmToEmu(leftW);
+    geom.contentRight = g.margin + geom.contentW;
+    rects[at] = {
+        x: emuToCm(g.margin) + boxW * (1 - ratio) + gap / 2,
+        y: emuToCm(g.bodyY),
+        w: Math.max(1, boxW * ratio - gap / 2),
+        h: emuToCm(g.bodyH),
+    };
+    return { geom, rects };
+}
+
 /** 计数表自增（stats.shapeKinds 与各助手的条目统计共用）。 */
 function bump(map, key, by = 1) {
     map[key] = (map[key] ?? 0) + by;
@@ -2521,6 +2659,45 @@ function cardNeedCm(item, cardW, pal) {
         [CARD_BODY_PT],
     );
     return CARD_CHROME_CM + emuToCm(fit.neededPt * EMU_PER_PT);
+}
+
+/** 图标网格每格的固定留白：上 0.3 + 图标与标签间隙 0.18 + 标签与说明间隙 0.08 + 下 0.25。 */
+const ICON_CELL_CHROME_CM = 0.81;
+/** 图标网格格高的下限（厘米）：低于此值图标与标签会挤在一起，读者失去层次。 */
+const ICON_CELL_MIN_CM = 2.0;
+/** 图标网格说明文字的基准字号：内容自适应高度时按它量，放不下仍走原来的字号阶梯。 */
+const ICON_CELL_BODY_PT = 11;
+/** 时间线节点的基准字号（与字号阶梯的首项一致）：内容自适应高度时按它量。 */
+const TIMELINE_TEXT_PT = 12;
+/** 时间线相邻节点之间的最小间距（厘米）：再挤下去节点圆与文字会叠在一起。 */
+const TIMELINE_MIN_SLOT_CM = 1.6;
+/** 时间线一个节点的文字块之外要留的余量（厘米）：上下各 0.2 强，节点圆 0.44 高。 */
+const TIMELINE_SLOT_PAD_CM = 0.45;
+
+/**
+ * 一个图标网格格子「内容需要多高」（厘米）。
+ *
+ * 与卡片同源的问题（历史遗留 `3-2`）：格高过去只由版心与行数决定，
+ * 三列两行只有图标与标签时每格仍分到 7cm，整块上下各空出一大片。
+ * 这里按「固定头部 + 说明在基准字号下真实需要的高度」算下限，
+ * 让格子跟着内容走，整块再在版心内垂直居中。
+ *
+ * @param {{body?: unknown}} item 格子数据
+ * @param {number} cellW 格宽（厘米）
+ * @param {{muted: string}} pal 主题色板
+ * @param {{iconSize: number, labelH: number}} opts 图标边长与标签高度（厘米）
+ */
+function iconCellNeedCm(item, cellW, pal, opts) {
+    const body = asString(item.body);
+    const chrome = ICON_CELL_CHROME_CM + opts.iconSize + opts.labelH;
+    if (body === '') return chrome;
+    const fit = fitParas(
+        (size) => [{ text: body, sizePt: size, color: pal.muted, align: 'ctr', lineSpacing: 1.3 }],
+        cmToEmu(Math.max(1, cellW - 0.3)),
+        cmToEmu(200),   // 只量「需要多高」，不给上限
+        [ICON_CELL_BODY_PT],
+    );
+    return chrome + emuToCm(fit.neededPt * EMU_PER_PT);
 }
 
 /**
@@ -3182,6 +3359,36 @@ function renderImageText(sink, ctx, data) {
  * 时间线（deck.timeline）：一条轴线 + 等距节点圆 + 上下交错的时间/标题/正文。
  * 交错是为了让相邻节点在纵向上不打架：横向 n 个节点平分版心宽，每格已经很窄了。
  */
+/** 时间线一个节点的三段文字（时间 / 标题 / 正文）：量高度与真正落盘共用同一份。 */
+function timelineParasOf(item, size, pal) {
+    return [
+        { text: asString(item.time), sizePt: Math.max(9, size - 1), bold: true, color: pal.accent, lineSpacing: 1.15, align: 'l' },
+        { text: asString(item.title), sizePt: size + 1, bold: true, color: pal.text, lineSpacing: 1.15, align: 'l', spaceBeforePt: 3 },
+        { text: asString(item.body), sizePt: Math.max(9, size - 1), color: pal.muted, lineSpacing: 1.3, align: 'l', spaceBeforePt: 3 },
+    ];
+}
+
+/**
+ * 纵向时间线：一个节点在基准字号下真正需要多高（厘米）。
+ *
+ * 与卡片 / 图标网格同源的问题（历史遗留 `3-2`）：节点间距过去一律 = 版心高 / 节点数，
+ * 两个节点时会拉出一根 14cm 长的轴线、中间一大片空。这里按内容量算间距，
+ * 量出来的总高不超过版心时整块在版心内垂直居中，超过才退回「贯穿版心」。
+ *
+ * @param {{time?: unknown, title?: unknown, body?: unknown}} item 节点数据
+ * @param {number} blockW 文字块宽度（厘米）
+ * @param {{accent: string, text: string, muted: string}} pal 主题色板
+ */
+function timelineTextNeedCm(item, blockW, pal) {
+    const fit = fitParas(
+        (size) => timelineParasOf(item, size, pal),
+        cmToEmu(Math.max(1, blockW)),
+        cmToEmu(200),   // 只量「需要多高」，不给上限
+        [TIMELINE_TEXT_PT],
+    );
+    return emuToCm(fit.neededPt * EMU_PER_PT);
+}
+
 function renderTimeline(sink, ctx, data) {
     const { pal } = ctx;
     const box = contentBox(ctx);
@@ -3203,11 +3410,8 @@ function renderTimeline(sink, ctx, data) {
         return info;
     }
     const d = 0.44;
-    const parasOf = (item, size) => [
-        { text: asString(item.time), sizePt: Math.max(9, size - 1), bold: true, color: pal.accent, lineSpacing: 1.15, align: 'l' },
-        { text: asString(item.title), sizePt: size + 1, bold: true, color: pal.text, lineSpacing: 1.15, align: 'l', spaceBeforePt: 3 },
-        { text: asString(item.body), sizePt: Math.max(9, size - 1), color: pal.muted, lineSpacing: 1.3, align: 'l', spaceBeforePt: 3 },
-    ];
+    // 三段文字的样式只有一处定义：量高度与落盘都走 timelineParasOf
+    const parasOf = (item, size) => timelineParasOf(item, size, pal);
     if (direction === 'horizontal') {
         const slot = box.w / items.length;
         info.slot = slot;
@@ -3258,10 +3462,25 @@ function renderTimeline(sink, ctx, data) {
         return info;
     }
     const axisX = box.x + 2.4;
-    const slot = box.h / items.length;
+    const blockX = axisX + 0.8;
+    const blockW = Math.max(1, box.x + box.w - blockX);
+    // 轴线长度跟着内容走（3-2）：不超过版心时整块在版心内垂直居中，超过才贯穿版心。
+    // 槽高取**各节点需要的最大值**（与 cardGrid 同一口径），不是均值 ——
+    // 均值会让「一个重节点 + 一个轻节点」里的重节点拿不到自己需要的高度：
+    // 复核实测 500 字节点会从 12pt 无告警退化成 9pt + 「放不下」（旧公式反而够用）。
+    // 取最大值后：内容轻时整块收高居中，内容重到装不下时退回版心均分（与旧行为一致，只会更宽裕）。
+    const needs = items.map((item) => Math.max(
+        TIMELINE_MIN_SLOT_CM,
+        timelineTextNeedCm(item, blockW, pal) + TIMELINE_SLOT_PAD_CM,
+    ));
+    const slot = Math.min(box.h / items.length, Math.max(...needs));
+    const usedH = slot * items.length;
+    const startY = box.y + (box.h - usedH) / 2;
     info.slot = slot;
+    info.usedH = usedH;
+    info.startY = startY;
     addLineShape(sink, ctx, {
-        from: [axisX, box.y], to: [axisX, box.y + box.h],
+        from: [axisX, startY], to: [axisX, startY + usedH],
         color: pal.border, widthPt: 1.5, name: 'Timeline Axis',
     });
     info.shapes += 1;
@@ -3271,7 +3490,7 @@ function renderTimeline(sink, ctx, data) {
         ctx.notes.push(`第 ${ctx.page} 页 timeline：${items.length} 个节点纵向排布每格只有 ${cm1(slot)}cm 高，建议分页`);
     }
     items.forEach((item, index) => {
-        const nodeY = box.y + slot * (index + 0.5);
+        const nodeY = startY + slot * (index + 0.5);
         addAutoShape(sink, ctx, {
             preset: 'ellipse', name: `Timeline Node ${index + 1}`,
             x: axisX - d / 2, y: nodeY - d / 2, w: d, h: d,
@@ -3279,8 +3498,6 @@ function renderTimeline(sink, ctx, data) {
         });
         info.shapes += 1;
         bump(info.kinds, 'ellipse');
-        const blockX = axisX + 0.8;
-        const blockW = Math.max(1, box.x + box.w - blockX);
         const blockH = Math.max(0.6, slot - 0.2);
         const blockY = nodeY - blockH / 2;
         const fit = fitParas(
@@ -3313,30 +3530,49 @@ function renderIconGrid(sink, ctx, data) {
     addContentChrome(sink, ctx, data.title);
     const items = helperItems(data.items);
     const columns = helperColumns(data.columns, 3, ctx, [1, 2, 3, 4, 5, 6]);
-    const gap = Math.max(0.2, asNumber(data.gapCm, 0.6));
+    // 间隙先钳一次：gapCm 没有上限时（既有边界，分栏让窄版心更容易命中）格宽会被压到 0，
+    // 标签与说明的文本框宽度变成负数、被 shapeProps 钳到 1 EMU —— 文字直接看不见且不告警。
+    // 留够每格 1.5cm 的可用宽度，超出就钳回来并如实报一句。
+    const wantedGap = Math.max(0.2, asNumber(data.gapCm, 0.6));
+    const gapMax = columns > 1 ? Math.max(0.2, (box.w - columns * 1.5) / (columns - 1)) : wantedGap;
+    const gap = Math.min(wantedGap, gapMax);
+    if (gap < wantedGap) {
+        ctx.notes.push(`第 ${ctx.page} 页 iconGrid 的 gapCm ${cm1(wantedGap)}cm 太大`
+            + `（${columns} 列排进 ${cm1(box.w)}cm 的版心会把格子压没），已按 ${cm1(gap)}cm 处理`);
+    }
     const iconSize = Math.max(0.4, asNumber(data.iconSizeCm, 1.1));
     const rows = Math.max(1, Math.ceil(items.length / columns));
     const cellW = (box.w - gap * (columns - 1)) / columns;
-    const cellH = (box.h - gap * (rows - 1)) / rows;
+    const labelH = 0.8;
+    // 格高跟着内容走（3-2）：先按格宽量出每格需要多高，再让整块按它收高并垂直居中。
+    // 量不出来（没有格子）或量出来比均分高度还高时仍按均分高度，行为与从前一致。
+    const fillH = (box.h - gap * (rows - 1)) / rows;
+    const needH = items.length === 0
+        ? undefined
+        : Math.max(...items.map((item) => iconCellNeedCm(item, cellW, pal, { iconSize, labelH })));
+    // 内容下限只用来「抬」太矮的格子，绝不能超过均分高度 ——
+    // 否则格子会互相压住、整块溢出页面（与 cardGrid 同一个口径：上限永远是 fillH）
+    const cellH = needH === undefined ? fillH : Math.min(fillH, Math.max(ICON_CELL_MIN_CM, needH));
+    const usedH = cellH * rows + gap * (rows - 1);
+    const offsetY = Math.max(0, (box.h - usedH) / 2);
     const info = {
         title: asString(data.title), count: items.length, columns, rows,
-        kinds: {}, shapes: 0, icons: 0, cellW, cellH,
+        kinds: {}, shapes: 0, icons: 0, cellW, cellH, fillH, offsetY,
     };
     if (items.length === 0) {
         ctx.notes.push(`第 ${ctx.page} 页 iconGrid 没有任何图标，该页只有标题`);
         return info;
     }
-    const dense = cellH < 2.0;
+    const dense = cellH < ICON_CELL_MIN_CM;
     if (dense) {
         ctx.notes.push(`第 ${ctx.page} 页 iconGrid：${items.length} 个图标排成 ${columns}×${rows}，`
             + `每格只有 ${cm1(cellH)}cm 高，建议减少图标或分页`);
     }
-    const labelH = 0.8;
     items.forEach((item, index) => {
         const col = index % columns;
         const row = Math.floor(index / columns);
         const x = box.x + col * (cellW + gap);
-        const y = box.y + row * (cellH + gap);
+        const y = box.y + offsetY + row * (cellH + gap);
         const name = `IconGrid ${index + 1}`;
         const accent = cycleAccent(pal, index);
         const drawn = addIconShape(sink, ctx, {
@@ -3381,6 +3617,538 @@ function renderIconGrid(sink, ctx, data) {
     return info;
 }
 
+/**
+ * 目录页（deck.agenda）：编号条目纵向排列，当前章节高亮。
+ * 每行 = 圆角条 + 序号圆（numbered:false 时改画左侧强调竖条）+ 标题（+ 可选说明）。
+ * active 的那一行整行换成强调色、文字取反色；只认第一条 active —— 多条高亮等于没有高亮。
+ */
+function renderAgenda(sink, ctx, data) {
+    const { pal } = ctx;
+    const box = contentBox(ctx);
+    addContentChrome(sink, ctx, data.title);
+    const items = helperItems(data.items).map((item) => ({
+        text: asString(item.text ?? item.title),
+        runs: asArray(item.runs),
+        desc: asString(item.desc ?? item.body),
+        active: item.active === true,
+    }));
+    // 顶层 active（1 起的序号）是给「只标当前章节」这种最常见写法的快捷方式
+    if (!items.some((item) => item.active) && Number.isInteger(data.active) && data.active > 0
+        && data.active <= items.length) {
+        items[data.active - 1].active = true;
+    }
+    const numbered = data.numbered !== false;
+    const gap = Math.max(0.1, asNumber(data.gapCm, 0.28));
+    const rows = Math.max(1, items.length);
+    const fillH = (box.h - gap * (rows - 1)) / rows;
+    // 行高上限 2.4cm：条目少时不要拉成一排空荡荡的色带，整块垂直居中
+    const rowH = Math.min(2.4, fillH);
+    const usedH = rowH * rows + gap * (rows - 1);
+    const offsetY = Math.max(0, (box.h - usedH) / 2);
+    const activeAt = items.findIndex((item) => item.active);
+    const info = {
+        title: asString(data.title), count: items.length, rows, numbered, rowH,
+        active: activeAt < 0 ? 0 : activeAt + 1, kinds: {}, shapes: 0,
+    };
+    if (items.length === 0) {
+        ctx.notes.push(`第 ${ctx.page} 页 agenda 没有任何条目，该页只有标题`);
+        return info;
+    }
+    if (rows > 10 || rowH < 1.05) {
+        ctx.notes.push(`第 ${ctx.page} 页 agenda：${items.length} 条按版心高 ${cm1(box.h)}cm 排成 ${rows} 行，`
+            + `每行只有 ${cm1(rowH)}cm 高，建议精简到 10 条以内或拆成两页`);
+    }
+    if (activeAt < 0) {
+        // 目录没有「当前章节」是合法状态，但要让调用方知道没有行被高亮
+        ctx.notes.push(`第 ${ctx.page} 页 agenda 没有标记 active 的条目，全部按普通条目排版`);
+    }
+    items.forEach((item, index) => {
+        const y = box.y + offsetY + index * (rowH + gap);
+        const active = index === activeAt;
+        const accent = active ? pal.accent : cycleAccent(pal, index);
+        const name = `Agenda Row ${index + 1}`;
+        addCardBox(sink, ctx, {
+            name,
+            x: box.x, y, w: box.w, h: rowH,
+            fill: active ? accent : helperCardFill(data.cardFill, ctx),
+            line: active ? accent : helperCardLine(data.cardLine, ctx),
+            radius: 0.16,
+        });
+        info.shapes += 1;
+        bump(info.kinds, 'roundRect');
+        const pad = 0.42;
+        let textX = box.x + pad;
+        if (numbered) {
+            const d = Math.max(0.5, Math.min(0.82, rowH - 0.46));
+            addAutoShape(sink, ctx, {
+                preset: 'ellipse', name: `${name} Badge`,
+                x: box.x + pad, y: y + (rowH - d) / 2, w: d, h: d,
+                // 素色主题的 surface 是 FFFFFF，而本引擎把 FFFFFF 当「不填充」：
+                // 直接写会把圆整个变透明、只剩 595959 的序号浮在同样 595959 的
+                // 高亮行上（实测肉眼不可见）。active 行改回落到一档极浅灰。
+                fill: active ? (isBlankFill(pal.surface) ? 'F8FAFC' : pal.surface) : accent,
+                text: String(index + 1),
+                textOpts: {
+                    size: Math.max(9, Math.round(d * 15)), bold: true,
+                    color: active ? accent : onColorText(accent), align: 'ctr', anchor: 'ctr',
+                },
+            });
+            info.shapes += 1;
+            bump(info.kinds, 'ellipse');
+            textX = box.x + pad + d + 0.34;
+        } else {
+            // 不编号时用左侧一条竖色条建立节奏：既省掉序号圆，也保住「一条条」的视觉
+            addRect(sink, {
+                name: `${name} Mark`,
+                x: cmToEmu(box.x + pad), y: cmToEmu(y + 0.18),
+                w: cmToEmu(0.1), h: cmToEmu(Math.max(0.3, rowH - 0.36)),
+                fill: accent,
+            });
+        }
+        const textW = Math.max(2, box.w - (textX - box.x) - 0.5);
+        const textH = Math.max(0.4, rowH - (item.desc === '' ? 0.32 : 0.26));
+        const color = active ? onColorText(accent) : pal.text;
+        const descColor = active ? onColorText(accent) : pal.muted;
+        const fit = fitParas(
+            (size) => {
+                const paras = [{
+                    text: item.text, runs: item.runs, sizePt: size, bold: true,
+                    color, lineSpacing: 1.12,
+                }];
+                if (item.desc !== '') {
+                    paras.push({
+                        text: item.desc, sizePt: Math.max(9, Math.round(size * 0.62)),
+                        color: descColor, lineSpacing: 1.2, spaceBeforePt: 4,
+                    });
+                }
+                return paras;
+            },
+            cmToEmu(textW),
+            cmToEmu(textH),
+            [22, 20, 19, 18, 17, 16, 15, 14, 13],
+        );
+        addText(sink, ctx, {
+            x: cmToEmu(textX), y: cmToEmu(y + 0.11), w: cmToEmu(textW), h: cmToEmu(textH),
+            anchor: 'ctr', name: `Agenda Text ${index + 1}`, autofit: false, paras: fit.paras,
+        });
+    });
+    return info;
+}
+
+/**
+ * 图片墙（deck.gallery）：等格图片网 + 图注 + 角标。
+ * 图片一律走 imageText 那套（imageFit / ctx.mediaOf / placeholderBox / mediaBox），
+ * 所以相对路径、缺图占位、DPI 复算与 deck.image 是同一口径，这里不另写解析。
+ */
+function renderGallery(sink, ctx, data) {
+    const { pal } = ctx;
+    const box = contentBox(ctx);
+    addContentChrome(sink, ctx, data.title);
+    const items = asArray(data.items).map((entry) => (
+        entry !== null && typeof entry === 'object' ? entry : { path: asString(entry) }
+    ));
+    const columns = helperColumns(data.columns, 2, ctx, [1, 2, 3]);
+    // gap 与 iconGrid 同口径：没有上限时 3 列窄版心会把格子压到 0 宽，先钳一次并如实报
+    const wantedGap = Math.max(0.2, asNumber(data.gapCm, 0.5));
+    const gapMax = columns > 1 ? Math.max(0.2, (box.w - columns * 3) / (columns - 1)) : wantedGap;
+    const gap = Math.min(wantedGap, gapMax);
+    if (gap < wantedGap) {
+        ctx.notes.push(`第 ${ctx.page} 页 gallery 的 gapCm ${cm1(wantedGap)}cm 太大`
+            + `（${columns} 列排进 ${cm1(box.w)}cm 的版心会把格子压没），已按 ${cm1(gap)}cm 处理`);
+    }
+    const ratioRaw = asNumber(data.ratio, 0.62);
+    const ratio = Math.min(1.5, Math.max(0.2, ratioRaw));
+    if (ratio !== ratioRaw) {
+        ctx.notes.push(`第 ${ctx.page} 页 gallery 的 ratio ${ratioRaw} 超出 0.2~1.5，已按 ${ratio} 处理`);
+    }
+    const fit = imageFit(data.fit, ctx.notes);
+    const rows = Math.max(1, Math.ceil(items.length / columns));
+    const cellW = (box.w - gap * (columns - 1)) / columns;
+    const fillH = (box.h - gap * (rows - 1)) / rows;
+    const hasCaption = items.some((item) => asString(item.caption ?? item.alt) !== '');
+    const captionH = hasCaption ? 0.72 : 0;
+    // 图框高 = 格宽 × ratio（宽高比指的是高/宽），但不能吃穿均分行高
+    const imgH = Math.max(1.0, Math.min(cellW * ratio, fillH - captionH - 0.28));
+    const cellH = imgH + captionH + 0.28;
+    const usedH = cellH * rows + gap * (rows - 1);
+    const offsetY = Math.max(0, (box.h - usedH) / 2);
+    const info = {
+        title: asString(data.title), count: items.length, items: items.length,
+        columns, rows, ratio, fit, cellW, imgH, cellH, images: 0, kinds: {}, shapes: 0,
+    };
+    if (items.length === 0) {
+        ctx.notes.push(`第 ${ctx.page} 页 gallery 没有任何图片，该页只有标题`);
+        return info;
+    }
+    if (cellH > fillH + 0.01 || items.length > 12) {
+        ctx.notes.push(`第 ${ctx.page} 页 gallery：${items.length} 张图按 ${columns} 列排成 ${rows} 行，`
+            + `每格只有 ${cm1(fillH)}cm 高，建议减少图片、调小 ratio 或分页`);
+    }
+    const boxes = [];
+    const noPath = [];
+    items.forEach((item, index) => {
+        const col = index % columns;
+        const row = Math.floor(index / columns);
+        const x = box.x + col * (cellW + gap);
+        const y = box.y + offsetY + row * (cellH + gap);
+        const name = `Gallery Cell ${index + 1}`;
+        // image 允许写成 {path, alt} 对象（与 deck.image 同形），也认 path / src 简写
+        const imageObj = item.image !== null && typeof item.image === 'object' ? item.image : {};
+        const path = asString(imageObj.path ?? item.path ?? item.src ?? item.image);
+        const caption = withCredit(asString(item.caption ?? item.alt), item.source);
+        const badge = asString(item.badge);
+        const accent = cycleAccent(pal, index);
+        addCardBox(sink, ctx, {
+            name, x, y, w: cellW, h: cellH,
+            fill: helperCardFill(data.cardFill, ctx), line: helperCardLine(data.cardLine, ctx), radius: 0.16,
+        });
+        info.shapes += 1;
+        bump(info.kinds, 'roundRect');
+        if (path === '') noPath.push(index + 1);
+        const media = ctx.mediaOf(path);
+        const frameX = x + 0.14;
+        const frameY = y + 0.14;
+        const frameW = Math.max(1, cellW - 0.28);
+        const picBox = placeholderOf(media)
+            ? placeholderBox(cmToEmu(frameX), cmToEmu(frameY), cmToEmu(frameW), cmToEmu(imgH), { ...(media ?? {}), path })
+            : mediaBox(media, { fit, align: 'center', widthCm: 0, heightCm: 0, fullBleed: false }, {
+                x: cmToEmu(frameX), contentW: cmToEmu(frameW), y: cmToEmu(frameY), h: cmToEmu(imgH),
+            }, ctx);
+        // alt 写进图片的替代文字（a:cNvPr descr）：这是 PowerPoint 里「设置替代文字」的同一个位置
+        addPicture(sink, ctx, { ...picBox, name: `${name} Picture`, alt: asString(item.alt ?? imageObj.alt) });
+        boxes.push(picBox);
+        if (badge !== '') {
+            const badgeW = Math.min(Math.max(1.0, cellW - 0.6), Math.max(1.1, 0.3 * badge.length + 0.5));
+            addAutoShape(sink, ctx, {
+                preset: 'roundRect', name: `${name} Badge`,
+                x: x + cellW - badgeW - 0.24, y: y + 0.26, w: badgeW, h: 0.48,
+                fill: accent, radius: 0.18,
+                text: badge,
+                textOpts: { size: 10, bold: true, color: onColorText(accent), align: 'ctr', anchor: 'ctr' },
+            });
+            info.shapes += 1;
+            bump(info.kinds, 'roundRect');
+        }
+        if (caption !== '') {
+            addText(sink, ctx, {
+                x: cmToEmu(x + 0.16), y: cmToEmu(y + 0.14 + imgH + 0.05),
+                w: cmToEmu(Math.max(1, cellW - 0.32)), h: cmToEmu(Math.max(0.3, captionH - 0.06)),
+                anchor: 't', name: `${name} Caption`, autofit: false,
+                paras: [{ text: caption, sizePt: 10, color: pal.muted, align: 'ctr', lineSpacing: 1.2 }],
+            });
+        }
+    });
+    info.images = boxes.length;
+    if (noPath.length > 0) {
+        ctx.notes.push(`第 ${ctx.page} 页 gallery 有 ${noPath.length} 张图片缺少 path（第 ${noPath.join('、')} 张），`
+            + '已画成占位框');
+    }
+    const base = finishImagePage(sink, ctx, { title: asString(data.title), caption: '' }, {
+        boxes, captionAt: null, captionColor: pal.muted, fullBleed: false, fit, grid: true, columns,
+    });
+    return { ...base, ...info };
+}
+
+/**
+ * 阶段路线图（deck.roadmap）：横向 3~5 个阶段卡，每卡 = 强调条 + 阶段名 + 要点 + 可选完成度条。
+ * 阶段多过 5 个时按网格换行（不丢阶段、不抛），并报一条「每列会被压窄」的告警。
+ */
+function renderRoadmap(sink, ctx, data) {
+    const { pal } = ctx;
+    const box = contentBox(ctx);
+    addContentChrome(sink, ctx, data.title);
+    const badProgress = [];
+    const phases = asArray(data.phases).map((entry, index) => {
+        const phase = entry !== null && typeof entry === 'object' ? entry : { label: asString(entry) };
+        const raw = phase.progress === undefined || phase.progress === null ? undefined : asNumber(phase.progress, 0);
+        if (raw !== undefined && (raw < 0 || raw > 1)) badProgress.push(index + 1);
+        return {
+            label: asString(phase.label ?? phase.title),
+            items: asArray(phase.items).map((item) => asString(item)),
+            progress: raw === undefined ? undefined : Math.min(1, Math.max(0, raw)),
+            accent: asString(phase.accent),
+        };
+    });
+    const total = phases.length;
+    const columns = Math.max(1, Math.min(5, total));
+    const rows = Math.max(1, Math.ceil(total / columns));
+    const gap = Math.max(0.25, asNumber(data.gapCm, 0.45));
+    const cellW = (box.w - gap * (columns - 1)) / columns;
+    const cellH = (box.h - gap * (rows - 1)) / rows;
+    const info = {
+        title: asString(data.title), count: total, columns, rows, phases: phases.map((phase) => phase.label),
+        kinds: {}, shapes: 0,
+    };
+    if (total === 0) {
+        ctx.notes.push(`第 ${ctx.page} 页 roadmap 没有任何阶段，该页只有标题`);
+        return info;
+    }
+    if (badProgress.length > 0) {
+        ctx.notes.push(`第 ${ctx.page} 页 roadmap 有 ${badProgress.length} 个阶段的 progress 超出 0~1`
+            + `（第 ${badProgress.join('、')} 个），已钳到边界`);
+    }
+    if (total > 5) {
+        ctx.notes.push(`第 ${ctx.page} 页 roadmap：${total} 个阶段排成 ${columns} 列 ${rows} 行，`
+            + `每列只有 ${cm1(cellW)}cm 宽，建议精简到 3~5 个阶段或拆成多页`);
+    }
+    if (cellH < 3) {
+        ctx.notes.push(`第 ${ctx.page} 页 roadmap：${total} 个阶段每格只有 ${cm1(cellH)}cm 高，`
+            + '建议减少每阶段要点或拆成两页');
+    }
+    let overflowed = 0;
+    phases.forEach((phase, index) => {
+        const col = index % columns;
+        const row = Math.floor(index / columns);
+        const x = box.x + col * (cellW + gap);
+        const y = box.y + row * (cellH + gap);
+        const name = `Roadmap Phase ${index + 1}`;
+        const accent = phase.accent === '' ? cycleAccent(pal, index) : phase.accent;
+        addCardBox(sink, ctx, {
+            name, x, y, w: cellW, h: cellH,
+            fill: helperCardFill(data.cardFill, ctx), line: helperCardLine(data.cardLine, ctx), radius: 0.2,
+        });
+        info.shapes += 1;
+        bump(info.kinds, 'roundRect');
+        // 顶部强调条：不依赖颜色也能看出「一阶段一卡」的分段
+        addRect(sink, {
+            name: `${name} Strip`,
+            x: cmToEmu(x + 0.28), y: cmToEmu(y + 0.3),
+            w: cmToEmu(Math.max(0.5, cellW - 0.56)), h: cmToEmu(0.1), fill: accent,
+        });
+        const badgeD = 0.72;
+        addAutoShape(sink, ctx, {
+            preset: 'ellipse', name: `${name} Badge`,
+            x: x + 0.28, y: y + 0.56, w: badgeD, h: badgeD,
+            fill: accent, text: String(index + 1),
+            textOpts: { size: 11, bold: true, color: onColorText(accent), align: 'ctr', anchor: 'ctr' },
+        });
+        info.shapes += 1;
+        bump(info.kinds, 'ellipse');
+        const labelFit = fitTitle(phase.label, cmToEmu(Math.max(1, cellW - 1.6)), cmToEmu(0.9), [19, 17, 16, 15, 14, 13]);
+        addText(sink, ctx, {
+            x: cmToEmu(x + 1.16), y: cmToEmu(y + 0.58), w: cmToEmu(Math.max(1, cellW - 1.44)), h: cmToEmu(0.9),
+            anchor: 'ctr', name: `${name} Label`, autofit: false,
+            paras: [{ text: phase.label, sizePt: labelFit.sizePt, bold: true, color: pal.text, lineSpacing: 1.1 }],
+        });
+        const progressH = phase.progress === undefined ? 0 : 0.95;
+        const bodyY = y + 1.56;
+        const bodyH = Math.max(0.4, y + cellH - 0.32 - progressH - bodyY);
+        const bullets = phase.items;
+        if (bullets.length > 0) {
+            const fit = fitParas(
+                (size) => bullets.map((text) => ({
+                    text, sizePt: size, color: pal.muted, lineSpacing: 1.28,
+                    marL: cmToEmu(0.38), indent: -cmToEmu(0.38),
+                    bullet: '•', bulletColor: accent, spaceBeforePt: 3,
+                })),
+                cmToEmu(Math.max(1, cellW - 0.72)),
+                cmToEmu(bodyH),
+                [13, 12, 11, 10.5, 10, 9.5, 9],
+            );
+            if (!fit.fits) overflowed += 1;
+            addText(sink, ctx, {
+                x: cmToEmu(x + 0.34), y: cmToEmu(bodyY), w: cmToEmu(Math.max(1, cellW - 0.72)), h: cmToEmu(bodyH),
+                anchor: 't', name: `${name} Items`, autofit: false, paras: fit.paras,
+            });
+        }
+        if (phase.progress !== undefined) {
+            const trackW = Math.max(1, cellW - 1.66);
+            const trackY = y + cellH - 0.78;
+            const trackX = x + 0.34;
+            addRect(sink, {
+                name: `${name} Progress Track`,
+                x: cmToEmu(trackX), y: cmToEmu(trackY), w: cmToEmu(trackW), h: cmToEmu(0.24),
+                fill: pal.band,
+            });
+            if (phase.progress > 0) {
+                addRect(sink, {
+                    name: `${name} Progress Fill`,
+                    x: cmToEmu(trackX), y: cmToEmu(trackY),
+                    w: cmToEmu(trackW * phase.progress), h: cmToEmu(0.24), fill: accent,
+                });
+            }
+            addText(sink, ctx, {
+                x: cmToEmu(trackX + trackW + 0.16), y: cmToEmu(trackY - 0.13), w: cmToEmu(0.95), h: cmToEmu(0.5),
+                anchor: 'ctr', name: `${name} Progress Text`, autofit: false,
+                paras: [{
+                    text: `${Math.round(phase.progress * 100)}%`, sizePt: 10, bold: true,
+                    color: accent, align: 'r', lineSpacing: 1,
+                }],
+            });
+        }
+        if (rows === 1 && index < total - 1) {
+            addLineShape(sink, ctx, {
+                from: [x + cellW + 0.06, y + cellH / 2],
+                to: [x + cellW + gap - 0.06, y + cellH / 2],
+                color: pal.subtle, widthPt: 1.25, arrow: 'end',
+                name: `Roadmap Arrow ${index + 1}`,
+            });
+            info.shapes += 1;
+            bump(info.kinds, 'line');
+        }
+    });
+    if (overflowed > 0) {
+        ctx.notes.push(`第 ${ctx.page} 页 roadmap 有 ${overflowed} 个阶段的要点放不下，已压到最小 9pt，`
+            + '建议精简每阶段要点');
+    }
+    return info;
+}
+
+/**
+ * 2×2 矩阵（deck.matrix）：四象限 + 两条中线 + 轴标签 + 归一化坐标点。
+ * x/y 是 0~1（原点左下），越界与缺坐标都只钳制 + 汇总一条告警，不抛。
+ */
+function renderMatrix(sink, ctx, data) {
+    const { pal } = ctx;
+    const box = contentBox(ctx);
+    addContentChrome(sink, ctx, data.title);
+    const axisOf = (raw, fallback) => {
+        const value = raw !== null && typeof raw === 'object' ? raw : {};
+        return { low: asString(value.low, fallback[0]), high: asString(value.high, fallback[1]) };
+    };
+    const xAxis = axisOf(data.xAxis, ['低', '高']);
+    const yAxis = axisOf(data.yAxis, ['低', '高']);
+    const items = helperItems(data.items).map((item) => ({
+        x: item.x === undefined || item.x === null ? undefined : asNumber(item.x, 0),
+        y: item.y === undefined || item.y === null ? undefined : asNumber(item.y, 0),
+        text: asString(item.text ?? item.title),
+        desc: asString(item.desc ?? item.body),
+    }));
+    const gutter = 2.1;
+    const plot = {
+        x: box.x + gutter, y: box.y + 0.15,
+        w: box.w - gutter - 0.25, h: box.h - 0.8 - 0.15,
+    };
+    const midX = plot.x + plot.w / 2;
+    const midY = plot.y + plot.h / 2;
+    const info = {
+        title: asString(data.title), count: items.length, points: items.length,
+        xAxis, yAxis, quadrants: 4, kinds: {}, shapes: 0,
+    };
+    // 四个象限：交替两档极浅底，点落在哪一格一眼能看出来（不靠颜色也靠中线分界）
+    const fills = [
+        { color: pal.band, alpha: 55 },
+        undefined,
+        undefined,
+        { color: pal.band, alpha: 35 },
+    ];
+    const quads = [
+        { x: plot.x, y: plot.y },
+        { x: midX, y: plot.y },
+        { x: plot.x, y: midY },
+        { x: midX, y: midY },
+    ];
+    quads.forEach((quad, index) => {
+        addRect(sink, {
+            name: `Matrix Quadrant ${index + 1}`,
+            x: cmToEmu(quad.x), y: cmToEmu(quad.y),
+            w: cmToEmu(plot.w / 2), h: cmToEmu(plot.h / 2),
+            fill: fills[index],
+        });
+    });
+    addLineShape(sink, ctx, {
+        from: [midX, plot.y], to: [midX, plot.y + plot.h],
+        color: pal.border, widthPt: 1, name: 'Matrix Axis Vertical',
+    });
+    addLineShape(sink, ctx, {
+        from: [plot.x, midY], to: [plot.x + plot.w, midY],
+        color: pal.border, widthPt: 1, name: 'Matrix Axis Horizontal',
+    });
+    info.shapes += 2;
+    bump(info.kinds, 'line');
+    addAutoShape(sink, ctx, {
+        preset: 'rect', name: 'Matrix Frame',
+        x: plot.x, y: plot.y, w: plot.w, h: plot.h,
+        fill: 'none', line: { color: pal.border, widthPt: 1 },
+    });
+    // 轴标签：x 轴在画面下缘（low 左 / high 右），y 轴在左侧留白（low 底 / high 顶）
+    addText(sink, ctx, {
+        x: cmToEmu(plot.x), y: cmToEmu(plot.y + plot.h + 0.06), w: cmToEmu(plot.w / 2 - 0.2), h: cmToEmu(0.55),
+        anchor: 'ctr', name: 'Matrix XAxis Low', autofit: false,
+        paras: [{ text: xAxis.low, sizePt: 10.5, color: pal.muted, align: 'l', lineSpacing: 1 }],
+    });
+    addText(sink, ctx, {
+        x: cmToEmu(midX + 0.2), y: cmToEmu(plot.y + plot.h + 0.06), w: cmToEmu(plot.w / 2 - 0.3), h: cmToEmu(0.55),
+        anchor: 'ctr', name: 'Matrix XAxis High', autofit: false,
+        paras: [{ text: xAxis.high, sizePt: 10.5, color: pal.muted, align: 'r', lineSpacing: 1 }],
+    });
+    addText(sink, ctx, {
+        x: cmToEmu(box.x), y: cmToEmu(plot.y - 0.08), w: cmToEmu(gutter - 0.25), h: cmToEmu(0.55),
+        anchor: 'ctr', name: 'Matrix YAxis High', autofit: false,
+        paras: [{ text: yAxis.high, sizePt: 10.5, color: pal.muted, align: 'r', lineSpacing: 1 }],
+    });
+    addText(sink, ctx, {
+        x: cmToEmu(box.x), y: cmToEmu(plot.y + plot.h - 0.47), w: cmToEmu(gutter - 0.25), h: cmToEmu(0.55),
+        anchor: 'ctr', name: 'Matrix YAxis Low', autofit: false,
+        paras: [{ text: yAxis.low, sizePt: 10.5, color: pal.muted, align: 'r', lineSpacing: 1 }],
+    });
+    if (items.length === 0) {
+        ctx.notes.push(`第 ${ctx.page} 页 matrix 没有任何坐标点，该页只有坐标轴`);
+        return info;
+    }
+    const badCoord = [];
+    const outOfRange = [];
+    if (items.length > 12) {
+        ctx.notes.push(`第 ${ctx.page} 页 matrix 有 ${items.length} 个坐标点，标签容易互相压住，建议减到 12 个以内`);
+    }
+    const dotD = 0.34;
+    const clamps = { min: 0, max: 1 };
+    const clamp01 = (value) => Math.min(clamps.max, Math.max(clamps.min, value));
+    items.forEach((item, index) => {
+        let { x, y } = item;
+        let clamped = false;
+        if (x === undefined || y === undefined) {
+            badCoord.push(index + 1);
+            x = 0;
+            y = 0;
+            clamped = true;
+        } else {
+            if (!(x >= 0 && x <= 1) || !(y >= 0 && y <= 1)) clamped = true;
+            x = clamp01(x);
+            y = clamp01(y);
+        }
+        if (clamped && !badCoord.includes(index + 1)) outOfRange.push(index + 1);
+        const px = plot.x + x * plot.w;
+        const py = plot.y + (1 - y) * plot.h;
+        const accent = cycleAccent(pal, index);
+        const name = `Matrix Point ${index + 1}`;
+        addAutoShape(sink, ctx, {
+            preset: 'ellipse', name,
+            x: px - dotD / 2, y: py - dotD / 2, w: dotD, h: dotD,
+            fill: accent, line: { color: 'FFFFFF', widthPt: 1.25 },
+        });
+        info.shapes += 1;
+        bump(info.kinds, 'ellipse');
+        const text = item.text;
+        const desc = item.desc;
+        if (text === '' && desc === '') return;
+        const labelW = Math.min(6.4, plot.w * 0.32);
+        const labelH = desc === '' ? 0.55 : 1.02;
+        // 靠右的点把标签放到点的左侧、靠上的点往下放：标签不越出绘图区
+        let labelX = px + 0.3;
+        if (labelX + labelW > plot.x + plot.w) labelX = px - 0.3 - labelW;
+        let labelY = py - labelH / 2;
+        labelY = Math.min(plot.y + plot.h - labelH, Math.max(plot.y, labelY));
+        const paras = [{ text, sizePt: desc === '' ? 11.5 : 12, bold: true, color: pal.text, lineSpacing: 1.15 }];
+        if (desc !== '') {
+            paras.push({ text: desc, sizePt: 9.5, color: pal.muted, lineSpacing: 1.2, spaceBeforePt: 2 });
+        }
+        addText(sink, ctx, {
+            x: cmToEmu(labelX), y: cmToEmu(labelY), w: cmToEmu(labelW), h: cmToEmu(labelH),
+            anchor: 'ctr', name: `${name} Text`, autofit: false, paras,
+        });
+    });
+    if (badCoord.length > 0) {
+        ctx.notes.push(`第 ${ctx.page} 页 matrix 有 ${badCoord.length} 个点缺少 x/y 坐标`
+            + `（第 ${badCoord.join('、')} 个），已按左下角 (0, 0) 处理`);
+    }
+    if (outOfRange.length > 0) {
+        ctx.notes.push(`第 ${ctx.page} 页 matrix 有 ${outOfRange.length} 个点的坐标超出 0~1`
+            + `（第 ${outOfRange.join('、')} 个），已钳到边界`);
+    }
+    return info;
+}
+
 /** 助手 kind → 渲染函数。compile() 的派发与 outline/stats 用的是同一个名单。 */
 const HELPER_RENDERERS = {
     cards: renderCards,
@@ -3390,6 +4158,10 @@ const HELPER_RENDERERS = {
     imageText: renderImageText,
     timeline: renderTimeline,
     iconGrid: renderIconGrid,
+    agenda: renderAgenda,
+    gallery: renderGallery,
+    roadmap: renderRoadmap,
+    matrix: renderMatrix,
 };
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -3547,16 +4319,127 @@ function addBanner(sink, ctx, spec) {
 // ───────────────────────────────────────────────────────────────────────────
 
 /**
+ * 画布配图（第五十二轮 `新-6`）：把一张图放进「宿主页」的一栏里，与版式共存。
+ *
+ * 矩形来源三选一（优先级从高到低）：
+ * 1. 调用方给的 `x/y/w/h`（厘米）—— 完全按给的画，越界照旧进 warnings；
+ * 2. `plan` —— 分栏算出来的那一栏（见 planPageGeometry）；
+ * 3. 版心整块 —— 自由绘制页上没给摆位时的兜底。
+ *
+ * 与「单图版式」（renderImage）的分工：这里不画标题带、不接管整页，只画图 + 题注，
+ * 所以它能叠在 cards / bullets 这些版式页上。图片照旧进 stats.images（与 read() 数 p:pic 口径一致）。
+ *
+ * 与单图页同一套尺寸规则：`widthCm` / `heightCm` 照收（只给一个时按原图纵横比推另一个，
+ * 超出可用区域整体缩小并告警），`fit` 的裁切与 DPI 也都报回生成端 —— 否则
+ * `save()` 与 `read()` 对同一份文件会给出两个数（复核实测过）。
+ *
+ * @returns {{x: number, y: number, w: number, h: number, caption: string, missing: boolean,
+ *   unsupported: boolean, cropped: boolean, dpi: number, widthCm: number, heightCm: number,
+ *   path: string}}
+ */
+function addCanvasImage(sink, ctx, spec, plan) {
+    const { pal } = ctx;
+    // 默认框用**整幅版心**：分栏页上的版心已经收窄成左栏，拿它当默认会让
+    // 「只给 x」的配图变成一条左栏宽的带子（复核实测会盖住卡片）
+    const box = contentBox(ctx);
+    const full = {
+        x: box.x,
+        y: box.y,
+        w: emuToCm(ctx.g.fullContentW ?? ctx.g.contentW),
+        h: box.h,
+    };
+    const given = (key) => spec[key] !== undefined && spec[key] !== null;
+    const explicit = ['x', 'y', 'w', 'h'].some(given);
+    let x;
+    let y;
+    let w;
+    let h;
+    if (explicit) {
+        x = asNumber(spec.x, full.x);
+        y = asNumber(spec.y, full.y);
+        w = Math.max(0.5, asNumber(spec.w, full.w));
+        h = Math.max(0.5, asNumber(spec.h, full.h));
+    } else if (plan !== undefined) {
+        ({ x, y, w, h } = plan);
+    } else {
+        ({ x, y, w, h } = full);
+    }
+    warnOffPage(ctx, 'image', x, y, w, h);
+    // 与版式同页的配图没有标题带（标题带是整页版式的构件）：给了 title 就如实说清去哪了，
+    // 静默丢掉一个调用方明确写下的字段是最难排查的一类「没生效」
+    if (asString(spec.title) !== '') {
+        ctx.notes.push(`第 ${ctx.page} 页的配图与版式同页，image 的 title「${asString(spec.title)}」`
+            + '只在一张图独占一页时生效，已忽略；要与版式同页又要标题，请改用 deck.imageText 或页内形状');
+    }
+    const caption = asString(spec.caption);
+    // 题注高度按栏高取一档，最高 1.1cm：窄栏里用固定 1cm 会把图挤得太小
+    const captionH = caption === '' ? 0 : Math.min(1.1, Math.max(0.6, h * 0.16));
+    const areaH = Math.max(0.6, h - captionH - (captionH === 0 ? 0 : 0.18));
+    const media = ctx.mediaOf(asString(spec.path));
+    const frame = { x: cmToEmu(x), y: cmToEmu(y), contentW: cmToEmu(w), h: cmToEmu(areaH) };
+    const boxSpec = {
+        fit: imageFit(spec.fit, ctx.notes),
+        align: imageAlign(spec.align, ctx.notes),
+        // 显式尺寸照收（只给一个时 layoutImage 按纵横比推另一个）
+        widthCm: asNumber(spec.widthCm, 0),
+        heightCm: asNumber(spec.heightCm, 0),
+        fullBleed: false,
+    };
+    const drawn = placeholderOf(media)
+        ? placeholderBox(frame.x, frame.y, frame.contentW, frame.h, media)
+        : mediaBox(media, boxSpec, frame, ctx);
+    // 名字带序号：同页两张配图重名会让 read() 侧按名取几何的探针只看得到第一张
+    addPicture(sink, ctx, {
+        ...drawn,
+        frame: spec.frame === true,
+        name: `Canvas Picture ${sink.imageCount + 1}`,
+    });
+    if (caption !== '') {
+        addText(sink, ctx, {
+            x: frame.x, y: cmToEmu(y + h - captionH), w: frame.contentW, h: cmToEmu(captionH),
+            anchor: 't', name: 'Caption', autofit: false,
+            paras: [{ text: caption, sizePt: 10, color: pal.muted, align: 'ctr', lineSpacing: 1.2 }],
+        });
+    }
+    // 裁切与 DPI 与单图页同口径（finishImagePage）：生成端不报，read() 一读就会报，
+    // 同一份文件两个数就是报告在说谎
+    const cropped = drawn.crop !== undefined && (drawn.crop.l > 0 || drawn.crop.t > 0);
+    const dpi = placeholderOf(media) || drawn.w <= 0
+        ? 0
+        : Math.round(media.width / ((drawn.w / 360000) / 2.54));
+    return {
+        x, y, w, h, caption,
+        path: asString(spec.path),
+        missing: media?.missing === true,
+        unsupported: media?.unsupported === true,
+        cropped,
+        dpi,
+        widthCm: cm1(drawn.w / 360000),
+        heightCm: cm1(drawn.h / 360000),
+    };
+}
+
+/**
  * 自由绘制页的画布条目。
  * 一页里形状的先后顺序就是图层顺序（先写的在下），因此不排序、不合并，
  * 完全按调用顺序落盘 —— 用户能预期「后画的盖在前面」。
- * 助手页复用这同一个函数画它们的叠加层（cards 之后接着 banner 就是走这里）。
+ * 助手页复用这同一个函数画它们的叠加层（cards 之后接着 banner 就是走这里），
+ * 基础版式页（bullets / table / …）现在也走这里（第五十二轮 `新-6`）。
  */
 function renderCanvasItems(sink, ctx, items) {
     const kinds = {};
     let icons = 0;
     let shapes = 0;
-    for (const entry of items) {
+    let images = 0;
+    let missing = 0;
+    let placeheld = 0;
+    let cropped = 0;
+    let dpi = 0;
+    let widthCm = 0;
+    let heightCm = 0;
+    const missingPaths = [];
+    const plan = asArray(ctx.canvasImageRects);
+    for (const [index, entry] of items.entries()) {
         const spec = entry?.spec ?? {};
         if (entry.type === 'icon') {
             if (addIconShape(sink, ctx, spec) !== undefined) icons += 1;
@@ -3573,13 +4456,33 @@ function renderCanvasItems(sink, ctx, items) {
             addBanner(sink, ctx, spec);
             shapes += 1;
             bump(kinds, 'banner');
+        } else if (entry.type === 'image') {
+            const drawn = addCanvasImage(sink, ctx, spec, plan[index]);
+            images += 1;
+            shapes += 1;
+            if (drawn.missing) {
+                missing += 1;
+                missingPaths.push(drawn.path);
+            }
+            if (drawn.unsupported) placeheld += 1;
+            if (drawn.cropped) cropped += 1;
+            // DPI 取最悲观的一张（要报就报最该被看见的那张）
+            if (drawn.dpi > 0 && (dpi === 0 || drawn.dpi < dpi)) {
+                dpi = drawn.dpi;
+                widthCm = drawn.widthCm;
+                heightCm = drawn.heightCm;
+            }
         } else {
             const drawn = addAutoShape(sink, ctx, spec);
             shapes += 1;
             bump(kinds, drawn.preset);
         }
     }
-    return { items: items.length, shapes, icons, kinds };
+    // 字段名与单图页（finishImagePage）对齐：collectWarnings 那一段才能两条路共用
+    return {
+        items: items.length, shapes, icons, images, kinds,
+        missing, missingPaths, placeheld, cropped, dpi, widthCm, heightCm,
+    };
 }
 
 /** 自由绘制页（deck.shape / line / icon / panel / banner）。 */
@@ -3594,17 +4497,39 @@ function renderShapePage(sink, ctx, data) {
     };
 }
 
-/** 助手页的叠加层：把 items 通道画出来的形状并进助手自己的计数。 */
+/**
+ * 助手页 / 版式页的叠加层：把 items 通道画出来的形状并进这一页自己的计数。
+ *
+ * 图片那几项（missing / placeheld / cropped / dpi / widthCm / heightCm）按「与宿主页自己的
+ * 图合并」处理，而不是覆盖：`imageText` 这一页本来就带一套（finishImagePage 给的），
+ * 直接覆盖会把宿主自己的图从告警里抹掉。
+ */
 function mergeCanvasInfo(info, extra) {
     const kinds = { ...(info.kinds ?? {}) };
     for (const [key, count] of Object.entries(extra.kinds)) bump(kinds, key, count);
-    return {
+    const merged = {
         ...info,
         extra,
         shapes: (info.shapes ?? 0) + extra.shapes,
         icons: (info.icons ?? 0) + extra.icons,
-        kinds,
+        // 画布配图（新-6）：叠在版式页上的图也要能被 outline / warnings 报出来
+        images: (info.images ?? 0) + (extra.images ?? 0),
     };
+    if ((extra.images ?? 0) === 0) return { ...merged, kinds };
+    merged.missing = (info.missing ?? 0) + (extra.missing ?? 0);
+    merged.missingPaths = [...asArray(info.missingPaths), ...asArray(extra.missingPaths)];
+    merged.placeheld = (info.placeheld ?? 0) + (extra.placeheld ?? 0);
+    merged.cropped = (info.cropped ?? 0) + (extra.cropped ?? 0);
+    const own = asNumber(info.dpi, 0);
+    const added = asNumber(extra.dpi, 0);
+    const candidates = [own, added].filter((value) => value > 0);
+    merged.dpi = candidates.length === 0 ? 0 : Math.min(...candidates);
+    // 尺寸跟着报出的那一张走（自己更悲观时保留自己的）
+    if (added > 0 && (own === 0 || added <= own)) {
+        merged.widthCm = extra.widthCm;
+        merged.heightCm = extra.heightCm;
+    }
+    return { ...merged, kinds };
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -3834,11 +4759,13 @@ function addMasterLogo(sink, ctx, logo) {
 
 function addMasterHeader(sink, ctx, header) {
     const { g } = ctx;
+    // 母版是页面级装饰：分栏页（新-6）上仍按整幅版心摆
+    const fullW = g.fullContentW ?? g.contentW;
     const x = header.x === undefined ? g.margin : cmToEmu(asNumber(header.x, 0.9));
     const y = header.y === undefined ? cmToEmu(0.32) : cmToEmu(asNumber(header.y, 0.32));
-    const w = header.w === undefined ? g.contentW : cmToEmu(asNumber(header.w, 0));
+    const w = header.w === undefined ? fullW : cmToEmu(asNumber(header.w, 0));
     addText(sink, ctx, {
-        x, y, w: w > 0 ? w : g.contentW, h: cmToEmu(0.95), anchor: 't', name: 'Master Header', autofit: false,
+        x, y, w: w > 0 ? w : fullW, h: cmToEmu(0.95), anchor: 't', name: 'Master Header', autofit: false,
         paras: [{
             text: header.text, sizePt: header.size, bold: header.bold,
             color: header.color ?? ctx.pal.muted, align: header.align, lineSpacing: 1, font: header.font,
@@ -3849,7 +4776,8 @@ function addMasterHeader(sink, ctx, header) {
 function addMasterFooter(sink, ctx, footer) {
     const { g } = ctx;
     addText(sink, ctx, {
-        x: g.margin, y: g.footerY + cmToEmu(0.1), w: Math.round(g.contentW * 0.72), h: g.footerH,
+        x: g.margin, y: g.footerY + cmToEmu(0.1), w: Math.round((g.fullContentW ?? g.contentW) * 0.72),
+        h: g.footerH,
         anchor: 't', name: 'Master Footer', autofit: false,
         paras: [{
             text: footer.text, sizePt: footer.size,
@@ -4227,6 +5155,11 @@ function compile(state) {
         const sink = createSink();
         ctx.page = index + 1;
         if (source.kind === 'section') ctx.sectionIndex += 1;
+        // 本页几何：有「没给摆位的画布配图」时按分栏收窄版心（新-6）。
+        // 逐页算、逐页恢复 —— 下一页从完整版心重新开始
+        const plan = planPageGeometry(g, source);
+        ctx.g = plan.geom;
+        ctx.canvasImageRects = plan.rects;
         // 背景在最底层：本页显式给的优先，否则用母版
         const pageBackground = source.background !== undefined
             ? normalizeBackground(source.background, ctx, `第 ${ctx.page} 页`)
@@ -4472,6 +5405,11 @@ function compile(state) {
         // 「一共有几个公式」与「有几个没写成公式」是两个问题，合在一起等于都答不清楚
         formulaErrors: ctx.formulaErrors.length,
         formulaErrorList: ctx.formulaErrors.slice(0, 8),
+        // 看着像公式却写成普通文本的短公式数（第五十八轮 新-23）。read() 侧同名同口径，
+        // 与 formulaErrors 也分开：那一条是「解析失败」（改命令），这一条是「没进通道」（改成 math）
+        plainFormulas: built.reduce((sum, item) => sum + item.sink.plainFormulas, 0),
+        plainFormulaList: built.flatMap((item, index) => item.sink.plainFormulaSamples
+            .map((text) => ({ page: index + 1, text }))).slice(0, 8),
         mediaBytes: mediaParts.reduce((sum, item) => sum + item.bytesLength, 0),
         bytes: bytes.length,
     };
@@ -4544,7 +5482,11 @@ function helperOutline(kind, info) {
     if (kind === 'kpi') return `${title}｜${count} 个指标`;
     if (kind === 'imageText') return `${title}｜图 + 文`;
     if (kind === 'timeline') return `${title}｜${count} 个节点`;
-    return `${title}｜${count} 个图标`; // iconGrid
+    if (kind === 'iconGrid') return `${title}｜${count} 个图标`;
+    if (kind === 'agenda') return `${title}｜${count} 条`;
+    if (kind === 'gallery') return `${title}｜${count} 张图片`;
+    if (kind === 'roadmap') return `${title}｜${count} 个阶段`;
+    return `${title}｜${count} 个坐标点`; // matrix
 }
 
 function outlineLine(item, page) {
@@ -4641,7 +5583,10 @@ function collectWarnings(item, ctx, warn) {
         }
     }
     // imageText 复用同一套图片口径：缺图 / 格式不支持 / 被裁切 / DPI 不足都从 info 上读
-    if (item.kind === 'image' || item.kind === 'images' || item.kind === 'imageText') {
+    // 图片类告警：单图 / 多图 / 图文页走各自的 info，版式页上的**画布配图**走 mergeCanvasInfo
+    // 并进来的同一套字段（第五十二轮 新-6）—— 两条路共用一段，save() 与 read() 才不会各报一个数
+    if (item.kind === 'image' || item.kind === 'images' || item.kind === 'imageText'
+        || (info.images ?? 0) > 0) {
         if (info.missing > 0) {
             const paths = asArray(info.missingPaths).filter((item) => item !== '').join('、');
             warn(`第 ${page} 页有 ${info.missing} 张图片缺失，已画占位框${paths === '' ? '' : `：${paths}`}`);
@@ -4672,12 +5617,17 @@ function collectWarnings(item, ctx, warn) {
     if (item.kind === 'cover' && !info.fitted?.fits) {
         warn(`第 1 页封面标题过长，已压到最小字号 ${info.fitted?.sizePt}pt`);
     }
-    const contentArea = ctx.g.contentW * (ctx.g.footerY - ctx.g.titleY);
+    // 容量按**整幅版心**算：分栏页（新-6）的 ctx.g 已收窄成左栏，拿它当分母会把
+    // 「一页正常内容 + 一张右栏配图」判成压到页脚（复核实测过）
+    const capacityW = ctx.g.fullContentW ?? ctx.g.contentW;
+    const contentArea = capacityW * (ctx.g.footerY - ctx.g.titleY);
     if (item.sink.contentArea > (ctx.g.cx * ctx.g.cy) * 0.95) {
         warn(`第 ${page} 页文本框总面积占页面 ${Math.round((item.sink.contentArea / (ctx.g.cx * ctx.g.cy)) * 100)}%，几乎没有留白`);
     } else if (item.sink.contentArea > contentArea) {
-        warn(`第 ${page} 页文本框总面积 ${Math.round(item.sink.contentArea / 10000) / 100}cm² 超过版心 `
-            + `${Math.round(contentArea / 10000) / 100}cm²，可能压到页脚`);
+        // 1 cm² = 1.296e11 EMU²（360000²）—— 这里原来写 /10000/100，报出的数大了 129,600 倍
+        const toCm2 = (value) => Math.round(value / 1.296e11 * 100) / 100;
+        warn(`第 ${page} 页文本框总面积 ${toCm2(item.sink.contentArea)}cm² 超过版心 `
+            + `${toCm2(contentArea)}cm²，可能压到页脚`);
     }
 }
 
@@ -4691,8 +5641,8 @@ export const meta = {
     ext: '.pptx',
     summary: '生成可被 PowerPoint 直接打开的 .pptx：封面/章节/要点/表格/引用/陈述/图片/结尾 8 种版式，'
         + '图片支持 contain/cover/natural 三种适配、显式尺寸、裁切、左右对齐、边框、满页背景图与多图网格；'
-        + '另有「版式助手」：deck.cards / steps / compare / kpi / imageText / timeline / iconGrid 一次调用成形一整页'
-        + '（卡片网格、编号流程、对比双栏、KPI 大数字、图文、时间线、图标网格），'
+        + '另有「版式助手」：deck.cards / steps / compare / kpi / imageText / timeline / iconGrid / agenda / gallery / roadmap / matrix'
+        + ' 一次调用成形一整页（卡片网格、编号流程、对比双栏、KPI 大数字、图文、时间线、图标网格、目录、图片墙、路线图、2×2 矩阵），'
         + 'deck.panel / deck.banner 则在当前页叠加提示词面板与横幅/色带，可与助手同页拼成参考稿式整页；'
         + '还有「自由绘制」能力：deck.shape / deck.line / deck.icon 可在同一页任意摆放 33 种预设形状、'
         + '渐变/透明填充、虚线箭头、旋转圆角阴影与形状内文字，deck.master 给全篇加背景图（可压暗）、'
@@ -4709,8 +5659,10 @@ export const meta = {
             '  deck.bullets({title, items, columns})   items: string 或 {text, level, runs}',
             '  deck.table({title, columns, rows, headerFill, zebra, border, cellPadCm, rowHeightCm, firstRowBold})',
             '  deck.quote({text, by, runs}) / deck.statement({text, sub, runs})',
-            '  deck.image({path, title, caption, source, fit, widthCm, heightCm, align, frame, fullBleed})',
+            '  deck.image({path, title, caption, source, fit, widthCm, heightCm, align, frame, fullBleed, x, y, w, h, ratio})',
             '    fit: contain（默认）/ cover（裁切）/ natural（96 DPI 原尺寸）',
+            '    接在版式页后面 = 与版式同页的配图（助手页上不给 x/y/w/h 时图占右侧 ratio 默认 0.42、版式收到左栏；',
+            '    一页只自动分栏一次，第二张不给坐标的配图另起一页）',
             '  deck.images(items, {title, columns, gapCm, fit})   items: [{path, caption, source}]',
             '  deck.chart({type, title, categories, series:[{name, values}]})  原生图表页（bar/column/line/pie/area/scatter）',
             '  ── 版式助手（各新起一页，之后可继续叠元素级助手）──',
@@ -4721,6 +5673,10 @@ export const meta = {
             '  deck.imageText({title, image, items, text, side, ratio, cardFill, cardLine})',
             '  deck.timeline({title, items, direction, gapCm})   items: [{time,title,body}]',
             '  deck.iconGrid({title, items, columns, gapCm, iconSizeCm})   items: [{icon,label,body}]',
+            '  deck.agenda({title, items, numbered, active})   items: [{text, desc, active}]  目录/议程，当前节高亮',
+            '  deck.gallery({title, items, columns, ratio, fit})   items: [{path, caption, badge, alt}]  图片墙',
+            '  deck.roadmap({title, phases})   phases: [{label, items, progress, accent}]  阶段路线图（progress 0~1）',
+            '  deck.matrix({title, xAxis, yAxis, items})   items: [{x,y,text,desc}]  x/y 归一化 0~1  2×2 象限',
             '  ── 元素级助手（画在当前页，与 deck.shape 同级）──',
             '  deck.panel({title, text, runs, x, y, w, h, fill, line, radius, sizePt, align, shadow})',
             '  deck.banner({text, sub, x, y, w, h, fill, gradient, color, sizePt, name})',
@@ -4732,14 +5688,16 @@ export const meta = {
             '  deck.background(spec) 只改当前页 / deck.page() 另起一页 / deck.notes(text)',
             '  deck.render() → Uint8Array / deck.save(path?) → report',
             "  runs: [{text, bold, italic, underline, color, size, font, spacing}]；{math:'E=mc^2'} 插入公式",
+            "    短公式（r=qr_0、F=ma、E=mc^2）同样走 math 通道，别写成 r=q·r0 这样的纯文本",
             '    （LaTeX 子集，详见全文层）；整段只有一条 math run 时按展示式（独立成行）排版',
             "  create({font:'楷体'}) 全篇换字体，或 {font:{body, bodyEn, title, titleEn}} 分槽覆盖；",
             '    段落/run 的 font 收字符串或 {en, cn}，逐处覆盖',
             '  ── 三个约定 ──',
             '  1) preset 口语名会映射：flowChartData→flowChartInputOutput、roundedRectCallout→wedgeRoundRectCallout、',
             '     ovalCallout→wedgeEllipseCallout（写原名真实 PowerPoint 打不开）',
-            '  2) cover/section/bullets/table/quote/statement/image/closing 这 8 种基础版式**不开放自由画布**：',
-            '     接在它们后面的 shape/line/icon/panel/banner 会另起一页。装饰只有两条路：deck.master() 或版式自带参数',
+            '  2) cover/section/closing 这 3 种版式**不开放自由画布**（整页构图）：',
+            '     接在它们后面的 shape/line/icon/panel/banner 会另起一页。bullets/table/quote/statement/image 与',
+            '     版式助手页都能续画；deck.image() 接在**版式助手页**后面 = 与版式同页的配图（见全文层）',
             '  3) 填充值 \'FFFFFF\' 与空串 = 不填充（纯白卡片会变透明，要白卡用 F8FAFC 这类极浅灰）',
         ],
         read: [
@@ -4778,12 +5736,20 @@ export const meta = {
             '    headerFill 表头底色 / zebra 隔行底色（true|false|色值）/ border 四边描边 / cellPadCm 单元格内边距',
             '    / rowHeightCm 最小行高 / firstRowBold 表头加粗（默认 true）',
             '  deck.quote({text, by, runs}) / deck.statement({text, sub, runs})',
-            '  deck.image({path, title, caption, source, fit, widthCm, heightCm, align, frame, fullBleed})',
+            '  deck.image({path, title, caption, source, fit, widthCm, heightCm, align, frame, fullBleed, x, y, w, h, ratio})',
             "    fit: 'contain'（默认，等比放进版心）| 'cover'（铺满版心，超出部分用 a:srcRect 裁切）",
             "         | 'natural'（按 96 DPI 折算原始像素尺寸，超出才缩）",
             '    widthCm / heightCm 只给一个时另一个按原图纵横比推算；align: left|center|right（默认 center）',
             '    source 是署名（通常传 office.image.fetch 的 credit）：并进题注那一行（`题注 ｜ 来源：…`）',
             '    frame: true 加细边框；fullBleed: true 铺满整页（忽略页边距与标题区），可当背景图',
+            '    ── 与版式共存（第五十二轮 新-6）──',
+            '    deck.image() 与版式同页只有两条路（画布开着 ≠ 一定同页）：',
+            '      ① 落在**版式助手页**上、不给 x/y/w/h → 分栏：图占版心右侧（ratio 默认 0.42），宿主版式收到左栏；',
+            '         一页只自动分栏一次 —— 第二张不给坐标的配图没有第二栏可分，会另起一页（给了坐标仍可同页）；',
+            '      ② 给了 x/y/w/h（厘米）→ 按给的摆位画在当前页，越界照旧 warning；',
+            '      其余情况（bullets / shape 之后不给坐标）照旧另起一页 —— 要独立成页先 deck.page()，',
+            '      或干脆不给坐标（fullBleed: true 永远独立成页）。',
+            '    图与题注都并进这一页：stats.images、read().pages[i].images 都会数到它（缺图占位框只算生成端）。',
             '  deck.images(items, {title, columns, gapCm, fit})',
             '    items: [{path, caption, source}]，columns 支持 2 或 3，gapCm 默认 0.4，逐格等比放入并居中',
             '  deck.chart({type, title, categories, series, legend, labels, stacked, gapWidth, colors}) → 原生图表页',
@@ -4819,6 +5785,27 @@ export const meta = {
             '  deck.iconGrid({title, items, columns, gapCm, iconSizeCm})',
             '    items: [{icon, label, body}]；icon 走 deck.icon 的字形（默认 Segoe MDL2 Assets）',
             '    columns 默认 3（支持 1~6）；每格 = 图标 + 标签 + 说明，全部居中',
+            '  deck.agenda({title, items, numbered, active, gapCm, cardFill, cardLine})',
+            '    items: [{text, desc, active, runs}]（也认 title/body 两个别名）；numbered 默认 true（序号圆），false 改画左侧色条',
+            '    active 标「当前章节」：条目级 active:true 或顶层 active: 页码N（1 起）都行，只高亮第一条；没有则全部普通样式并进 warnings',
+            '    用于汇报目录 / 议程页：一行一节、当前节反色高亮；超过 10 条或行高不足 1.05cm 进 warnings',
+            '    正例：deck.agenda({title:"目录", items:[{text:"背景",desc:"行业现状"},{text:"方案",active:true},{text:"验证"}]})',
+            '  deck.gallery({title, items, columns, gapCm, ratio, fit, cardFill, cardLine})',
+            '    items: [{path, caption, badge, alt, source}]；path 相对工作目录，缺图/坏图照画虚线占位框并 warning',
+            '    columns 默认 2（支持 1~3）；ratio 是图框高/宽（默认 0.62，钳制 0.2~1.5，1.0 = 正方形）',
+            '    badge 是图片角上的小圆角色标（如 "实拍" / "示意图"）；alt 写进图片的替代文字（cNvPr descr）',
+            '    用于实拍照片墙 / 作品集：等格网 + 图注，图片解析与 deck.image 同一套（fit 同 contain/cover/natural）',
+            '    正例：deck.gallery({title:"现场照片", columns:3, items:[{path:"assets/a.png",caption:"入口",badge:"实拍"},{path:"assets/b.png",caption:"中庭"}]})',
+            '  deck.roadmap({title, phases, gapCm, cardFill, cardLine})',
+            '    phases: [{label, items, progress, accent}]；items 是 string[]（阶段要点），progress 是 0~1 的完成度（画进度条 + 百分比）',
+            '    横排阶段卡（1~5 列，列间自动加箭头）；phase 数超过 5 个按网格换行并 warning，progress 越界钳制后警告',
+            '    用于季度路线图 / 实施计划：每阶段一卡，要点 + 完成度一眼看清',
+            '    正例：deck.roadmap({title:"实施路线", phases:[{label:"调研",items:["访谈 12 家客户","竞品拆解"],progress:1},{label:"试点",items:["两个场景上线"],progress:0.4},{label:"推广",items:["全量灰度"]}]})',
+            '  deck.matrix({title, xAxis, yAxis, items})',
+            '    xAxis/yAxis: {low, high}（两端的轴名）；items: [{x, y, text, desc}]，x/y 是 0~1 的归一化坐标（原点左下角）',
+            '    用于 2×2 象限分析（如「重要-紧急」「价值-难度」）：四象限浅底 + 交叉中线 + 坐标点与标签',
+            '    x/y 缺省按 (0,0) 处理并汇总警告，越界钳到 0~1；超过 12 个点提示标签易互相压住',
+            '    正例：deck.matrix({title:"任务优先级", xAxis:{low:"不紧急",high:"紧急"}, yAxis:{low:"低影响",high:"高影响"}, items:[{x:0.82,y:0.8,text:"修复线上故障",desc:"本周"},{x:0.2,y:0.7,text:"规划架构",desc:"下周"}]})',
             '  ── 元素级助手（画在当前页，不新起页，与 deck.shape 同级）──',
             '  deck.panel({title, text, runs, x, y, w, h, fill, line, radius, sizePt, align, shadow})',
             '    浅底圆角面板 + 小字号长文本（参考稿的「提示词示例」）；h 缺省时按真实文字量算，越出页面进 warnings',
@@ -4861,12 +5848,17 @@ export const meta = {
             '     且不给错误说明（只报「需要修复」），引擎已静默映射到语义最接近的合法形状',
             '  2) deck.page()：连续 shape/line/icon/panel/banner 画在同一页；要另起一页就用 deck.page() 或任意版式方法，',
             '     也可以先用版式助手（deck.cards 等）再往上叠元素级助手 —— 它们共用同一页的自由画布',
-            '  2b) 反过来说：cover / section / bullets / table / quote / statement / image / closing 这 8 种基础版式',
-            '     不开放自由画布。接在它们后面的 deck.shape / line / icon / panel / banner 会另起一页空白页',
-            '     （导出后表现为「没有标题文本」的页）。要装饰这类页只有两条路：deck.master()（全篇统一）',
-            '     或版式自带参数（cover 的 kicker/subtitle/runs、bullets 的 columns、quote 的 by 等）。',
+            '  2b) 反过来说：cover / section / closing 这 3 种整页构图版式不开放自由画布，',
+            '     接在它们后面的 deck.shape / line / icon / panel / banner 会另起一页空白页',
+            '     （导出后表现为「没有标题文本」的页）。bullets / table / quote / statement / image 与',
+            '     版式助手页都开放：接在它们后面的**元素级助手**落在同一页。',
+            '     deck.image() 是另一条规则：只有「接在版式助手页后面且不给坐标」（自动分栏）或',
+            '     「给了 x/y/w/h」才同页，其余情况另起一页 —— 见上面 deck.image 那一段。',
+            '     要装饰封面这类页只有两条路：deck.master()（全篇统一）或版式自带参数'
+            + '（cover 的 kicker/subtitle/runs、bullets 的 columns、quote 的 by 等）。',
             '     只想要整页背景用 deck.background()（它只改当前页，不会新起页）。',
-            '     2026-09-22 实测：把形状接到 cover/section/bullets 后面装饰，41 页的稿子被撑到 67 页、再到 80 页。',
+            '     2026-09-22 实测：把形状接到 cover/section/bullets 后面装饰，41 页的稿子被撑到 67 页、再到 80 页；',
+            '     第五十二轮起 bullets 这一类不再另起页，接在后面的元素级助手直接续画。',
             '  3) FFFFFF 与空串 = 不填充：shape/panel/banner 的 fill、卡片底色、背景与表格底色都遵循这一条，',
             '     纯白卡片会变透明；要一张看得见的白卡请用 F8FAFC 这类极浅灰（助手默认值已这样做）',
             '  deck.background(spec)                          只改当前页（写法同母版 background）',
@@ -4878,6 +5870,10 @@ export const meta = {
             '    带自动字号适配的版式（cover/section/quote/statement/bullets）按 runs 里最大字号做溢出估算',
             '  ── 公式（原生 OMML，PowerPoint/WPS/LibreOffice 里都是可编辑公式）──',
             "  run 写 {math:'E=mc^2'}（可与文字 run 混排；size/color 照 run 的规则取）。",
+            "    **短公式同样走这条通道**：r=qr_0 要写 {math:'r=qr_0'}，不要写成 r=q·r0 这样的纯文本 ——",
+            '    短公式最容易下意识写成文字，而纯文本的公式在 PowerPoint 里不是公式也不能再编辑；',
+            '    这样的文本会进 warnings 与 stats.plainFormulas（写侧与读侧同名同口径；',
+            '    PPT 按文本节点计，Word 按段落与表格单元格计）',
             '    子集：\\frac \\binom \\sqrt[n]{}、上下标与撇号、\\sum \\prod \\int 等大运算符带上下限',
             '    （\\limits/\\nolimits 改位置）、\\lim \\max 等极限、\\sin \\log 等函数名、\\text \\mathrm \\mathbf \\mathbb',
             '    等样式、\\left\\right 定界符（含 \\lfloor \\langle 与空定界符 .）、\\hat \\vec \\overline \\overrightarrow',
@@ -4903,7 +5899,7 @@ export const meta = {
             '  stats.media: [{part, contentType, bytes, width, height, slides[]}] —— 包里每个 ppt/media 部件一条',
             '    （与 stats.imageParts 同一批条目；slides 是引用它的页码，空数组表示没有页面引用它）',
             '  pages[]: 每页 {index, layout, title, shapes, autoShapes, tables, tableRows, tableColumns,',
-            '    mergedCells, images, cropped, fullBleed, dpi, imageSizes, textBoxes, lines, words, formulas, notes, helperCount}',
+            '    mergedCells, images, cropped, fullBleed, dpi, imageSizes, textBoxes, lines, words, formulas, plainFormulas, notes, helperCount}',
             '  outline: ["P1 cover：标题", ...]；warnings: 排版风险（例如「第 N 页没有标题文本」）',
             '  注意：逐页数组叫 pages，不是 slides（slides 只在 stats 里是页数）。',
         ],
@@ -4949,7 +5945,8 @@ export const meta = {
             '  不适用的场景：增删整页、换版式、改表格结构 —— 那些请重新生成或直接用 PowerPoint。',
         ],
         // 图片的两个方向：抽出来看（images）与插进去（insertImages）。
-        // 生成侧的 deck.image 只能往「新造的页」里放图，改一份别人给的稿子只能靠这两条。
+        // 生成侧的 deck.image 只能落在「这一趟正在造的页」上（第五十二轮起还能落在刚写过的
+        // 版式页上，见新-6），改一份**别人给的**稿子要插图只能靠这两条。
         images: [
             'images(path, {out?}) → {ok, format, path, bytes, count, dir, files[], skipped[], reused, hint}',
             '  把演示文稿里**嵌着**的图片抽出来，落盘后返回可直接交给 read_image 的路径。',
@@ -5115,12 +6112,22 @@ function makeDeck(spec, env) {
         dirty = true;
         cache = null;
     };
-    // 自由画布是否还开着：连续画形状时续在同一页，见 pushCanvas
+    // 当前页是否还接着收「叠加层 / 配图」：连续画形状或给版式加配图时续在同一页
     let canvasOpen = false;
+    /**
+     * 叠加层还能落在哪一页：`undefined` 表示要另起一页。
+     * 判据只有两条 —— 画布还开着、且最近这一页是内容型版式（见 CANVAS_HOST_KINDS）。
+     */
+    const canvasHost = () => {
+        const last = state.slides[state.slides.length - 1];
+        return canvasOpen && last !== undefined && CANVAS_HOST_KINDS.has(last.kind) ? last : undefined;
+    };
     const push = (kind, data) => {
-        // 换一种版式就等于离开自由画布：下一次 shape() 会开新页
-        canvasOpen = false;
-        state.slides.push({ ...data, kind, notes: '' });
+        state.slides.push({ ...data, kind, canvas: [], notes: '' });
+        // 落到内容型版式（bullets / table / …）时画布保持打开：接着画的
+        // shape / banner / panel / image 会续在同一页；封面 / 章节页 / 结束页则关掉。
+        // 满页背景图那一页也关掉 —— 它是整页构图，再叠一张配图只会压在图上看不清
+        canvasOpen = CANVAS_HOST_KINDS.has(kind) && !(kind === 'image' && data?.spec?.fullBleed === true);
         invalidate();
         return deck;
     };
@@ -5139,17 +6146,13 @@ function makeDeck(spec, env) {
     };
 
     /**
-     * 自由绘制页的落点。
+     * 自由绘制页 / 叠加层的落点。
      * 连续调用 shape / line / icon / panel / banner 会画在同一页（参考稿那种
      * 「一页里 4 张卡片 + 一条横幅」就是这样拼出来的）；一旦中间插了别的版式，
      * 或显式调了 deck.page()，下一次就开新页。
      */
     const pushCanvas = (type, spec) => {
-        const last = state.slides[state.slides.length - 1];
-        const host = canvasOpen && last !== undefined
-            && (last.kind === 'shape' || HELPER_KINDS.includes(last.kind))
-            ? last
-            : undefined;
+        const host = canvasHost();
         if (host !== undefined) {
             host.canvas.push({ type, spec });
         } else {
@@ -5265,31 +6268,74 @@ function makeDeck(spec, env) {
                 sub: asString(input2.sub, ''),
             });
         },
+        /**
+         * 单图（第五十二轮 `新-6`：与版式共存）。
+         *
+         * 三种落点，按当前页的状态自动选：
+         * 1. 画布开着（刚写过 cards / bullets / shape…）且没给 `fullBleed` → **落当前页**，
+         *    成为这一页的配图。没给 `x/y/w/h` 时按「版式 + 配图」分栏：图占版心右侧
+         *    （`ratio` 默认 0.42），宿主版式自动收到左栏；给了 `x/y/w/h` 就完全按给的画。
+         * 2. 要独立成页：先 `deck.page()` 再调，或第一次调用就是它。
+         * 3. `fullBleed: true` 永远是独立的一页（满页背景不该跟版式同页）。
+         *
+         * `x/y/w/h` 与 `ratio` 只在落当前页时有意义；独立成页时仍走原来的
+         * contain / cover / natural + align 那一套。
+         */
         image(data) {
             const input2 = data ?? {};
             const file = asString(input2.path);
+            // 来源/署名（历史遗留 1-2）：PPT 的图注就是图片下方那一行居中文本，
+            // 署名并进同一行（用 ｜ 分隔）—— 页面里没有第二个自然落点，
+            // 而「配图无来源」正是要修的事。传 office.image.fetch 返回的 credit。
+            const caption = withCredit(asString(input2.caption, ''), input2.source);
+            const spec = {
+                // 这里刻意只做「原样透传」：非法 fit / 负数尺寸统一在渲染时落成 warning，
+                // 这样 save() 之前随时改 spec 都不会让状态变得不可预期
+                fit: asString(input2.fit, ''),
+                widthCm: input2.widthCm,
+                heightCm: input2.heightCm,
+                align: asString(input2.align, ''),
+                frame: input2.frame === true,
+                fullBleed: input2.fullBleed === true,
+            };
+            // 显式摆位（厘米）：只有四个都缺省才算「没给」，交给分栏规则
+            const placed = { x: input2.x, y: input2.y, w: input2.w, h: input2.h, ratio: input2.ratio };
+            const given = ['x', 'y', 'w', 'h'].filter((key) => placed[key] !== undefined && placed[key] !== null);
+            const host = canvasHost();
+            // 与版式同页的两条路（第五十二轮 新-6）：
+            // ① 落在**版式助手页**上 —— 助手页只差配图，这是「版式 + 配图」的主路径；
+            //    但一页只自动分栏一次：第二张不给坐标的配图没有第二栏可分，照旧另起一页
+            //    （否则它会落进已经收窄的版心、压住助手内容）；
+            // ② 落在任意开着画布的页上、且调用方给了 x/y/w/h —— 显式摆位就是明确要求同页。
+            // 其余情况（bullets 之后直接 image()、自由绘制页上不给摆位）照旧另起一页：
+            // 「每次调用一页」是多数稿子的写法，不能因为画布开着就被悄悄改掉。
+            const hostHasImage = host !== undefined
+                && asArray(host.canvas).some((entry) => entry?.type === 'image');
+            const joinHost = host !== undefined
+                && (given.length > 0 || (HELPER_KINDS.includes(host.kind) && !hostHasImage));
+            // 缺图警告要报**真的落点页码**：与版式同页时是当前这一页，另起一页时才是下一页
             if (file === '' || !env.exists(file)) {
-                state.inputWarnings.push(`第 ${state.slides.length + 1} 页图片不存在：${file}`);
+                const page = input2.fullBleed !== true && joinHost ? state.slides.length : state.slides.length + 1;
+                state.inputWarnings.push(`第 ${page} 页图片不存在：${file}`);
                 env.warn(`ppt.image：找不到图片 ${file}`);
+            }
+            if (input2.fullBleed !== true && joinHost) {
+                host.canvas.push({
+                    type: 'image',
+                    spec: {
+                        ...placed, ...spec, caption, path: file, title: asString(input2.title),
+                        source: asString(input2.source, ''), split: given.length === 0,
+                    },
+                });
+                invalidate();
+                return deck;
             }
             return push('image', {
                 path: file,
                 title: asString(input2.title),
-                // 来源/署名（历史遗留 1-2）：PPT 的图注就是页面底部那一行居中文本，
-                // 署名并进同一行（用 ｜ 分隔）—— 页面里没有第二个自然落点，
-                // 而「配图无来源」正是要修的事。传 office.image.fetch 返回的 credit。
-                caption: withCredit(asString(input2.caption, ''), input2.source),
+                caption,
                 source: asString(input2.source, ''),
-                // 这里刻意只做「原样透传」：非法 fit / 负数尺寸统一在渲染时落成 warning，
-                // 这样 save() 之前随时改 spec 都不会让状态变得不可预期
-                spec: {
-                    fit: asString(input2.fit, ''),
-                    widthCm: input2.widthCm,
-                    heightCm: input2.heightCm,
-                    align: asString(input2.align, ''),
-                    frame: input2.frame === true,
-                    fullBleed: input2.fullBleed === true,
-                },
+                spec,
             });
         },
         /**
@@ -5488,6 +6534,60 @@ function makeDeck(spec, env) {
                 iconSizeCm: input2.iconSizeCm,
             });
         },
+        /** 目录页：编号条目纵向排列，active 的那条高亮（只认第一条 active）。 */
+        agenda(data) {
+            const input2 = data ?? {};
+            return pushHelper('agenda', {
+                title: asString(input2.title),
+                items: helperItems(input2.items),
+                numbered: input2.numbered,
+                active: input2.active,
+                gapCm: input2.gapCm,
+                cardFill: input2.cardFill,
+                cardLine: input2.cardLine,
+            });
+        },
+        /** 图片墙：等格图片网 + 图注 + 角标，图片走 deck.image 的同一套解析与占位。 */
+        gallery(data) {
+            const input2 = data ?? {};
+            return pushHelper('gallery', {
+                title: asString(input2.title),
+                items: asArray(input2.items).map((item) => (
+                    item !== null && typeof item === 'object'
+                        ? { ...item }
+                        : { path: asString(item) }
+                )),
+                columns: input2.columns,
+                gapCm: input2.gapCm,
+                ratio: input2.ratio,
+                fit: input2.fit,
+                cardFill: input2.cardFill,
+                cardLine: input2.cardLine,
+            });
+        },
+        /** 路线图：横向 3~5 个阶段卡，每卡要点 + 可选完成度。 */
+        roadmap(data) {
+            const input2 = data ?? {};
+            return pushHelper('roadmap', {
+                title: asString(input2.title),
+                phases: asArray(input2.phases).map((phase) => (
+                    phase !== null && typeof phase === 'object' ? { ...phase } : { label: asString(phase) }
+                )),
+                gapCm: input2.gapCm,
+                cardFill: input2.cardFill,
+                cardLine: input2.cardLine,
+            });
+        },
+        /** 2×2 矩阵：x/y 归一化坐标点 + 轴标签。 */
+        matrix(data) {
+            const input2 = data ?? {};
+            return pushHelper('matrix', {
+                title: asString(input2.title),
+                xAxis: input2.xAxis,
+                yAxis: input2.yAxis,
+                items: helperItems(input2.items),
+            });
+        },
         /** 结束当前自由画布：下一次 shape/line/icon 会另起一页。 */
         page() {
             canvasOpen = false;
@@ -5580,6 +6680,10 @@ const HELPER_MARKERS = [
     { kind: 'imageText', detect: 'ImageText ', count: /^ImageText Panel$/ },
     { kind: 'timeline', detect: 'Timeline Node ', count: /^Timeline Node \d+$/ },
     { kind: 'iconGrid', detect: 'IconGrid ', count: /^IconGrid \d+ Label$/ },
+    { kind: 'agenda', detect: 'Agenda Row ', count: /^Agenda Row \d+$/ },
+    { kind: 'gallery', detect: 'Gallery Cell ', count: /^Gallery Cell \d+$/ },
+    { kind: 'roadmap', detect: 'Roadmap Phase ', count: /^Roadmap Phase \d+$/ },
+    { kind: 'matrix', detect: 'Matrix Point ', count: /^Matrix Point \d+$/ },
 ];
 
 /** 从形状名里认出版式助手页；返回 undefined 表示这不是助手页（普通版式页或自由绘制页）。 */
@@ -5813,8 +6917,12 @@ function parseSlide(root) {
  * 读已有文件，返回报告。
  * 版式类型优先看 layout 的中文名，其次看 layout 的 type，最后按内容猜 ——
  * 这样自己生成的文件与别人的文件都能描述清楚。
+ *
+ * `options.density`（第六十九轮）：对 `bullets` 内容页做**内容密度自检**，把「太空」
+ * 与「太密」写进 `warnings`。默认关：测试与内部复用只想验结构时不该被内容口径干扰，
+ * 工具面（`office.ppt.read`）由 SDK 传 `{ density: true }` 打开。
  */
-export function read(path, env) {
+export function read(path, env, options = {}) {
     const context = env ?? createEnv({ root: process.cwd() });
     const bytes = context.readFile(path);
     const files = unzip(bytes);
@@ -5844,6 +6952,8 @@ export function read(path, env) {
     let totalMerged = 0;
     let totalFormulas = 0;
     let totalFormulaErrors = 0;
+    // 看着像公式却写成普通文本的短公式数（第五十八轮 新-23）
+    let totalPlainFormulas = 0;
     // 图片页的展示尺寸与 DPI 从 slide 关系里的媒体部件反推：rels 指向哪个 imageN，
     // 就按那个部件的真实像素数算清晰度，报告里的 DPI 才不是凭空猜的
     const mediaByPart = new Map();
@@ -5959,6 +7069,18 @@ export function read(path, env) {
                 + `（如「${strayLatex[0].slice(0, 32)}」）：写入时公式解析失败会回落成普通文字，`
                 + '这几处要按 runs:[{ math }] 重写或改写成纯文本');
         }
+        // 短公式兜底（第五十八轮 新-23）：**压根没进 math 通道**的短公式（`r=q·r0`）。
+        // 上面那条判据要求文本里有 `\命令`，对这一档完全看不见。扫描跳过 mc:Fallback ——
+        // 那里是成功公式的纯文本近似（`E = mc²`），算进来就是一条永远甩不掉的假告警。
+        const plainFormulaTexts = plainTextNodesOfTree(root)
+            .map((node) => textOf(node))
+            .filter((text) => looksLikePlainFormula(text));
+        totalPlainFormulas += plainFormulaTexts.length;
+        if (plainFormulaTexts.length > 0) {
+            warnings.push(`第 ${index + 1} 页有 ${plainFormulaTexts.length} 处看着像公式的普通文本`
+                + `（如「${plainFormulaTexts[0].trim().slice(0, 32)}」）：短公式同样要走 math 通道，`
+                + "写成 runs:[{math:'r=qr_0'}]；确实要当文字用可以忽略这条");
+        }
         const page = {
             index: index + 1,
             layout,
@@ -5979,6 +7101,7 @@ export function read(path, env) {
             lines: parsed.bodyLines,
             words,
             formulas,
+            plainFormulas: plainFormulaTexts.length,
             notes: notes.slice(0, 120),
             helperCount: parsed.helperCount,
         };
@@ -5988,30 +7111,50 @@ export function read(path, env) {
             const count = box?.paragraphs?.length ?? 0;
             if (count > 7) warnings.push(`第 ${page.index} 页要点 ${count} 条，超过 7 条`);
         }
+        // 内容密度自检（第六十九轮）：`bullets` 是承载正文的主力版式，最常见的两种失手
+        // 是「一页三个词」（信息量不够、用户要问「为什么这么空」）和「塞满整页」
+        // （13pt 往下压、读不动）。阈值按用户偏好定：内容页 120–200 字为目标，
+        // 低于 80 字算太空、高于 400 字算太密；只报 bullets，表格/KPI 的「少」通常是设计。
+        if (options.density === true && page.layout === 'bullets') {
+            if (page.words < 80) {
+                // 第七十七轮实测：真实稿里被点名的都是「3 条短要点」页（40 字 / 33 字）。
+                // 按用户偏好（每条 15–40 字）这确实是太空，阈值不该放宽；但提示要说清
+                // 「平均每行多少字」，用户才知道是补句子还是整页改提纲。
+                const perLine = page.lines > 0 ? Math.round(page.words / page.lines) : null;
+                const detail = perLine === null ? '' : `（页内正文 ${page.lines} 行，平均 ${perLine} 字/行）`;
+                warnings.push(`第 ${page.index} 页只有 ${page.words} 字${detail}：内容页一般每页 120–200 字、`
+                    + '每条 15–40 字，建议补数据、对比、归因或责任人；确认要「提纲 / 极简」形态可忽略这条。');
+            } else if (page.words > 400) {
+                warnings.push(`第 ${page.index} 页 ${page.words} 字偏多：13pt 已是下限，建议拆成两页`
+                    + '或删到 200 字以内，并把可表格化的内容改成 deck.table。');
+            }
+        }
         const prevPage = pages[pages.length - 2];
-        const strayCanvas = page.layout === 'shape' && prevPage !== undefined
-            && !HELPER_KINDS.includes(prevPage.layout) && prevPage.layout !== 'shape';
-        if (page.title === '' && page.layout !== 'quote' && page.layout !== 'statement' && !strayCanvas) {
+        // 自由绘制页天生没有标题（标题是版式的构件），只要它不是第 1 页就不再念这一句 ——
+        // 「bullets(); deck.page(); shape()」是本轮起推荐的显式换页写法，
+        // 再报一句「没有标题文本」只是无法执行的噪音（分栏那三类版式的组告警照旧见下）
+        const freeDrawPage = page.layout === 'shape' && prevPage !== undefined;
+        if (page.title === '' && page.layout !== 'quote' && page.layout !== 'statement' && !freeDrawPage) {
             warnings.push(`第 ${page.index} 页没有标题文本`);
         }
     });
 
-    // 基础版式页后面紧跟的自由绘制页：shape/panel/banner 接在 cover/section/bullets… 之后
-    // 只会另起一页空白页。这条规则最容易被误解（2026-09-22 实测：调用方为了给版式页加装饰，
-    // 把 41 页的稿子撑到 67 页、再到 80 页，还花了七八次调用去探针试规则），
+    // 封面 / 章节页 / 结束页后面紧跟的自由绘制页：这三类版式是整页构图、不开放画布，
+    // 接在它们后面的 shape/panel/banner 只会另起一页。这条规则最容易被误解
+    // （2026-09-22 实测：调用方为了给版式页加装饰，把 41 页的稿子撑到 67 页、再到 80 页），
     // 所以合成一条带页码的提示，而不是每页各报一次「没有标题文本」。
+    // 第五十二轮（新-6）起内容型版式与助手页都开放画布，这条告警只剩这三类版式会命中。
     const strayCanvasPages = pages.filter((page, index) => {
         const prev = pages[index - 1];
         return page.layout === 'shape' && prev !== undefined
-            && !HELPER_KINDS.includes(prev.layout) && prev.layout !== 'shape';
+            && CANVAS_CLOSED_KINDS.includes(prev.layout);
     });
     if (strayCanvasPages.length > 0) {
         const shown = strayCanvasPages.slice(0, 6).map((page) => `P${page.index}`).join('、');
-        warnings.push(`共 ${strayCanvasPages.length} 页是「基础版式页之后的自由绘制页」（${shown}`
-            + `${strayCanvasPages.length > 6 ? ' 等' : ''}）：cover/section/bullets/table/quote/statement/image/closing `
-            + '不开放自由画布，接在它们后面的 deck.shape / line / icon / panel / banner 会另起一页。'
-            + '要与版式同页请改用版式助手页（cards/steps/compare/kpi/imageText/timeline/iconGrid），'
-            + '整篇统一装饰用 deck.master()，只改当前页背景用 deck.background()。');
+        warnings.push(`共 ${strayCanvasPages.length} 页是「封面 / 章节页 / 结束页之后的自由绘制页」（${shown}`
+            + `${strayCanvasPages.length > 6 ? ' 等' : ''}）：cover/section/closing `
+            + '是整页构图、不开放自由画布，接在它们后面的 deck.shape / line / icon / panel / banner 会另起一页。'
+            + '要接着画请先 deck.page() 显式换页，整篇统一装饰用 deck.master()，只改当前页背景用 deck.background()。');
     }
 
     const themeFromCategory = (() => {
@@ -6096,6 +7239,8 @@ export function read(path, env) {
             formulas: totalFormulas,
             // 疑似未解析的 LaTeX 文本数（兜底扫描，见上面的注释）：生成端与 read() 侧同一口径
             formulaErrors: totalFormulaErrors,
+            // 看着像公式的普通文本数（第五十八轮 新-23）：与 formulaErrors 分开，见 createSink 的注释
+            plainFormulas: totalPlainFormulas,
             bytes: bytes.length,
         },
         pages,
@@ -6109,7 +7254,7 @@ export function read(path, env) {
  *
  * 为什么默认落缓存目录而不是工作目录：抽图是「下一步要看它」的中间动作，不是交付物，
  * 而「工作目录里不出现临时文件」是本仓库的一条硬规则（见 engine/cache.js 的说明）。
- * 目录一律走注入进来的 cache 对象，绝不硬编码 `.office/cache` 这类路径 ——
+ * 目录一律走注入进来的 cache 对象，绝不硬编码 `.office/runtime/cache` 这类路径 ——
  * 缓存目录的位置是插件配置项，写死一处就会在改配置时静默失效。
  *
  * 三件事照实报，不糊过去：
@@ -6245,27 +7390,54 @@ export function images(path, options, env, extra) {
     }
 
     // 输出目录：显式 out 优先，否则落缓存。缓存目录由插件注入，这里不写死任何路径。
+    // 缓存桶带上包内容哈希（S-05）：从前只按 basename 前 24 个字符分目录，
+    // 两份同名但内容不同的稿子会落进同一个目录，后一次导出直接覆盖前一次，
+    // 文件清单里还看不出覆盖发生过。
     const stem = (basename(asString(path)).replace(/\.[^.]+$/, '').replace(/[\\/:*?"<>|]/g, '-').slice(0, 24) || 'deck');
+    const digest = createHash('sha256').update(bytes).digest('hex').slice(0, 10);
     let outDir;
     let intoCache = false;
     if (typeof opts.out === 'string' && opts.out.trim() !== '') {
-        const wanted = opts.out.trim();
-        outDir = isAbsolute(wanted) ? wanted : join(context.root, wanted);
-    } else if (cache !== undefined && cache !== null) {
-        outDir = cache.ensureDir(`ppt-images/${stem}`);
+        // 与 office.image.fetch / archive.extract 同口径：相对路径不得逃出工作目录，
+        // 绝对路径视为调用方显式选择。
+        outDir = assertInsideRoot(opts.out.trim(), context, 'office.ppt.images');
+    } else if (cache !== undefined && cache !== null && typeof cache.ensureDir === 'function') {
+        outDir = cache.ensureDir(`ppt-images/${stem}-${digest}`);
         intoCache = true;
     } else {
         throw new Error('office.ppt.images：没有可写的目录 —— 请给 { out }，或在 office_run 里调用（缓存目录会自动注入）');
     }
-    mkdirSync(outDir, { recursive: true });
 
     const list = [];
+    // 覆盖必须是调用方明说的决定：显式 out 指向用户已有文件时，默认跳过而不是悄悄改写；
+    // 缓存目录同理 —— 同一份稿子重复导出是常态，第二次直接复用已导出的文件即可。
+    const overwrite = opts.overwrite === true;
     for (const entry of found.values()) {
         // 部件名带上演示文稿的词干：缓存目录是多份文档共用的，只用 image1.png 会互相覆盖
         entry.name = `${stem}-${entry.part.slice('ppt/media/'.length)}`;
         const target = join(outDir, entry.name);
-        writeFileSync(target, payloads.get(entry.part));
-        if (intoCache) cache.noteArtifact();
+        if (!overwrite && context.exists(target)) {
+            if (intoCache) {
+                // 缓存桶按包内容哈希分桶，命中说明这份稿子已经导出过：文件字节相同，
+                // 直接复用，不重写；同时把路径放回 files，调用方仍能 read_image。
+                entry.path = displayPath(context.root, target);
+                entry.slides.sort((a, b) => a - b);
+                entry.existing = true;
+                if (typeof cache.noteHit === 'function') cache.noteHit(entry.bytes);
+                list.push(entry);
+                continue;
+            }
+            skipped.push({
+                part: entry.part,
+                reason: '目标文件已存在，未覆盖（需要覆盖请在 options 里传 overwrite: true）',
+                path: displayPath(context.root, target),
+            });
+            continue;
+        }
+        // 落盘统一走 env.writeFile：父目录自动创建、写进 writes 台账，
+        // office_run 的统一结果清单与产物复检才会包含这些导出的图。
+        context.writeFile(target, payloads.get(entry.part));
+        if (intoCache && typeof cache.noteArtifact === 'function') cache.noteArtifact();
         entry.path = displayPath(context.root, target);
         entry.slides.sort((a, b) => a - b);
         list.push(entry);
@@ -6280,10 +7452,13 @@ export function images(path, options, env, extra) {
         dir: displayPath(context.root, outDir),
         files: list,
         skipped,
+        overwrite,
         reused: list.filter((item) => item.reused).length,
         hint: '图片已导出，直接 read_image({ file_path }) 逐张看；files[].slides 说明它出现在第几页，'
             + 'slides 为空表示包里没有页面引用它（母版/版式里的图或残留部件）。'
-            + '抽的是「嵌在包里的」图片：r:link 链到外部的图没有字节，已在 skipped 里说明。',
+            + '抽的是「嵌在包里的」图片：r:link 链到外部的图没有字节，已在 skipped 里说明。'
+            + '显式 out 里已有同名文件时默认跳过（skipped 里能看到路径），确实要覆盖请传 overwrite: true；'
+            + '默认缓存目录按包内容哈希分桶，同一份稿子重复导出会复用已有文件（existing: true）。',
     };
 }
 
@@ -6306,3 +7481,4 @@ export function edit(path, ops, env) {
         warnings: [reason],
     };
 }
+

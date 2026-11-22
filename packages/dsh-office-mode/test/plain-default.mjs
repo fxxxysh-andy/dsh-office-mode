@@ -20,7 +20,7 @@ import { create as createWord, edit as editWord, read as readWord } from '../src
 import { create as createExcel, read as readExcel } from '../src/formats/excel.js';
 import { create as createPpt } from '../src/formats/ppt.js';
 
-const ROOT = fileURLToPath(new URL('../../../.office/tmp/plain/', import.meta.url));
+const ROOT = fileURLToPath(new URL('../../../.office/runtime/tmp/plain/', import.meta.url));
 const failures = [];
 let checks = 0;
 

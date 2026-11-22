@@ -6,8 +6,8 @@
  *
  *   node test/web-live.mjs
  *
- * 它跑的是**自带实现**（不注入 web 接缝），走 DeepSeek 的 Anthropic 兼容接口 +
- * 原生 web_search。没有可用 Key 时明确跳过（退出码 0），不是失败。
+ * 它跑的是**自带实现**（不注入 web 接缝），默认顺序第一是 DeepSeek Search API
+ * （直连，要 DEEPSEEK_API_KEY）；没有可用 Key 时明确跳过（退出码 0），不是失败。
  * 需要联网与额度，所以不要把它挂进 npm test。
  */
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -49,8 +49,8 @@ if (proxyInput !== '') {
         + '这一项要过请设 DSH_OFFICE_TEST_PROXY');
 }
 
-const config = resolveConfig({ search: { builtin: { maxResults: 5, fetchPages: 1 } } });
-const access = createWebAccess(undefined, config.search.builtin);
+const config = resolveConfig({ search: { fetch: { maxResults: 5, fetchPages: 1 } } });
+const access = createWebAccess(undefined, config.search);
 
 const status = await access.probe();
 if (!status.ok) {

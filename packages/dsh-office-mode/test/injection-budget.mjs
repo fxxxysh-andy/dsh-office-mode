@@ -3,7 +3,7 @@
  *
  * 这一份守的是**上下文成本**，不是功能：办公插件往模型上下文里写的东西会留在
  * 前缀里被后续每一次请求重发，所以「体积」与「重复」都是要被钉住的量。
- * 六节断言口径：
+ * 七节断言口径：
  *
  *   1. **默认层必须比全文层小得多**（每个话题至少 2x）。office_help 默认只给
  *      最小事实集（接口签名 + 必需边界），例子与解释留在 detail:true —— 默认层
@@ -20,6 +20,8 @@
  *      （kind 的「只看某一类」、import 的「只增不改」、id 的位置「第二段」）都要留。
  *   6. **按需投影的预算**（第三十六轮新增）：带话题信号的投影要收掉一大半、
  *      「完全未变化」的投影压到一行级、台账登记后要贴回来、心跳重贴不筛。
+ *   7. **写作前的篇幅表**（第六十轮新增，用户点名的 `新-24`）：`guide` 的默认层
+ *      要指路、全文层要有表的四要素与正反例，两层的字节各有上限。
  *
  * 跑法：node test/injection-budget.mjs
  */
@@ -50,7 +52,7 @@ async function check(name, fn) {
 const bytes = (text) => Buffer.byteLength(String(text ?? ''), 'utf8');
 
 /** 所有话题：默认层与全文层都要能出，且默认层不许比全文层大。 */
-const TOPICS = ['', 'guide', 'run', 'word', 'excel', 'ppt', 'tex', 'pdf', 'python', 'av', 'files', 'cache', 'archive', 'preview', 'image', 'theme', 'search', 'memory', 'settings'];
+const TOPICS = ['', 'guide', 'run', 'word', 'excel', 'ppt', 'tex', 'pdf', 'python', 'av', 'files', 'cache', 'archive', 'preview', 'convert', 'image', 'writing', 'theme', 'search', 'memory', 'settings'];
 
 // ── 1. 分层：每个话题的默认层都比全文层小得多 ──────────────────────────────
 
@@ -122,17 +124,76 @@ await check('默认层的 pdf / python / search / settings / memory 仍讲清关
         assert.ok(av.includes(needle), `av 默认层缺 ${needle}`);
     }
     const search = (await buildHelp('search')).text;
-    for (const needle of ['office_search_run', 'office_search_brief', 'office_search_dispatch', 'office_parse_findings', '泛搜', '茧房']) {
+    for (const needle of ['office_search_run', 'office_search_dispatch', 'office_parse_findings', '提纲', '泛搜', '茧房']) {
         assert.ok(search.includes(needle), `search 默认层缺 ${needle}`);
     }
     const settings = (await buildHelp('settings')).text;
-    for (const needle of ['工具开关', 'maxParallel', 'resultLimit', 'subagentTools', 'outputDir', 'defaultTheme', 'userLimitBytes', 'ledgerLimit']) {
+    for (const needle of ['工具开关', '办公模式插件', 'maxParallel', 'resultLimit', 'maxChannels', 'outputDir', 'defaultTheme', 'userLimitBytes', 'ledgerLimit']) {
         assert.ok(settings.includes(needle), `settings 默认层缺 ${needle}`);
     }
     const memory = (await buildHelp('memory')).text;
     for (const needle of ['热记忆', '台账', '归档', 'replace', 'oldText', '不记', '记忆目录', '按工作目录']) {
         assert.ok(memory.includes(needle), `memory 默认层缺 ${needle}`);
     }
+    // 转换那半的关键事实：入口名、三个引擎、四条目标、覆盖口径与「PDF 正文读不出来
+    // 要走 office.pdf」这条最容易踩的边界。
+    const convert = (await buildHelp('convert')).text;
+    for (const needle of ['office.convert.check', 'office.convert.file', 'pandoc', 'TeX', 'LibreOffice', 'md / docx / tex / pdf', 'overwrite:true', 'office.pdf.text']) {
+        assert.ok(convert.includes(needle), `convert 默认层缺 ${needle}`);
+    }
+});
+
+// ── 2′. 写作前的篇幅表（第六十轮 新-24）────────────────────────────────────
+
+/**
+ * 用户点名的 `新-24`：生成前先给每一部分定篇幅，压住「简单内容过度表述、复杂内容
+ * 一笔带过」。落点是 `office_help('guide')`（persona 只放每次请求都要守的纪律，
+ * 写法约定不放那里），
+ * 所以这里钉三件事：**默认层要指路、全文层要有表与正反例、两层都不许再涨**。
+ *
+ * 为什么写成断言而不是只改文案：这条改动的收益是软的（模型照不照做，脚本证不了），
+ * 能机械验的只有「指引还在不在、有没有被后来的人删掉或写回去」—— 那就是这一条。
+ * 它与 `preset-check` 里那条反向断言（persona **不写**篇幅表）是一对。
+ */
+const GUIDE_FULL_BUDGET_BYTES = 9500;      // 第六十轮实测 9,373 B（改动前 7,890 B）
+const GUIDE_COMPACT_BUDGET_BYTES = 2280;   // 第六十轮实测 2,224 B（改动前 2,048 B；补「总长以它为准」后 2,194 → 2,224）
+
+await check('office_help(guide)：两层都讲「先定篇幅」，全文层有表与正反例，字节有界（新-24）', async () => {
+    const compact = (await buildHelp('guide')).text;
+    const full = (await buildHelp('guide', { detail: true })).text;
+    // 默认层只有一句话的位置：先列表、重点给足、**总长以用户要求为准**、写完自查 —— 四样都要在。
+    // 默认层才是那次调用进前缀的那一份，而「收住」单独出现时正是被读成「越短越好」的那个风险
+    // （复核 P3-1：初版默认层只留了「收住」，解药只在全文层）。
+    for (const needle of ['篇幅表', '重点给足', '以它为准', '自查', 'office.writing.plan', 'office.writing.audit']) {
+        assert.ok(compact.includes(needle), `guide 默认层缺 ${needle}`);
+    }
+    // 全文层：表的四要素（分几节 / 写什么 / 多少字 / 依据）与「不是交付物」这条边界。
+    for (const needle of ['篇幅表', '分几节', '写什么', '多少字', '依据', '不是交付物']) {
+        assert.ok(full.includes(needle), `guide 全文层缺 ${needle}`);
+    }
+    // 正反例都要在：正例给三节的字数分法，反例点名「每节一样长」。
+    assert.ok(full.includes('背景 1 段约 150 字'), '全文层缺正例（三节的字数分法）');
+    assert.ok(full.includes('三节各 350 字就是没定篇幅'), '全文层缺反例（每节一样长）');
+    // 「总长以它为准」补的依据是**推理**（初版只写「收住」容易被读成「越短越好」），不是那次
+    // 对照实验的数据 —— 实验里两臂都落在 800–1200，过程与两次在飞读数见交付档 §四。
+    assert.ok(full.includes('以它为准') && full.includes('不是把整份写短'), '全文层缺「总长以用户要求为准」这条边界');
+    // persona 那侧只放常驻纪律（第六十七轮压缩后余 2,411 B，但这条仍属写法约定），所以落在 guide；反向断言在 preset-check。
+    assert.ok(bytes(full) <= GUIDE_FULL_BUDGET_BYTES, `guide 全文层 ${bytes(full)}B 超 ${GUIDE_FULL_BUDGET_BYTES}B`);
+    assert.ok(bytes(compact) <= GUIDE_COMPACT_BUDGET_BYTES, `guide 默认层 ${bytes(compact)}B 超 ${GUIDE_COMPACT_BUDGET_BYTES}B`);
+});
+
+// ── 2″. 写作规划（第七十三轮）──────────────────────────────────────────────
+
+await check('office_help(writing)：默认层给五个入口，全文层给分配公式、警告码与 deai 口径', async () => {
+    const compact = (await buildHelp('writing')).text;
+    const full = (await buildHelp('writing', { detail: true })).text;
+    for (const needle of ['office.writing.plan', 'office.writing.audit', 'office.writing.deai', 'office.writing.signals', 'office.writing.render', 'depth', 'score', 'warnings']) {
+        assert.ok(compact.includes(needle), 'writing 默认层缺 ' + needle);
+    }
+    for (const needle of ['difficulty', 'value', '权重', 'underdeveloped', 'longest-not-hardest', 'scripts/writing-eval.mjs', '不是结构模板', 'office.writing.deai', 'register', 'styleRef']) {
+        assert.ok(full.includes(needle), 'writing 全文层缺 ' + needle);
+    }
+    assert.ok(bytes(full) > bytes(compact) * 2, 'writing 全文层要明显厚于默认层');
 });
 
 // ── 3. 固定长句一个会话只说一次 ────────────────────────────────────────────
@@ -262,7 +323,7 @@ await check('office_search_run：同一会话第二次的反馈明显更短，�
 
 // **第四十一轮：这次预算是往下调的**（实测 15,548 / 4,736 → 阈值 15,650 / 4,840）。
 // 本轮往 `office_memory` 里加了知识库的四个动作（kb-ingest / kb-read / kb-list / kb-drop）、
-// 来源档 `tier`、冲突边的 `conflict` / `state` —— 按第二十四轮 §5.1 的规矩，
+// 来源档 `tier` —— 按第二十四轮 §5.1 的规矩，
 // **先瘦身再加动作**：把工具描述与参数描述压到「模型写错就调不通」的最小事实集，
 // 于是总字节与单项都**低于上一轮**（15,631 → 15,548、4,819 → 4,736）。
 // 这条「只减不增」是本轮刻意守住的口径：新增能力不该靠加宽预算来落地。
@@ -293,12 +354,41 @@ await check('office_search_run：同一会话第二次的反馈明显更短，�
 // 两处都先按「先瘦身再加动作」压过一轮（content 描述从 205 → 147 B，去掉了
 // 「超了怎么办」的重复说明 —— 拒绝时的报错里已经给了三条去处），
 // 剩下的 46 B 是净增的语义：总预算 +120 B、单项 +60 B，留 4.8% 余量。
-const TOOL_SURFACE_BUDGET_BYTES = 15770;
-const OFFICE_MEMORY_BUDGET_BYTES = 4950;
+//
+// **第五十一轮：预算不动，靠瘦身把两个新参数塞进去**（实测 15,519 → **15,674**）。
+// `新-7` 给 `office_run` 加了 `scriptFile` 与 `args`（跨调用复用同一段脚本），
+// `新-8` / `新-13` 一个字节都没花在工具面上。按「先瘦身再加参数」：
+//   · `script` 描述里那份**与工具描述重复**的能力清单删掉（av 一句补进工具描述，
+//     它原来只在参数里出现过），386 → 158 B；
+//   · `keepCache` 去掉「保留才能跨调用复用」这句解释，195 → 159 B；
+//   · 工具描述里「每次调用都从零开始」换成 scriptFile 那条新路由，净增 72 B。
+// 结果 +155 B，仍在原阈值 15,770 内（余量 96 B）。
+//
+// **第八十五轮：预算上调，换的是四种可执行的块级动作**（实测 15,672 → **15,885** /
+// 4,931 → **5,419**）。知识库从「整份文档的读 / 写」下沉到「块间关系与摘要」：模型要能
+// 建块边（kb-link）、沿边找邻居（kb-related）、把多块合成摘要（kb-summarize、kb-summaries），
+// 否则这三件事只有面板能做、模型写不出来。参数面同时多了 title / text / chunkId / chunkIds。
+// 旧动作与关键语义一条没删（第 409 行那份清单仍然全过），新增的是真能力而不是润色；
+// 阈值按实测 + 小余量调到 16,000 / 5,500（余量 115 B / 81 B）。
+//
+// **第五十七轮：预算不动，靠瘦身把两处新语义塞进去**（实测 15,701 → **15,672** /
+// 4,908 → **4,931**）。这一轮进的是 P2-8 的统一入口动作 `recall`（动作名 + 一句路由语义，
+// 并把 `layer` / `query` / `limit` / `since` / `until` / `tags` / `entities` 的说明
+// 补上「recall 也认这些参数」—— 模型是从参数面挑参数的）与 P2-9 的 `draft` 参数。
+// 按「先瘦身再加」的老规矩，同一轮里瘦掉的是**重复与举例**：
+//   · `office_web_search` 的 site: 举例（同一条规则在 office_help('search') 里）；
+//   · `office_search_run` 那句「适合不想派子代理的场合」—— 首句已经说了它是旁路直查，
+//     下一句已经说了什么时候用它而不是两个抓取工具，-84 B；
+//   · `office_search_brief` 的渠道规则清单压成一行（满表在 office_help('search')）；
+//   · `office_parse_findings` 的两处冗余措辞（「只有单一来源背书」→「单一来源」等）；
+//   · `office_memory` 的 `content` / `source` 里与工具描述重复的说明。
+// 净额 -29 B：两处新语义没有靠加宽预算落地，单项余量 19 B（0.4%）。
+const TOOL_SURFACE_BUDGET_BYTES = 16000;
+const OFFICE_MEMORY_BUDGET_BYTES = 5500;
 
-await check('工具面字节：九个工具的常驻字节在预算内，且 office_memory 是单项最大的一块', () => {
+await check('工具面字节：八个工具的常驻字节在预算内，且 office_memory 是单项最大的一块', () => {
     const tools = buildTools(resolveConfig({}));
-    assert.ok(tools.length >= 9, `工具面至少要含九个工具，实际 ${tools.length}`);
+    assert.ok(tools.length >= 8, `工具面至少要含八个工具，实际 ${tools.length}`);
     const measured = tools.map((tool) => ({
         name: tool.name,
         bytes: bytes(JSON.stringify({ name: tool.name, description: tool.description, parameters: tool.parameters })),
@@ -323,7 +413,7 @@ await check('工具面字节：九个工具的常驻字节在预算内，且 off
 await check('工具面字节：省字节不能省掉 office_memory 的动作名与关键语义', () => {
     const tool = buildTools(resolveConfig({})).find((item) => item.name === 'office_memory');
     const text = `${tool.description}\n${JSON.stringify(tool.parameters)}`;
-    for (const action of ['read', 'add', 'replace', 'remove', 'log', 'link', 'unlink', 'related', 'entities', 'status', 'export', 'import', 'migrate']) {
+    for (const action of ['read', 'recall', 'add', 'replace', 'remove', 'log', 'status', 'export', 'import', 'migrate']) {
         assert.ok(text.includes(action), `瘦身把动作名「${action}」省掉了：模型会写不出这个调用`);
     }
     for (const needle of ['旧条目', 'layer', 'query', 'oldText', 'id', '配额']) {
@@ -346,9 +436,8 @@ await check('工具面字节：省字节不能省掉 office_memory 的动作名�
     for (const needle of ['kb-ingest', 'kb-search', 'kb-read', 'kb-list', 'kb-drop', 'tier', 'unverified']) {
         assert.ok(params.includes(needle), `知识库接口面缺「${needle}」：模型会不知道 kb 怎么用、或不知道来源档怎么填`);
     }
-    // 冲突边的三态（保留双方、不自动裁决）同样要留在参数面：模型不知道该传什么时，
-    // 会把一条真实的冲突记成普通 related 边。
-    for (const needle of ['conflict', 'state', 'contradicts']) {
+    // 知识库块边的类型留在参数面：模型不知道该传什么时，会把一条真实的联系记成普通 related 边。
+    for (const needle of ['contradicts']) {
         assert.ok(params.includes(needle), `冲突边参数面缺「${needle}」`);
     }
 });
@@ -393,7 +482,7 @@ await check('office_run 反馈：脚本返回里的 outline 不再原样回灌',
         logs: [],
         notes: [],
         warnings: [],
-        cache: { dir: '.office/cache', kept: 0, keptBytes: 0, hits: 0, pruned: [], ttlMinutes: 720 },
+        cache: { dir: '.office/runtime/cache', kept: 0, keptBytes: 0, hits: 0, pruned: [], ttlMinutes: 720 },
     });
     for (const line of outline) assert.ok(!text.includes(line), `outline 不该回灌：${line}`);
     assert.ok(text.includes('共 41 项'), '要报出 outline 有条数');
@@ -411,7 +500,7 @@ await check('office_run 反馈：脚本返回超长时按小上限截断', () =>
         logs: [],
         notes: [],
         warnings: [],
-        cache: { dir: '.office/cache', kept: 0, keptBytes: 0, hits: 0, pruned: [], ttlMinutes: 720 },
+        cache: { dir: '.office/runtime/cache', kept: 0, keptBytes: 0, hits: 0, pruned: [], ttlMinutes: 720 },
     });
     assert.ok(text.includes('…'), '要能看出是被截断的');
     assert.ok(bytes(text) < 2000, `截断上限要够小，实际 ${bytes(text)}B`);
@@ -420,7 +509,7 @@ await check('office_run 反馈：脚本返回超长时按小上限截断', () =>
 await check('office_run 反馈：缓存块压成一行，TTL 说明不再占三行', () => {
     const text = renderRun({
         ok: true, elapsedMs: 12, files: [], otherFiles: [], returned: null, logs: [], notes: [], warnings: [],
-        cache: { dir: '.office/cache', kept: 131, keptBytes: 19890000, hits: 2, hitBytes: 4000, pruned: ['a', 'b'], prunedBytes: 12400, ttlMinutes: 720 },
+        cache: { dir: '.office/runtime/cache', kept: 131, keptBytes: 19890000, hits: 2, hitBytes: 4000, pruned: ['a', 'b'], prunedBytes: 12400, ttlMinutes: 720 },
     });
     const cacheLines = text.split('\n').filter((line) => line.includes('缓存：') || line.trimStart().startsWith('720 分钟'));
     assert.equal(cacheLines.length, 1, `缓存块只该一行，实际 ${cacheLines.length} 行`);
@@ -453,13 +542,12 @@ await check('按需投影：真实量级夹具下，信号过滤、台账折叠�
         assert.ok(filtered.text.includes('PPT 汇报先给结论'), '命中的条目要在');
         assert.ok(filtered.text.includes('与「ppt」相关的条目 0 条，6 条全部折叠'), '无关条目要有折叠行');
 
-        // ② 完全未变化（热记忆与台账指纹都没动）：投影压到一行级。
+        // ② 完全未变化（热记忆与台账指纹都没动）：不输出（第七十五轮用户要求
+        //    「说无变化就别输出」；此前压到一行但仍要付 token）。
         const unchanged = projectDigest(digest, { sessionId: 'budget-full', context: 'help' });
         assert.equal(unchanged.mode, 'unchanged');
-        assert.ok(bytes(unchanged.text) <= 1400, `「未变化」投影要压小，实际 ${bytes(unchanged.text)}B`);
-        assert.ok(!unchanged.text.includes('主动记录'), '两部分都省略时固定尾巴不再重复');
-        assert.ok(!unchanged.text.includes('汇报.pptx'), '台账行不重复贴');
-        assert.ok(unchanged.text.includes('与上次投影相同'), '折叠要说清并留入口');
+        assert.equal(unchanged.text, '', '未变化时投影必须是空串，不能留状态行');
+        assert.equal(unchanged.bytes, undefined);
 
         // ③ 台账指纹变了（登记新产物）：台账行要贴回来 —— 省字节不能省掉
         //    「office_run 之后能看到刚登记的那条」这条反馈。
@@ -482,7 +570,40 @@ await check('按需投影：真实量级夹具下，信号过滤、台账折叠�
     }
 });
 
-// ── 投影预算（第四十八轮 P0-2） ────────────────────────────────────────────
+// ── 投影预算（第四十八轮 P0-2 / 第五十六轮 A-02） ──────────────────────────
+
+await check('投影预算：拿不到会话身份的渲染也要受同一个预算约束（A-02）', async () => {
+    // 从前 `projectDigest` 的 no-session 分支只传了 context 与 signal，**漏传 budget** ——
+    // 于是「不知道这是哪个会话、所以不按会话去重」被顺带当成了「可以不受配置的字节预算
+    // 约束」，同一个 digest 在两条分支下的成本差一大截，而设置页上完全看不出来。
+    // 去重与预算是两件事：前者要会话身份，后者只是渲染期的成本上限。
+    resetProjection();
+    const root = mkdtempSync(join(tmpdir(), 'office-projection-nosession-'));
+    try {
+        const memory = createMemory({ root });
+        const filler = '这一条用来把正文撑到真实量级，让预算断言立在刻度上而不是感觉上。'.repeat(5);
+        for (let index = 0; index < 5; index += 1) {
+            await memory.mutate({ action: 'add', target: 'project', content: `无会话条目 ${index}：${filler}` });
+        }
+        await memory.mutate({ action: 'add', target: 'project', content: `无会话条目 关键：${filler}`, importance: 'critical' });
+        const digest = await memory.digest();
+
+        const unlimited = projectDigest(digest, { sessionId: '', context: 'help' });
+        const budgeted = projectDigest(digest, { sessionId: '', context: 'help', budget: 1400 });
+        assert.ok(bytes(budgeted.text) < bytes(unlimited.text),
+            `no-session 分支也要省字节：${bytes(budgeted.text)}B vs ${bytes(unlimited.text)}B`);
+        assert.ok(budgeted.text.includes('无会话条目 关键'), '预算先保证重要度最高的条目');
+        assert.ok(/本次投影 \d+ B，其中条目 \d+ B（上限 1400 B）/.test(budgeted.text),
+            'no-session 分支同样要印成本行');
+        assert.ok(budgeted.text.includes('超出本次投影预算'), '折叠行要报「超出预算」的条数');
+        // 0 = 不限照旧，且这一支不印成本行（与有会话的分支同一口径）。
+        const zero = projectDigest(digest, { sessionId: '', context: 'help', budget: 0 });
+        assert.equal(bytes(zero.text), bytes(unlimited.text), '预算 0 = 不限');
+        return `no-session 不限额 ${bytes(unlimited.text)}B / 预算 1400B 时 ${bytes(budgeted.text)}B`;
+    } finally {
+        rmSync(root, { recursive: true, force: true });
+    }
+});
 
 await check('投影预算：超出预算的条目折叠但留入口，0 = 不限，首行报本次字节', async () => {
     resetProjection();

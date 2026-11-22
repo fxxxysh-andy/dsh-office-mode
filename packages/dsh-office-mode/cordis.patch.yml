@@ -2,11 +2,18 @@
 #
 # 只插入一行：整能力挂在一个插件行上，配置项全部可选，空配置永远可用。
 #
+# 按 preset 的守卫（第五十轮，无配置项）：本行的工具注册在**全局层**，每个 preset
+# 的 agent 都继承得到，所以「极简模式（preset id `minimal`）里不出现 office_*」
+# 不能靠 preset 里写 `- id: dsh-office-mode / disabled: true`（那只关该 preset
+# 自己那一份，关不掉全局层），只能由插件在 agent 创建时用 `ctx.tools.restrict()`
+# 按 agent 隐藏。清单固定为 ['minimal']，判据、实测与边界见 src/preset-guard.js
+# 与 README「极简模式里不注入这九个工具」一节。
+#
 # 组合层配置（composition 层）—— 设置页里的改动（用户层）会覆盖这里的同名项：
 #
 #   - id: dsh-office-mode
 #     config:
-#       cacheDir: .office/cache     # 中间文件目录（相对会话工作目录）
+#       cacheDir: .office/runtime/cache  # 中间文件目录（相对会话工作目录）
 #       scriptTimeoutMs: 60000      # 单次批量执行的超时
 #       defaultTheme: plain         # 默认视觉主题（plain = 素色网格，无背景填充）
 #       keepCache: false            # 默认是否保留中间产物
@@ -17,7 +24,6 @@
 #         office_web_search: true   # 网页抓取搜索（免 Key，来源直接回对话，不落盘）
 #         office_web_fetch: true    # 网页抓取取正文（PDF 交给 office.pdf 抽文本）
 #         office_search_run: true   # 内置检索直查（office_search_run）
-#         office_search_brief: true
 #         office_search_dispatch: true
 #         office_parse_findings: true
 #       search:
@@ -26,13 +32,15 @@
 #         resultLimit: 40           # 解析结果最多列几条（1-40）
 #         outputDir: .office/search # 检索提纲与结果文件目录
 #         provider: auto            # 用哪条联网通道（第二十轮）：auto 按 providerOrder 试，
-#                                   # 也可以固定成 seam / anthropic / openai / tavily / brave /
+#                                   # 也可以固定成 seam / deepseek-api / openai / tavily / brave /
 #                                   # bocha / exa / serper / searxng / duckduckgo
-#         providerOrder: [duckduckgo, searxng, seam]   # 第三十轮起：免 Key 抓取在前、接缝兜底；
-#                                   # 三方检索 API（anthropic / openai / tavily / brave /
-#                                   # bocha / exa / serper）不进默认顺序，要显式加回
+#         providerOrder: [deepseek-api, seam, duckduckgo, searxng]   # 第六十五轮起：直连
+#                                   # DeepSeek Search API → 宿主接缝 → 免 Key 抓取；三方检索 API
+#                                   #（openai / tavily / brave / bocha / exa / serper）不进默认顺序，
+#                                   # 要显式加回
 #         providers:                # 每条通道各自的参数（键集 = 它真正用得上的那几个）
-#           anthropic: { apiKeyEnv: DEEPSEEK_API_KEY, baseURL: ..., model: ..., timeoutMs: 60000 }
+#           deepseek-api: { apiKeyEnv: DEEPSEEK_API_KEY,
+#                           baseURL: https://api.deepseek.com/v1/tools, timeoutMs: 30000 }
 #           tavily:    { apiKeyEnv: TAVILY_API_KEY, timeoutMs: 30000 }
 #           bocha:     { apiKeyEnv: BOCHA_API_KEY, timeoutMs: 30000 }   # 中文长尾好
 #           searxng:   { baseURL: http://127.0.0.1:8080 }               # 自建实例
@@ -44,22 +52,18 @@
 #           dedupeLines: true       # 重复出现的行只留第一次
 #           minLineChars: 12        # 短于这个长度又不像句子的行当导航丢掉（0 = 关）
 #           keepTitle: true         # 抽标题 / 作者 / 时间进报告
-#         builtin:                  # Anthropic 兼容通道（= providers.anthropic 的老入口）
-#           apiKeyEnv: DEEPSEEK_API_KEY   # 取 Key 的环境变量名（凭据服务 → 环境 → .credentials.yaml）
-#           apiKey: ""                    # 字面量 Key；一般留空
-#           baseURL: https://api.deepseek.com/anthropic/v1
-#           model: deepseek-v4-flash      # 要支持原生 web_search
-#           maxUses: 5                    # 一次检索最多几次原生 web_search
-#           maxTokens: 2048
+#         fetch:                    # 取正文与 PDF 的上限（与检索通道无关；第六十五轮
+#                                   # 从旧 search.builtin 拆出来的那一半）
 #           maxResults: 8                 # 每个渠道/每条直查查询最多几条来源
 #           fetchPages: 2                 # 最多打开几页取正文摘录（0 = 只用搜索片段）
-#           searchTimeoutMs: 60000
-#           fetchTimeoutMs: 20000
-#           maxBytes: 2097152
-#           maxChars: 20000
+#           fetchTimeoutMs: 20000         # 单页取正文的超时
+#           maxBytes: 2097152             # 单页体积上限（2 MB）
+#           maxChars: 20000               # 单页字符上限
 #           maxRedirects: 3
-#         # 环境变量覆盖：DSH_OFFICE_SEARCH_BASE_URL / DSH_OFFICE_SEARCH_MODEL /
-#         # DSH_OFFICE_SEARCH_API_KEY_ENV，端点也认宿主的 DEEPSEEK_SEARCH_BASE_URL。
+#           pdfMaxBytes: 25165824         # 撞上 PDF 时的放弃线（24 MB，超了换来源）
+#           pdfMaxPages: 30
+#         # Key 解析链：字面量 → 凭据服务 → 环境变量 → $DSH_HOME/.credentials.yaml。
+#         # 第六十五轮删掉了 DSH_OFFICE_SEARCH_* 三个环境变量，端点只认 baseURL。
 #       memory:                     # 三层记忆（热记忆 / 台账 / 归档）
 #         enabled: true             # 总开关：关掉后记忆工具、提示段与自动台账一起停
 #         dir: .office/memory       # 记忆目录（相对会话工作目录）
@@ -77,7 +81,6 @@
 #                                   # / both（两者并存，全局在前、工作区在后）
 #         globalDir: ""             # 全局层目录；留空 = $DSH_HOME/.office/memory
 #         userScope: memory         # USER 偏好范围：memory（跟着 scope）/ global（始终落全局层）
-#         links: true               # 图关系：link / related / 实体视图
 #         autoCapture: true         # 主动记录指引（不是自主记录器）
 #         recallQuality:            # 召回质量 strict-v1（分数 = 命中词占比，不是余弦相似度）
 #           policy: strict-v1       # strict-v1 | off
@@ -109,7 +112,8 @@
 # 报出命中数），旁边是「全部展开 / 全部收起」。开合状态记在 localStorage
 # （键 dsh-office-mode.groups.<office|memory>），拿不到就只记在这次会话里。
 #
-# 记忆浏览面板：侧栏的「记忆」入口（注册进 sidebar.panellist + main 两个槽位），
+# 记忆浏览面板：会话页签行里的「记忆」一格（注册进 conversation.view，order 40 ——
+# 排在「上下文」20 与「编队」30 的右侧；第六十二轮前它是侧栏的一个图标 + 主面板一格），
 # 数据来自本插件注册的只读端点 GET /office-memory/snapshot。该端点只服务**宿主
 # 认得的工作目录**（见 src/view.js 的信任边界说明）：本进程真跑过办公工具的工作目录、
 # 宿主工作区登记表里的项目目录（ctx.workspaceRegistry，跨重启仍在）、会话日志里出现过

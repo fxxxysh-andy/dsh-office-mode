@@ -9,7 +9,7 @@
  *
  * 跑法：node test/format-ppt-math.mjs
  */
-import { isKnownCommand, knownCommands, latexToMath, looksLikeLatex, mathPlain } from '../src/formats/ppt-math.js';
+import { isKnownCommand, knownCommands, latexToMath, looksLikeLatex, looksLikePlainFormula, mathPlain } from '../src/formats/ppt-math.js';
 
 const failures = [];
 let checks = 0;
@@ -289,6 +289,78 @@ for (const [latex, needle] of badCases) {
         '\\\\server\\share', '路径 C:\\temp 里有反斜杠', 'D:\\my_files\\notes.txt'];
     for (const text of yes) assert(looksLikeLatex(text), `「${text}」应被判成残留公式`);
     for (const text of no) assert(!looksLikeLatex(text), `「${text}」不该被判成残留公式`);
+}
+
+// ── 8.6 「短公式写成了普通文本」的判据（第五十八轮 新-23） ──────────────────
+//
+// 这一档与 8.5 是**两件事**：8.5 抓的是「进了 math 通道但解析失败」（必然含 `\命令`），
+// 这里抓的是「压根没进通道」（`r=q·r0` 一个反斜杠都没有）。两组用例互相做负例：
+// 谁也别把对方的用例认下来，否则说明两条判据的边界糊了。
+{
+    const yes = [
+        'r=q·r0',                 // 用户原话给的反例
+        '欧姆定律 r=q·r0',         // 中文夹带：最常见的写法
+        'E=mc^2',                 // 上下标
+        'E = mc²',                // Unicode 角标 + 带空格
+        'F=ma',                   // 紧凑赋值
+        'x_1+x_2=0',
+        'f(x)=x^2+1',
+        'S=πr²',
+        'a≈b',
+        'v=s/t',
+        'x=y',
+        'K_1=0.5',
+        'E=mc^2，其中 c 是光速',   // 中文解释 + 中文逗号
+        '由 x=y 可得',
+        'これはテストです a=b',     // 日/韩散文夹带的短等式：切出片段照判（与中文夹带同口径）
+        '테스트 a=b',
+    ];
+    const no = [
+        'Total = 12',                      // 英文散文里的等号
+        'Q1 = revenue + cost',
+        'key=value',                       // 配置项（左边三个字母）
+        'id=abc', 'os=windows', 'Q1=A',    // 复核 P1-1：标识符 / 两字母键 / 两位下标都不判
+        'MY_VAR=x', 'report_final=v2',     // 蛇形标识符（下标不认字母）
+        'Plan→Build',                      // 流程箭头（箭头不算数学证据）
+        'the a=b thing',                   // 三片段以上的句子里的等号是叙述
+        'the answer is x=y',
+        'x = 1',                           // 带空格且右边不是字母
+        'n=100', 'T=273',                  // 右边以数字开头
+        '1+1=2',                           // 纯数字算式（有意不判）
+        'F = ma',                          // 带空格且只有字母（有意不判）
+        'ab=cd',                           // 左边两个字母（有意不判）
+        'x^2+y^2',                         // 没有关系符（有意不判）
+        'a_i', 'x_{i}',                    // 字母下标 / 花括号下标（有意不判）
+        'x<y', 'a>=b',                     // ASCII 不等式（关系符表里只有 ≤ ≥）
+        'D:\\work\\demo project\\demo1',    // Windows 路径
+        'C:\\Users\\alpha\\file',
+        '\\\\server\\share',
+        'https://example.com/a=b',         // URL
+        '路径 C:\\temp 里有反斜杠',
+        '见第 3 页 = 附录',                 // 中文散文里的等号
+        '合计 = 1200 元',
+        '利润=收入-成本',                   // 去掉中文后不剩什么
+        '请把 v 设为 3 = 上限',
+        '1920×1080', '12:30', '2026-10-12',
+        '\\frac{a}{b}','\\unknowncmd{x}',   // 8.5 的地盘
+        '', 'TODO', '今天天气不错',
+    ];
+    for (const text of yes) assert(looksLikePlainFormula(text), `「${text}」应被判成写成了文字的短公式`);
+    for (const text of no) assert(!looksLikePlainFormula(text), `「${text}」不该被判成短公式`);
+    // 本组用例两条判据互不重叠（不是通则：含 `\命令` 又像短公式的文本两条都会 true，
+    // 所以调用方必须自己保证不重复计数 —— Word 侧靠 !suspect，PPT 侧靠整段拒绝）
+    const overlap = yes.filter((text) => looksLikeLatex(text));
+    assert(overlap.length === 0, `本组的正例不该被 looksLikeLatex 认下来：${overlap.join(' / ')}`);
+    // 整段拒绝：解析失败的 math run 回落原文（含反斜杠）不许再被算成「压根没走通道」（复核 P1-2）
+    for (const text of ['E=mc² \\foo', 'F=ma \\bad', 'r=q·r0 \\cdot x', 'r=qr_{0']) {
+        assert(!looksLikePlainFormula(text), `LaTeX 残留「${text}」不该被判成短公式`);
+    }
+    assert(looksLikeLatex('E=mc^2 \\frac{a}') && !looksLikePlainFormula('E=mc^2 \\frac{a}'),
+        '同时像短公式的 LaTeX 文本必须由整段拒绝挡住（否则 PPT 侧会重复计数）');
+    // 判据是纯函数：同输入同输出（文档里报的条数才钉得住）
+    assert(looksLikePlainFormula('r=q·r0') === looksLikePlainFormula('r=q·r0'), '判据必须无状态');
+    // 带 g 的正则若被 .test() 复用会推进 lastIndex：连着判同一段两次必须同结果
+    assert(looksLikePlainFormula('欧姆定律 r=q·r0') === looksLikePlainFormula('欧姆定律 r=q·r0'), '含中文的判据必须无状态');
 }
 
 // ── 9. 真实世界的公式 ──────────────────────────────────────────────────────

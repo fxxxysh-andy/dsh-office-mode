@@ -18,7 +18,7 @@ import assert from 'node:assert/strict';
 
 import { createCache } from '../src/engine/cache.js';
 import { createEnv } from '../src/engine/kit.js';
-import { pdfEngines, pdfInfo, pdfPages, pdfText, probePdfEngines } from '../src/pdf.js';
+import { pdfEngines, pdfInfo, pdfPages, pdfSplit, pdfText, probePdfEngines } from '../src/pdf.js';
 import { defaultPdfReader } from '../src/web.js';
 import { resolveConfig } from '../src/config.js';
 import { executeRun } from '../src/run.js';
@@ -86,7 +86,7 @@ function makePdf(options = {}) {
 
 const root = mkdtempSync(join(tmpdir(), 'office-pdf-'));
 const env = createEnv({ root });
-const cache = createCache({ root, dir: '.office/cache' });
+const cache = createCache({ root, dir: '.office/runtime/cache' });
 const config = resolveConfig({});
 
 const textPdf = join(root, 'text.pdf');
@@ -195,6 +195,29 @@ await check('pdf：引擎探测结果可读（给报错与设置页用）', asyn
     return `render=[${engines.render.join(',')}] text=[${engines.text.join(',')}]`;
 });
 
+
+await check('pdf：按页拆分大文件，每份都是完整 PDF，单页超限会标明', async () => {
+    const engines = await pdfEngines();
+    if (!engines.render.includes('fitz')) skip('本机没有 PyMuPDF，无法测拆分');
+    const tiny = await pdfSplit(textPdf, { outDir: join(root, 'split-tiny'), targetBytes: 1 }, env, cache);
+    assert.equal(tiny.pages, 2);
+    assert.equal(tiny.parts.length, 2, '目标 1 字节时每页各成一份');
+    assert.deepEqual(tiny.parts.map((part) => [part.from, part.to, part.pages]), [[1, 1, 1], [2, 2, 1]]);
+    for (const part of tiny.parts) {
+        assert.equal(part.tooLarge, true, '单页仍超过目标时明确标 tooLarge');
+        assert.equal(existsSync(part.path), true, part.path);
+        const partInfo = await pdfInfo(part.path, env, { cache });
+        assert.equal(partInfo.pages, 1, '拆出来的文件必须是可读的完整 PDF');
+    }
+    const whole = await pdfSplit(textPdf, { outDir: join(root, 'split-whole'), targetBytes: 10 * 1024 * 1024 }, env, cache);
+    assert.equal(whole.parts.length, 1);
+    assert.equal(whole.parts[0].pages, 2);
+    assert.equal(whole.parts[0].tooLarge, false);
+    assert.ok(whole.parts[0].bytes <= 10 * 1024 * 1024);
+    const back = await pdfInfo(whole.parts[0].path, env, { cache });
+    assert.equal(back.pages, 2);
+});
+
 await check('缓存：子目录路径可用，向上跳会被拒', () => {
     const written = cache.write('pdf/a/b.png', Buffer.from([1, 2, 3]));
     assert.equal(written.bytes, 3);
@@ -218,7 +241,7 @@ await check('缓存：TTL 只清过期条目，新文件不动', () => {
 
 await check('缓存：容量上限从最旧的开始删', () => {
     const dir = mkdtempSync(join(tmpdir(), 'office-tmp-cap-'));
-    const small = createCache({ root: dir, dir: '.office/cache' });
+    const small = createCache({ root: dir, dir: '.office/runtime/cache' });
     small.write('a.bin', Buffer.alloc(40));
     small.write('b.bin', Buffer.alloc(40));
     const old = new Date(Date.now() - 3600 * 1000);
@@ -236,7 +259,7 @@ await check('office_run：缓存跨调用保留（这是缓存命中的前提）
     }, { agent: { session: { header: { cwd: runRoot } } } }, resolveConfig({}));
     assert.equal(first.ok, true, first.error?.message);
     assert.equal(first.cache.clearedAfter, false, '默认不该清空');
-    assert.equal(existsSync(join(runRoot, '.office', 'cache', 'keep.json')), true, '第一次写下的中间文件必须还在');
+    assert.equal(existsSync(join(runRoot, '.office', 'runtime', 'cache', 'keep.json')), true, '第一次写下的中间文件必须还在');
 
     const second = await executeRun({
         script: `const files = office.cache.list().filter((f) => !f.dir).map((f) => f.name);
@@ -251,10 +274,10 @@ await check('office_run：缓存跨调用保留（这是缓存命中的前提）
         keepCache: false,
     }, { agent: { session: { header: { cwd: runRoot } } } }, resolveConfig({}));
     assert.equal(cleared.cache.clearedAfter, true);
-    assert.equal(existsSync(join(runRoot, '.office', 'cache')), false, 'keepCache:false 才清空');
+    assert.equal(existsSync(join(runRoot, '.office', 'runtime', 'cache')), false, 'keepCache:false 才清空');
 
     const text = renderRun(second);
-    assert.match(text, /缓存：\.office\/cache 保留/);
+    assert.ok(!text.includes('缓存：'), '没有命中 / 清理时不贴缓存行');
     rmSync(runRoot, { recursive: true, force: true });
 });
 
@@ -264,7 +287,7 @@ await check('office_run：过期缓存会在下次调用开始时清掉', async 
         script: `office.cache.write('old.json', {a:1}); return 1;`,
     }, { agent: { session: { header: { cwd: runRoot } } } }, resolveConfig({}));
     assert.equal(first.ok, true, first.error?.message);
-    const stale = join(runRoot, '.office', 'cache', 'old.json');
+    const stale = join(runRoot, '.office', 'runtime', 'cache', 'old.json');
     const old = new Date(Date.now() - 48 * 3600 * 1000);
     utimesSync(stale, old, old);
 

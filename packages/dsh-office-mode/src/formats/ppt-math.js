@@ -247,6 +247,127 @@ export function looksLikeLatex(text) {
     return known.length >= 1 && /[[\]_^]/.test(source);
 }
 
+// ─── 「短公式写成了普通文本」的判据（第五十八轮 新-23） ─────────────────────
+
+/** 「短公式」窗口：超过这个长度就不再是「下意识写成文字」的场景（长公式一般会走 math）。 */
+export const PLAIN_FORMULA_MAX_CHARS = 60;
+
+/**
+ * 明显属于数学的符号。两样东西**不算**证据：加减乘除四个号（散文里到处都是，
+ * 一放进来误报就成灾），以及流程箭头 `→` / `⇒`（`Plan→Build` 是流程记号，不是公式）。
+ */
+const PLAIN_FORMULA_SYMBOL = /[·⋅×÷±∓√∑∏∐∫∮∞∂∇≈≃≅≤≥≠≡≪≫∝∈∉⊂⊆⊃⊇∪∩∧∨⟨⟩⌊⌋⌈⌉]/;
+/**
+ * 上下标：**下标后面必须是数字**（`x_1`、`K_2`），上标后面可以是字母或数字（`x^2`、`x^n`）。
+ * 为什么下标不认字母：`字母_字母` 是蛇形标识符（`MY_VAR`、`report_final`），
+ * 与数学下标在正则层面分不开 —— 宁可漏掉 `a_i`，也不要指着变量名说它是公式（复核 P1-1）。
+ */
+const PLAIN_FORMULA_SCRIPT = /[A-Za-z0-9)]\s*(?:_\s*[0-9]|\^\s*[A-Za-z0-9])/;
+/** Unicode 角标：`S=πr²`、`aₙ`。 */
+const PLAIN_FORMULA_SUPER = /[⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎]/;
+/** 函数名带括号：`sin(x)`、`log(x)`、`max(a, b)`。 */
+const PLAIN_FORMULA_FUNC = /(?:^|[^A-Za-z])(?:sin|cos|tan|cot|sec|csc|log|ln|lg|exp|lim|max|min|det|dim|gcd|arg)\s*\(/;
+/** 函数记号：单字母函数名 + 括号 + 关系符，`f(x)=…`、`g(x,y)≤…`、`p(x)>=0`。 */
+const PLAIN_FORMULA_FUNCTION_FORM = /\b[A-Za-z]\s*\([^()]{1,20}\)\s*[=<>≈≤≥≠]/;
+/** 关系符：没有关系的词组（「合计」「方案 A」）根本不是等式。 */
+const PLAIN_FORMULA_RELATION = /[=≈≃≅≤≥≠≡∝→⇒⇔]/;
+/**
+ * 无空格的**紧凑赋值**：`F=ma`、`v=s/t`、`x=y`。
+ * 三条限制都是为了把标识符与配置项挡在外头（复核 P1-1）：左边**只许一个字母**
+ * （`id=abc`、`os=windows`、`Q1=A` 不判）、右边必须以字母开头（`x=1`、`n=100`、`T=273` 不判）、
+ * 整串不许有空白（`F = ma`、`Q1 = revenue + cost` 不判）。右边另有 24 字符硬上限（见函数文档）。
+ */
+const PLAIN_FORMULA_ASSIGN = /^[A-Za-z]=[A-Za-z][A-Za-z0-9/()*^_.]{0,23}$/;
+/**
+ * 中文 / 日文 / 韩文与全角标点：命中即不判（散文、方案名、`总计=1200` 都在这里挡掉）。
+ * 假名与谚文一并算进来 —— 仓库别处判 CJK 也是这个字符集，日韩散文里的 `a=b` 才不会被误判。
+ */
+const PLAIN_FORMULA_CJK = /[\u3000-\u303F\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7A3\uF900-\uFAFF\uFF00-\uFFEF]/;
+/**
+ * LaTeX 残留的形态：反斜杠与花括号。这类文本归 `looksLikeLatex()` 与「公式解析失败」那条线，
+ * 而且**要在整段文本上就拒掉** —— 复核 P1-2 抓到的正是「只按片段拒」的破口：
+ * 解析失败的 math run 会原样回落成 `<a:t>E=mc² \foo</a:t>`，按空白切段之后
+ * `E=mc²` 这一段照样命中，于是同一条被同时算进 `formulaErrors` 与 `plainFormulas`，
+ * 读侧还给出方向相反的建议（「压根没走通道」）。
+ */
+const PLAIN_FORMULA_LATEX_RESIDUE = /[\\{}]/;
+/**
+ * 同一个字符集的**全局**版本，专供 `replace` 用。
+ * 刻意不把 `g` 写在上面那一条上：带 `g` 的正则 `.test()` 会推进 `lastIndex`，
+ * 同一个正则连着判两段文本就会忽真忽假（这一类 bug 极难查）。
+ */
+const PLAIN_FORMULA_CJK_G = new RegExp(PLAIN_FORMULA_CJK.source, 'g');
+/** 句子级标点：命中即不判（问句、分号列举、感叹句都不是公式）。 */
+const PLAIN_FORMULA_SENTENCE = /[;?!]/;
+
+/**
+ * 单个**无中文候选片段**是不是短公式（`looksLikePlainFormula` 的内核）。
+ * 每一步都同时成立才算，任何一步不成立就返回 false —— 判据宁可漏报也不误报。
+ * `allowAssign` 单独管「紧凑赋值」那一档：它只在短文本上成立（见调用方的注释）。
+ */
+function plainFormulaFragment(fragment, allowAssign) {
+    const source = String(fragment ?? '').trim();
+    if (source.length < 3 || source.length > PLAIN_FORMULA_MAX_CHARS) return false;
+    if (source.includes('\\') || source.includes(':')) return false;
+    if (PLAIN_FORMULA_CJK.test(source) || PLAIN_FORMULA_SENTENCE.test(source)) return false;
+    if (!PLAIN_FORMULA_RELATION.test(source)) return false;
+    if (PLAIN_FORMULA_SYMBOL.test(source)) return true;
+    if (PLAIN_FORMULA_SUPER.test(source)) return true;
+    if (PLAIN_FORMULA_SCRIPT.test(source)) return true;
+    if (PLAIN_FORMULA_FUNC.test(source)) return true;
+    if (PLAIN_FORMULA_FUNCTION_FORM.test(source)) return true;
+    if (allowAssign && !/\s/.test(source) && PLAIN_FORMULA_ASSIGN.test(source)) return true;
+    return false;
+}
+
+/**
+ * 一段**普通文本**是不是「本该走 math 通道，却被当成文字写下来」的**短公式**。
+ *
+ * 与 `looksLikeLatex()` 的分工（两条判据解决的是两件事，别混用）：
+ *   - `looksLikeLatex()` 管「公式**进了** math 通道但解析失败、原文被按字面量留下来」——
+ *     那种文本**必然**含 `\命令`；
+ *   - 本条管**压根没进通道**的短公式：`r=q·r0`、`E=mc²`、`F=ma` 一个反斜杠都没有，
+ *     上面那条判据永远看不见它们（用户第五十八轮点名的正是这一档）。
+ * 两条判据不保证互斥：含 `\命令` 又像短公式的文本（`E=mc² \frac{a}`）会同时命中，
+ * 所以**调用方必须自己保证不重复计数** —— Word 侧靠 `!suspect`，PPT 侧靠下面的整段拒绝。
+ *
+ * 候选怎么切：中文夹带短公式是最常见的写法（「欧姆定律 r=q·r0」），所以先把中文换成空格，
+ * 再同时试**整段**（保空格，抓 `E = mc²` 这种）与**每个空白切出的片段**（抓中文夹带的那种）；
+ * 文本本身不含中文时，原串也作为一个候选。中文一律不作为证据。
+ *
+ * 判据（对每个候选）**宁可漏报也不误报** —— 误报会让模型学会忽略这条告警：
+ *   0. 整段文本不含 `\` `{` `}`（LaTeX 残留与解析失败的回落原文都不算短公式，见 P1-2）；
+ *   1. 长度 3–60（更短是噪声，更长一般会走 math）；
+ *   2. 片段不含 `\` 与 `:`（Windows 路径、URL、LaTeX 残留交给 `looksLikeLatex`）；
+ *   3. 片段不含中文（含中文标点）与 `;?!`；
+ *   4. 至少有一个关系符 `=` `≈` `≤` `≥` `≠` `∝` `→`；
+ *   5. 至少有一条数学证据：数学符号 / 上下标（下标后接数字）/ Unicode 角标 /
+ *      函数名带括号 / 单字母函数记号 / 无空格的紧凑赋值（仅当整段不超过两个片段时）。
+ *
+ * **照实记的漏报边界**（有意为之，不是没做）：没有关系符的片段（`x^2+y^2`）、
+ * 带空格且只有字母的赋值（`F = ma`）、右边不以字母开头的（`x=1`、`n=100`、`T=273`）、
+ * 右边超过 24 字符的紧凑赋值、ASCII 不等式（`x<y`、`a>=b`，关系符表里只有 `≤` `≥`）、
+ * 字母下标（`a_i`）、带花括号的下标（`x_{i}`）、流程箭头（`Plan→Build`）、纯数字算式（`1+1=2`）。
+ * **误报边界**同样照实记：真公式与「英文散文里的短等式」在判据层面分不开，
+ * 所以 `the a=b thing` 这类**两片段以内**的文本里的 `a=b` 仍会命中（告警里写了
+ * 「确实要当文字用可以忽略这条」）；三片段以上的句子里的 `a=b` 不判（那多半是叙述）。
+ */
+export function looksLikePlainFormula(text) {
+    const raw = String(text ?? '').trim();
+    if (raw === '') return false;
+    // 整段拒绝：LaTeX 残留与「解析失败的 math run 回落原文」都在这里退场（复核 P1-2）
+    if (PLAIN_FORMULA_LATEX_RESIDUE.test(raw)) return false;
+    const hasCjk = PLAIN_FORMULA_CJK.test(raw);
+    const stripped = hasCjk ? raw.replace(PLAIN_FORMULA_CJK_G, ' ').trim() : raw;
+    if (stripped === '') return false;
+    const pieces = stripped.split(/\s+/);
+    // 紧凑赋值只在**短文本**上生效：切出三个以上片段说明这是一句话（「the a=b thing」），
+    // 句子里的等号是叙述而不是公式。整段候选与逐片段用同一个开关。
+    const allowAssign = pieces.length <= 2;
+    const candidates = hasCjk ? [stripped, ...pieces] : [raw, ...pieces];
+    return candidates.some((piece) => plainFormulaFragment(piece, allowAssign));
+}
+
 // ─── 词法 ───────────────────────────────────────────────────────────────────
 
 /**

@@ -5,8 +5,8 @@
  * office_run         —— 一次调用完成一批办公操作，结果自动复检。
  * office_memory      —— 三层记忆的读写与检索。
  * office_search_run  —— 内置检索直查（不需要子代理、也不需要提纲）。
- * office_search_brief / office_search_dispatch / office_parse_findings
- *                    —— 按渠道的检索三步（出提纲 → 执行 → 解析回摘要）。
+ * office_search_dispatch / office_parse_findings
+ *                    —— 按渠道的覆盖检索（出提纲并执行 → 解析回摘要）。
  *
  * 把「少调用、批量做」做成工具形状而不是提示词要求：模型没有"一条一条来"
  * 的入口，想改十处就只能写一次脚本。
@@ -17,28 +17,27 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
 import { availableHelpTopics, buildHelp } from './docs.js';
 import { parseFindings, renderFindings } from './findings.js';
+import { RETURN_ECHO_CHARS } from './config.js';
 import {
     createMemory,
     DEFAULT_ENTRY_LIMIT_BYTES,
-    renderEntities,
     renderExport,
     renderImport,
     renderKb,
-    renderLink,
     renderLog,
     renderMutation,
     renderRead,
-    renderRelated,
+    renderRecall,
     renderStatus,
     renderSunk,
-    renderUnlink,
 } from './memory.js';
+import { executeGalleryAction, renderGalleryValue } from './gallery-tool.js';
+import { resolveCallScope } from './kb-session-scope.js';
 import { migrateMnemon, renderMigration } from './migrate.js';
 import { hintOnce, projectDigest, sessionIdOf, signalOf } from './projection.js';
 import { createTurnQuota } from './quota.js';
 import { executeRun } from './run.js';
-import { dispatchSearch, excerptOf, parseResultFiles, renderDispatch, stepError, writeBrief } from './search.js';
-import { buildBrief, contentTypeIds, guessContentType } from './search-routes.js';
+import { dispatchSearch, excerptOf, parseResultFiles, renderDispatch, stepError } from './search.js';
 import { noteWorkspace } from './view.js';
 import {
     createWebAccess,
@@ -53,7 +52,6 @@ import {
 } from './web.js';
 import {
     effectiveSiteEntries,
-    groupSitesByType,
     matchSiteEntry,
     selectSiteEntries,
     SITE_PRIORITY_LIMITS,
@@ -61,6 +59,7 @@ import {
     summarizeSiteHits,
 } from './site-catalog.js';
 import { proxyStatus } from './web-proxy.js';
+import { describeRebuildState } from './rebuild-state.js';
 
 function textBlock(text) {
     return [{ type: 'text', text }];
@@ -77,16 +76,13 @@ function compactJson(value) {
     if (value === null || value === undefined) return '（无）';
     try {
         const text = JSON.stringify(value);
-        // 上限从 600 提到 4000：office.pdf.pages() 这类返回值要带一页一条的路径清单，
-        // 600 会把后半截页面直接吃掉（模型拿到的是截断 JSON，只能靠猜）。
+        // 上限是 1200 字符（中文下约 3.6 KB）：`office.pdf.pages()` 这类返回值要带一页
+        // 一条的路径清单，600 会把后半截页面直接吃掉（模型拿到的是截断 JSON，只能靠猜）。
         return text.length > RETURN_ECHO_CHARS ? `${text.slice(0, RETURN_ECHO_CHARS)}…` : text;
     } catch {
         return String(value);
     }
 }
-
-/** 脚本返回值回显的字符上限（4000 提到这里是因为中文下 4000 字符 ≈ 12 KB）。 */
-const RETURN_ECHO_CHARS = 1200;
 
 /** 单条 outline 最多回显几项（剩下的只报条数）。 */
 const OUTLINE_ECHO_MAX = 8;
@@ -137,14 +133,19 @@ function renderStats(stats) {
 /** 把执行结果渲染成模型直接可读的中文反馈。 */
 export function renderRun(value) {
     const lines = [];
+    // 脚本来自文件时先报它：失败时下面的「脚本第 N 行」是**那份文件**里的行号。
+    const scriptFile = typeof value.scriptFile === 'string' && value.scriptFile !== '' ? value.scriptFile : null;
     if (value.ok === true) {
         lines.push(`✅ office_run 完成（${value.elapsedMs} ms）${value.purpose ? `：${value.purpose}` : ''}`);
     } else {
         const error = value.error ?? {};
-        lines.push(`❌ office_run 执行失败：${error.name ?? 'Error'}：${error.message ?? '未知错误'}`);
+        lines.push(`❌ office_run 执行失败${scriptFile === null ? '' : `（${scriptFile}）`}：${error.name ?? 'Error'}：${error.message ?? '未知错误'}`);
         // line / column 可能是 null（找不到位置时），别渲染成「脚本第 null 行」。
         if (typeof error.line === 'number') {
             lines.push(`   脚本第 ${error.line} 行${typeof error.column === 'number' ? ` 第 ${error.column} 列` : ''}`);
+        } else if (/timed out|超时/.test(String(error.message ?? ''))) {
+            // 超时是**中断**，不是抛错：栈里没有可换算的位置。说清这一点，别让模型以为行号丢了。
+            lines.push('   （脚本超时被中断，无法定位到具体行；要定位就拆小脚本或调大脚本超时。）');
         }
         if (Array.isArray(error.stack) && error.stack.length > 0) {
             lines.push(...error.stack.slice(0, 3).map((frame) => `   ${frame}`));
@@ -153,6 +154,7 @@ export function renderRun(value) {
             lines.push('   （失败前已经写出的文件仍然保留，见下）');
         }
     }
+    if (scriptFile !== null) lines.push(`   脚本来源：${scriptFile}`);
 
     if (value.files.length > 0) {
         lines.push('', `文件（${value.files.length}）`);
@@ -214,16 +216,19 @@ export function renderRun(value) {
     if (cache.clearedAfter === true) {
         lines.push('', `缓存：${cache.dir} 已清空（keepCache:false）`);
     } else {
-        // 缓存块压成一行（第十七轮）：原来那行 TTL 说明每次调用都一模一样，
-        // 而 kept / pruned / hits 这些数字本来就进缓存前缀、每变一次都会让
-        // 后面所有内容重算 —— 值不动的一行比三行更省，也更好读。
+        // 缓存块只在**有动静**时出现（第七十九轮）：命中复用与过期清理是这次调用
+        // 的新信息；「还留着 N 个」在两次交付之间往往一模一样，每次调用都贴就是
+        // 前缀税（用户原话：没有变的像税费）。目录、TTL 与清空方式在 office_help
+        // 的 cache 话题里，这里不再重复。
         const size = formatBytes(cache.keptBytes ?? 0);
-        const reused = cache.hits > 0 ? `，命中复用 ${cache.hits} 项（${formatBytes(cache.hitBytes ?? 0)}）` : '';
+        const reused = cache.hits > 0 ? `命中复用 ${cache.hits} 项（${formatBytes(cache.hitBytes ?? 0)}）` : '';
         const pruned = Array.isArray(cache.pruned) && cache.pruned.length > 0
-            ? `，清掉 ${cache.pruned.length} 个过期文件（${formatBytes(cache.prunedBytes ?? 0)}）`
+            ? `清掉 ${cache.pruned.length} 个过期文件（${formatBytes(cache.prunedBytes ?? 0)}）`
             : '';
-        const ttl = cache.ttlMinutes > 0 ? `，${cache.ttlMinutes} 分钟没碰过下次开始时清掉` : '';
-        lines.push('', `缓存：${cache.dir} 保留 ${cache.kept ?? 0} 个中间文件（${size}）${reused}${pruned}${ttl}；立即清空用 office.cache.clear()`);
+        const activity = [reused, pruned].filter(Boolean).join('，');
+        if (activity !== '') {
+            lines.push('', `缓存：${activity}；现有 ${cache.kept ?? 0} 个（${size}）。立即清空用 office.cache.clear()`);
+        }
     }
     return lines.join('\n');
 }
@@ -272,12 +277,12 @@ export function officeRunErrorResult(value) {
     };
 }
 
-const briefParameters = {
+const dispatchParameters = {
     type: 'object',
     properties: {
         topic: {
             type: 'string',
-            description: '要检索的主题，一句话写清楚（如「某地化工厂爆炸」）。',
+            description: '要检索的主题，一句话写清楚（如「某地化工厂爆炸」）。给了 topic 就自动按内容类型出提纲（brief.md 落盘，可审计可复用）并逐渠道执行。',
         },
         type: {
             type: 'string',
@@ -287,25 +292,13 @@ const briefParameters = {
             type: 'string',
             description: '选填：这批资料用在哪（如「写一份 12 页的汇报 PPT」），决定详略取舍。',
         },
-        files: {
-            type: 'array',
-            description: '选填：接收结果的相对路径，按渠道分组，第 i 个对应提纲里第 i 个渠道。',
-            items: { type: 'string' },
-        },
-    },
-    required: ['topic'],
-};
-
-const dispatchParameters = {
-    type: 'object',
-    properties: {
         briefPath: {
             type: 'string',
-            description: 'office_search_brief 写下的提纲文件路径。',
+            description: '选填：已有提纲的路径（上一轮落盘的 brief.md），用于改渠道或重跑；不给就按 topic 现场出一份。',
         },
         outputPaths: {
             type: 'array',
-            description: '每个渠道一个结果文件路径；子代理会把找到的材料写进这些文件。顺序与提纲里的渠道一致。',
+            description: '选填：每个渠道一个结果文件路径，顺序与提纲渠道一致；不给就按渠道数自动生成。',
             items: { type: 'string' },
         },
         maxParallel: {
@@ -313,7 +306,7 @@ const dispatchParameters = {
             description: '同时铺开的子代理数量上限，默认 4。渠道多时不要一次全开。',
         },
     },
-    required: ['briefPath', 'outputPaths'],
+    // topic 与 briefPath 至少给一个 —— dispatchSearch 校验并给出可照抄的形状。
 };
 
 const parseParameters = {
@@ -332,21 +325,12 @@ const parseParameters = {
             type: 'string',
             description: '选填：主题，用于按类型生成核对清单。',
         },
+        draft: {
+            type: 'string',
+            description: '选填：已落盘的产物正文（md / txt）。给了就做句级引用审计，没过会 ok:false。',
+        },
     },
     required: ['paths'],
-};
-
-const briefOutputSchema = {
-    type: 'object',
-    properties: {
-        ok: { type: 'boolean' },
-        topic: { type: 'string' },
-        type: { type: 'string' },
-        typeName: { type: 'string' },
-        briefPath: { type: 'string' },
-        text: { type: 'string' },
-    },
-    additionalProperties: true,
 };
 
 const dispatchOutputSchema = {
@@ -393,7 +377,7 @@ const searchRunParameters = {
             type: 'string',
             description: '选一条检索通道（不传 = 按设置页的顺序自动挑）。可选：'
                 + PROVIDER_IDS.map((id) => (id === 'bocha' ? 'bocha（中文好）' : (id === 'duckduckgo' ? 'duckduckgo（免 Key）' : id))).join(' / ')
-                + '。seam = 宿主 web 服务，anthropic / openai = 兼容端点的原生检索。',
+                + '。seam = 宿主 web 服务，deepseek-api = 官方检索接口直连（默认第一），openai = 兼容端点的原生检索。',
         },
         preprocess: {
             type: 'string',
@@ -502,108 +486,70 @@ const memoryParameters = {
     properties: {
         action: {
             type: 'string',
-            description: 'read / add / replace / remove / log / link / unlink / related / entities / status'
-                + ' / sunk / kb-ingest / kb-search / kb-read / kb-list / kb-drop'
-                + ' / export / import / migrate（整包备份只增不改、按 id 幂等）。',
+            description: 'read / recall / add / replace / remove / log / status / sunk'
+                + ' / kb-ingest / kb-search / kb-read / kb-list / kb-tree / kb-drop'
+                + ' / kb-update / kb-edit / kb-link / kb-related / kb-summarize / kb-summaries'
+                + ' / gallery / export / import（只增不改） / migrate。',
         },
-        target: {
-            type: 'string',
-            description: 'add / replace / remove 用：user = 用户偏好；project = 项目事实与约定（默认）。',
-        },
+        target: { type: 'string', description: 'add/replace/remove：user 偏好；project 事实（默认）。' },
+        scope: { type: 'string', description: '写操作选根：workspace/global；省略按设置。' },
         content: {
             type: 'string',
-            // 单条上限**从真源现取**（memory.js 的 DEFAULT_ENTRY_LIMIT_BYTES）：手写一个数字
-            // 就会漂（第四十七轮那条教训）。它是**默认值**，设置页可改，所以文案里点明。
-            // 「超了怎么办」不在这里重复：拒绝时的报错里已经给了三条去处（压缩 / source / kb）。
-            description: 'add / replace 用：一两句、自包含（不写检索原文与一次性进度）。'
-                + `单条上限 ${DEFAULT_ENTRY_LIMIT_BYTES} 字节（0 = 不限），超了会被拒。`,
+            description: 'add/replace：一两句。'
+                + `单条上限 ${DEFAULT_ENTRY_LIMIT_BYTES} 字节，超了会被拒。`,
         },
+        title: { type: 'string', description: 'kb-summarize：摘要标题（默认「块摘要」）。' },
+        text: { type: 'string', description: 'kb-summarize：摘要正文。' },
+        chunkId: { type: 'string', description: 'kb-related：从哪一块出发（块 id）。' },
+        chunkIds: { type: 'array', description: 'kb-summarize：参与合成的块 id。', items: { type: 'string' } },
         tier: {
             type: 'string',
-            description: 'add / kb-ingest 用：来源档 user（默认）/ verified（≥2 独立来源）/ unverified（单源，永不得进热记忆）；kb-search 可筛。',
+            description: 'add / kb-ingest：来源档 user / verified（≥2 独立来源）/ unverified（单源，进不了热记忆）。',
         },
-        oldText: {
+        oldText: { type: 'string', description: 'replace / remove：能唯一命中旧条目的原文片段（多条被拒）。' },
+        importance: { type: 'string', description: 'critical / normal / low（默认 normal）；critical = 必须。' },
+        entities: { type: 'array', description: 'add / replace / read / recall：实体名，只存条目自带的。', items: { type: 'string' } },
+        tags: { type: 'array', description: 'add / replace / read / recall：自由标签，参与检索。', items: { type: 'string' } },
+        layer: { type: 'string', description: 'read / recall：hot / ledger / archive / all。' },
+        query: { type: 'string', description: 'read/recall/kb-search：检索词（空格分词），占每回合配额。' },
+        limit: { type: 'integer', description: 'read / recall / kb-list / kb-search：最多几条。' },
+        since: { type: 'string', description: 'read / recall：时间窗起点（2026-09-27 / 今天 / 上周 / 本月）。' },
+        until: { type: 'string', description: 'read / recall：时间窗终点，写法同 since。' },
+        id: { type: 'string', description: 'replace / remove / kb-read / kb-drop：条目/块 id（read 行首第二段）。' },
+        sourceId: { type: 'string', description: 'kb-link：起点块 id。' },
+        targetId: { type: 'string', description: 'kb-link：终点块 id（两端都要真实存在）。' },
+        kind: { type: 'string', description: 'kb-link：related（默认）/ refines / supersedes / contradicts / supports / derives；kb-related 只看某一类。' },
+        depth: { type: 'integer', description: 'kb-related：走几跳（1-3，默认 1）。' },
+        packPath: { type: 'string', description: 'export / import：Pack 路径（export 留空写记忆目录）。' },
+        path: { type: 'string', description: '文档路径（相对工作目录）；log / kb-*。' },
+        folder: { type: 'string', description: '知识库虚拟文件夹；空 = 根。' },
+        recursive: { type: 'boolean', description: 'folder 是否含子文件夹（默认 true）。' },
+        ai: { type: 'boolean', description: 'kb-ingest：开模型切片/摘要，默认关。' },
+        aiModel: { type: 'string', description: 'kb-ingest：覆盖模型（host 写 provider/model）。' },
+        aiEstimate: { type: 'boolean', description: 'kb-ingest：只预估不调模型。' },
+        aiResume: { type: 'boolean', description: 'kb-ingest：续跑暂停任务。' },
+        op: {
             type: 'string',
-            description: 'replace / remove 用：能唯一命中那一条的原文片段（命中多条被拒）。',
+            description: 'gallery：list / search / add / tag / describe / index / status / remove（默认 list）。',
         },
-        importance: {
-            type: 'string',
-            description: 'critical / normal / low（默认 normal）；critical = 明确的「必须 / 永远不要」。',
-        },
-        entities: {
-            type: 'array',
-            description: 'add / replace 用（选填）：实体名，填了才进实体视图（不猜）。',
-            items: { type: 'string' },
-        },
-        tags: {
-            type: 'array',
-            description: 'add / replace 用（选填）：自由标签，参与归档检索。',
-            items: { type: 'string' },
-        },
-        layer: {
-            type: 'string',
-            description: 'read 用：hot / ledger / archive / all（默认，各给额度）。',
-        },
-        query: {
-            type: 'string',
-            description: 'read / kb-search 用：检索关键词（空格分词）。两者都占每回合配额。',
-        },
-        limit: {
-            type: 'integer',
-            description: 'read / kb-list / kb-search 用：最多几条（有硬上限）。',
-        },
-        since: {
-            type: 'string',
-            description: 'read 用：时间窗起点（2026-09-27 或今天 / 上周 / 本月 / 最近7天），解析不了会报错。',
-        },
-        until: {
-            type: 'string',
-            description: 'read 用：时间窗终点，写法同 since（本地时区）。',
-        },
-        id: {
-            type: 'string',
-            description: 'related / unlink / replace / remove / kb-read / kb-drop 用：条目或块 id（read 行首去掉「- 」后的第二段）；给了它不必再用 oldText。',
-        },
-        sourceId: { type: 'string', description: 'link 用：起点 id。' },
-        targetId: { type: 'string', description: 'link 用：终点 id（两端都要真实存在）。' },
-        kind: {
-            type: 'string',
-            description: 'link 用：related（默认）/ refines / supersedes / contradicts / supports / derives。related 用：只看某一类。',
-        },
-        conflict: {
-            type: 'string',
-            description: 'link 用（kind:contradicts）：context-memory / inter-context / intra-memory。',
-        },
-        state: {
-            type: 'string',
-            description: 'link 用（kind:contradicts）：unresolved（默认）/ prefer-source / prefer-target。',
-        },
-        depth: {
-            type: 'integer',
-            description: 'related 用：走几跳（1-3，默认 1）。',
-        },
-        packPath: {
-            type: 'string',
-            description: 'export / import 用：Pack 路径（export 留空写记忆目录下 pack-<时间戳>.json）。',
-        },
-        path: {
-            type: 'string',
-            description: 'log / kb-ingest / kb-read / kb-drop 用：相对工作目录的路径；非 Office 产物不自动登记。kb-search 可筛。',
-        },
-        from: {
-            type: 'string',
-            description: 'migrate 用：mnemon 数据根（默认 .mnemon）。',
-        },
-        dryRun: {
+        name: { type: 'string', description: 'gallery add/tag：名称；空串清空。' },
+        description: { type: 'string', description: 'gallery add/tag：改写描述，优先于模型总结。' },
+        category: { type: 'string', description: 'gallery：分类名；空串清空。' },
+        favorite: { type: 'boolean', description: 'gallery：收藏。' },
+        note: { type: 'string', description: 'gallery：细节备注，与事实分开。' },
+        allowUpload: {
             type: 'boolean',
-            description: 'migrate 用：true 只统计不落盘。',
+            description: 'gallery：明确同意上传；describe、图片向量、以图搜图缺它拒绝。',
         },
-        format: { type: 'string', description: 'log 用：格式，如 word / excel / ppt / tex / pdf。' },
-        theme: { type: 'string', description: 'log 用：主题 id。' },
-        purpose: { type: 'string', description: 'log 用：这份产物是做什么的。' },
+        image: { type: 'string', description: 'gallery search：图库图 ID（64 位十六进制）。' },
+        from: { type: 'string', description: 'migrate：mnemon 数据根（默认 .mnemon）。' },
+        dryRun: { type: 'boolean', description: 'migrate：true 只统计不落盘。' },
+        format: { type: 'string', description: 'log：word / excel / ppt / tex / pdf。' },
+        theme: { type: 'string', description: 'log：主题 id。' },
+        purpose: { type: 'string', description: 'log：这份产物做什么。' },
         source: {
             type: 'array',
-            description: 'log / add 用：材料来源（路径 / URL）；kb:<哈希>:<块号> 形的块 id 另存为引用（add 传空数组 = 清掉引用）。',
+            description: 'log / add：来源（路径 / URL）；kb:<哈希>:<块号> 存引用（空数组清掉）。',
             items: { type: 'string' },
         },
     },
@@ -642,7 +588,15 @@ const runParameters = {
     properties: {
         script: {
             type: 'string',
-            description: '要执行的 JavaScript 脚本。可以用 office.word / office.excel / office.ppt 造文档，用 office.tex 生成 LaTeX 论文源码并编译 PDF，用 office.av 把录音 / 视频转成文字并给视频抽帧，用 office.files 批量改文件，用 office.python 做科学计算与绘图，最后 return 一个值。语法细节先 office_help。',
+            description: '要执行的 JavaScript 脚本（与 scriptFile 二选一）：用 office 对象直接写多步，最后 return 一个值。',
+        },
+        scriptFile: {
+            type: 'string',
+            description: '脚本文件路径（与 script 二选一）：从工作目录读一份 .js 当脚本跑 —— 同一段构建器不必每次内联，配 args 按参数复用。',
+        },
+        args: {
+            type: 'object',
+            description: '传给脚本的参数（选填）：脚本里以全局 args 读到，同一个 scriptFile 因此能按参数复用。',
         },
         purpose: {
             type: 'string',
@@ -650,10 +604,9 @@ const runParameters = {
         },
         keepCache: {
             type: 'boolean',
-            description: 'false 时这次调用结束就清空缓存目录（默认保留，保留才能跨调用复用：例如渲染好的 PDF 页面图下一步还要 read_image）。',
+            description: 'false 时这次调用结束就清空缓存目录（默认保留：渲染好的 PDF 页面图下一步还要 read_image）。',
         },
     },
-    required: ['script'],
 };
 
 const helpOutputSchema = {
@@ -688,79 +641,7 @@ const runOutputSchema = {
     additionalProperties: true,
 };
 
-/**
- * office_search_brief：出提纲并落盘。
- *
- * 提纲写成文件而不是只在返回值里给一段文本，是因为紧接着派工与若干轮 * 补检索都要用它当规格；落在盘上，子代理和后续调用都能拿到同一份。
- */
-/**
- * 提纲反馈里的「站点优先清单」几行（第三十四轮；没启用或没有条目时返回空数组）。
- *
- * 放这里而不是提纲文件里：提纲文件是**渠道规格**，站点清单是**跨渠道的资源**，
- * 混在一起会让「渠道数 / outputPaths 一一对应」这条硬约束变模糊。
- */
-function siteBriefLines(config) {
-    const sites = config?.search?.sites ?? {};
-    if (sites.enabled === false) return [];
-    const entries = effectiveSiteEntries(sites);
-    const groups = groupSitesByType(entries.filter((item) => item.enabled !== false));
-    if (groups.length === 0) return [];
-    const lines = ['站点优先清单（工具默认就按它限定，也可以用 sites 参数点名）：'];
-    for (const group of groups) {
-        lines.push('- ' + group.type.name + '（sites: \'' + group.type.id + '\'）：'
-            + group.items.slice(0, 6).map((item) => item.label).join('、')
-            + (group.items.length > 6 ? ' 等 ' + group.items.length + ' 个' : ''));
-    }
-    lines.push('  这些站点被墙或没收录时不纠结：工具会退回不限定来源的泛搜，并在反馈里点名空手的站点。');
-    return lines;
-}
-
-async function executeBrief(rawArgs, exec, config) {
-    const root = exec?.agent?.session?.header?.cwd ?? process.cwd();
-    const args = rawArgs !== null && typeof rawArgs === 'object' ? rawArgs : {};
-    const typeId = typeof args.type === 'string' && args.type.trim() !== '' ? args.type : undefined;
-    const { topic, type, text, fixed } = buildBrief(args.topic, typeId, { audience: args.audience });
-    const outputDir = config?.search?.outputDir;
-    const briefPath = await writeBrief(root, topic, type.id, args.audience, text, outputDir);
-    const shown = (await import('node:path')).relative(root, briefPath).split('\\').join('/');
-
-    // 结果文件路径：调用方没给就按渠道数生成默认路径，省掉一次来回。
-    const { defaultOutputPaths } = await import('./search.js');
-    const suggested = defaultOutputPaths(topic, type.channels.length, outputDir);
-
-    // 17-3：跨主题逐字相同的骨架（泛搜纪律 + 固定要求 + 站点清单 + 机制说明）
-    // 一个会话只说一次。**提纲文件里始终是逐字全份**（子代理读文件，不读对话）；
-    // 省掉的只是对话里那一份重复副本。第二次起用一行指路代替，指路里带文件路径。
-    const firstSkeleton = hintOnce(sessionIdOf(exec), 'search-brief-skeleton');
-    const pointer = '（泛搜纪律与固定要求同上一份提纲，逐字在文件里：' + shown + '）';
-    const body = firstSkeleton
-        ? text
-        // 第二处（固定要求那一段）只留一句「同上」：同一行指路贴两遍又是在付重复的钱。
-        : text.replace(fixed.intro, pointer).replace(fixed.requirements, '（固定要求同上。）');
-
-    const feedback = [
-        body,
-        '',
-        '提纲已写入：' + shown,
-        '',
-        ...(firstSkeleton ? siteBriefLines(config) : []),
-        '下一步',
-        '- 交给检索执行：office_search_dispatch({ briefPath: "' + shown + '", outputPaths: [...] })',
-        '  建议的结果文件（按渠道顺序）：' + suggested.join('、'),
-        ...(firstSkeleton
-            ? [
-                '  组合里没有检索子代理时（精简部署或没装子代理），这一步会自动改用插件的内置检索通道。',
-                '- 只想要提纲：直接把上面的渠道清单当人工检索清单用。',
-            ]
-            : ['  骨架与站点清单同上一份提纲，不再重复；照上面的渠道清单与文件走。']),
-        '',
-        '渠道数：' + type.channels.length + '（★ 为必须覆盖）。派工时 outputPaths 要给同样多个。',
-    ].join('\n');
-
-    return { ok: true, topic, type: type.id, typeName: type.name, briefPath: shown, text: feedback };
-}
-
-/** office_search_dispatch：把提纲铺成子代理并发检索。 */
+/** office_search_dispatch：出提纲（topic 直入时）并把渠道铺成并发检索。 */
 async function executeDispatch(rawArgs, exec, config, ctx) {
     const value = await dispatchSearch(rawArgs, exec, config, ctx);
     return { ok: value.ok, jobs: value.jobs, text: renderDispatch(value) };
@@ -769,7 +650,10 @@ async function executeDispatch(rawArgs, exec, config, ctx) {
 /** office_parse_findings：把子代理的结果文件读成摘要。 */
 async function executeParse(rawArgs, exec, config) {
     const value = await parseResultFiles(rawArgs, exec, config?.search?.resultLimit);
-    return { ok: true, files: value.files, text: value.text };
+    // 给了 `draft` 且引用审计没过时 `ok:false`（第五十七轮 P2-9）：这一步是**落盘断言**，
+    // 不是提示 —— 摘要照常给全（要改哪几句都在里面），但工具结果本身标错，
+    // 免得「没过的正文」被当成定稿交出去。
+    return { ok: value.ok !== false, files: value.files, text: value.text };
 }
 
 /** 一次直查最多几条查询 / 每条最多几条来源（与检索提纲的渠道数上限同一量级）。 */
@@ -815,10 +699,11 @@ export function preprocessReport(pages) {
  * 这是「不想派子代理、或部署里没有子代理服务时也能查资料」的入口：
  * 办公 preset 第三十轮起不再声明 @deepseek-ai/dsh-tool-web（子代理与主会话的
  * 快查走 office_web_search / office_web_fetch），但渠道覆盖检索与取证落盘
- * 仍走这里 —— 结果文件可复核，也不依赖子代理。默认顺序是免 Key 抓取
- * （duckduckgo → searxng），宿主 web 服务只是兜底；通道与参数见 src/web.js。
+ * 仍走这里 —— 结果文件可复核，也不依赖子代理。通道按设置页的 providerOrder
+ * 依次试（缺省 deepseek-api → seam → duckduckgo → searxng，见 src/config.js
+ * 的 DEFAULT_SEARCH；三方检索 API 不进默认顺序）；通道与参数见 src/web.js。
  *
- * 落盘与摘要的分工与三步走一致：来源与摘录写进文件，聊天里只回一份紧凑清单。
+ * 落盘与摘要的分工与渠道覆盖检索一致：来源与摘录写进文件，聊天里只回一份紧凑清单。
  */
 async function executeSearchRun(rawArgs, exec, config, ctx) {
     const root = cwdOf(exec);
@@ -829,7 +714,7 @@ async function executeSearchRun(rawArgs, exec, config, ctx) {
         throw new Error(stepError({
             step: 'office_search_run 收参数',
             what: 'queries 不能为空：它是要查的 1-5 条话',
-            next: '把要查的事写成 1-5 条查询传进来；要按渠道覆盖检索就改用 office_search_brief + office_search_dispatch',
+            next: '把要查的事写成 1-5 条查询传进来；要按渠道覆盖检索就改用 office_search_dispatch（给 topic 即可）',
             shape: "office_search_run({ queries: ['要查的话', '换个角度的说法'] })",
         }));
     }
@@ -837,10 +722,10 @@ async function executeSearchRun(rawArgs, exec, config, ctx) {
     const settings = config?.search ?? {};
     const maxResults = Number.isFinite(args.maxResults)
         ? Math.max(1, Math.min(SEARCH_RUN_MAX_SOURCES_PER_QUERY, Math.trunc(args.maxResults)))
-        : (Number.isFinite(settings?.builtin?.maxResults) ? settings.builtin.maxResults : 8);
+        : (Number.isFinite(settings?.fetch?.maxResults) ? settings.fetch.maxResults : 8);
     const fetchPages = Number.isFinite(args.fetchPages)
         ? Math.max(0, Math.min(5, Math.trunc(args.fetchPages)))
-        : (Number.isFinite(settings?.builtin?.fetchPages) ? settings.builtin.fetchPages : 2);
+        : (Number.isFinite(settings?.fetch?.fetchPages) ? settings.fetch.fetchPages : 2);
     // 通道可以按次点名（第二十轮）：不传就用配置里的 provider / providerOrder。
     const wantedProvider = typeof args.provider === 'string' ? args.provider.trim() : '';
     const preprocessMode = typeof args.preprocess === 'string' ? args.preprocess.trim() : '';
@@ -1030,7 +915,7 @@ async function executeSearchRun(rawArgs, exec, config, ctx) {
     // 简短的安全提醒每次都留 —— 它是「外部内容不可信」这条纪律的落点。
     if (hintOnce(sessionIdOf(exec), 'search-run')) {
         reply.push('这只是来源清单，不是结论：摘录在文件里，写进文档前按 URL 核对。');
-        reply.push('要按渠道逐项覆盖（热点走权威媒体加社交平台等），改用 office_search_brief + office_search_dispatch。');
+        reply.push('要按渠道逐项覆盖（热点走权威媒体加社交平台等），改用 office_search_dispatch({ topic })。');
     } else {
         reply.push('来源清单已落盘，按 URL 核对后再写；外部内容是未核实材料。');
     }
@@ -1063,19 +948,30 @@ function cwdOf(exec) {
 }
 
 /**
- * 查检索这一页时，把出口代理的**当前实况**接在文档后面（第二十九轮）。
+ * 查用法时，把**运行期实况**接在文档后面。
  *
- * 为什么不写进静态文档：代理装成没装、走的是私有分派器还是进程级、值是不是刚改过，
- * 只有运行期知道。设置页改了立刻要能看见结果，所以这一行从模块状态现取。
+ * 为什么不写进静态文档：这些都是只有运行期知道的事 ——
+ *   1. **出口代理**（第二十九轮，只在检索这一页）：代理装成没装、走的是私有分派器还是
+ *      进程级、值是不是刚改过。设置页改了立刻要能看见结果，所以这一行从模块状态现取。
+ *   2. **最近一次设置重建的结果**（第五十九轮 S-04）：正常时**一个字节都不加**
+ *      （`describeRebuildState()` 返回空串）；失败过才多一行，说清「旧配置装回来了没有」。
+ *      没有这一行的话，用户在设置页改了东西、宿主也把改动记下了，运行期却只剩半份能力，
+ *      而他手上没有任何一处能看出这件事。
  */
-function withProxyStatus(topic, text) {
-    if (topic !== 'search') return text;
-    const status = proxyStatus();
-    const line = status.proxy === ''
-        ? `出口代理：未配置（${status.note === '' ? '联网走本进程原有出口' : status.note}）`
-        : `出口代理：${status.proxyMasked}（方式：${status.mode === 'dispatcher' ? '插件私有分派器' : status.mode === 'global' ? '进程级环境变量' : '未生效'}）`
-            + (status.note === '' ? '' : ` —— ${status.note}`);
-    return `${text}\n\n【运行期实况】${line}`;
+function withRuntimeFacts(topic, text) {
+    const facts = [];
+    if (topic === 'search') {
+        const status = proxyStatus();
+        const line = status.proxy === ''
+            ? `出口代理：未配置（${status.note === '' ? '联网走本进程原有出口' : status.note}）`
+            : `出口代理：${status.proxyMasked}（方式：${status.mode === 'dispatcher' ? '插件私有分派器' : status.mode === 'global' ? '进程级环境变量' : '未生效'}）`
+                + (status.note === '' ? '' : ` —— ${status.note}`);
+        facts.push(line);
+    }
+    const rebuild = describeRebuildState();
+    if (rebuild !== '') facts.push(rebuild);
+    if (facts.length === 0) return text;
+    return `${text}\n\n【运行期实况】${facts.join('\n')}`;
 }
 
 /**
@@ -1090,10 +986,10 @@ function withProxyStatus(topic, text) {
  *
  * 记忆读写出任何问题都不该把用法查询本身弄失败：捕获后原样返回文档。
  */
-async function attachMemoryDigest(text, exec, config, context, signal = null) {
+async function attachMemoryDigest(text, exec, config, context, signal = null, ctx = null) {
     if (config?.memory?.enabled === false) return text;
     try {
-        const memory = createMemory({ root: cwdOf(exec), memory: config?.memory });
+        const memory = createMemory({ root: cwdOf(exec), memory: config?.memory, llm: hostLlmOf(ctx) });
         const digest = await memory.digest({ recentLedger: 3 });
         const projected = projectDigest(digest, {
             sessionId: sessionIdOf(exec),
@@ -1102,15 +998,31 @@ async function attachMemoryDigest(text, exec, config, context, signal = null) {
             // 投影预算（第四十八轮 P0-2）：0 / 未配置 = 不限
             budget: config?.memory?.projectionBudgetBytes,
         });
-        return `${text}\n\n${projected.text}`;
+        // 未变化时投影是空串：不要往反馈末尾接一个空行，更不要接「与上次相同」。
+        return projected.text === '' ? text : `${text}\n\n${projected.text}`;
     } catch {
         return text;
     }
 }
 
 /** 读/写三层记忆要用的一个实例（root = 会话工作目录）。 */
-function memoryOf(exec, config) {
-    return createMemory({ root: cwdOf(exec), memory: config?.memory });
+function memoryOf(exec, config, ctx = null) {
+    return createMemory({
+        root: cwdOf(exec),
+        memory: config?.memory,
+        llm: hostLlmOf(ctx),
+        gallery: config?.gallery ?? null,
+    });
+}
+
+/** 宿主模型服务（可选）：ctx.get 是安全读法，服务没装也不抛；拿不到就交给 kb-llm 明确报不可用。 */
+function hostLlmOf(ctx) {
+    try {
+        const llm = ctx !== null && ctx !== undefined && typeof ctx.get === 'function' ? ctx.get('llm') : null;
+        return llm !== null && typeof llm === 'object' ? llm : null;
+    } catch {
+        return null;
+    }
 }
 
 /**
@@ -1140,6 +1052,18 @@ function quotaRefusal(decision, stage) {
 }
 
 /**
+ * 「知识块检索这一档用完了」时**真的能走的那条路**。
+ *
+ * 抽成一处共用：`kb-search` 的拒绝回执与 `recall` 下探被挡时的路由行都印它 ——
+ * 两处各写一份的话，后改的那一处迟早只剩「配额用完了」这句没有出路的话。
+ */
+function kbEscapeRoutes() {
+    return '继续下去的办法：用 action:\'kb-read\' 按块 id 直接读（不占配额）、'
+        + '用 action:\'kb-list\' 看清单，或者基于已经拿到的块先动手写；'
+        + '要放宽就去设置页「记忆系统 → 每回合配额 → 知识块检索」（0 = 不限制）。';
+}
+
+/**
  * kb 检索被配额拦下时的回执。
  *
  * 与 `quotaRefusal` 分开写：那一份的「继续下去的办法」是换 `layer` 读记忆层，
@@ -1150,17 +1074,73 @@ function kbSearchRefusal(decision) {
     return [
         `📚 本回合的知识库检索配额已用完（${decision.reason}）。`,
         '- kb 的检索是词法的（bigram + BM25），换词重查很容易一直查下去，所以次数单独设了一道界。',
-        '- 继续下去的办法：用 action:\'kb-read\' 按块 id 直接读（不占配额）、用 action:\'kb-list\' 看清单，'
-        + '或者基于已经拿到的块先动手写。',
-        '- 要放宽就去设置页「记忆系统 → 每回合配额 → 知识块检索」（0 = 不限制）。',
+        `- ${kbEscapeRoutes()}`,
     ].join('\n');
 }
 
-/** Pack 文件的默认位置：记忆目录下按时间戳命名，不覆盖上一份。 */
-function defaultPackPath(exec, config) {
-    const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+$/, '').replace('T', '-');
-    return join(memoryOf(exec, config).paths.dir, `pack-${stamp}.json`);
+/**
+ * `recall` 的记忆侧配额被拦下时的回执。
+ *
+ * 与 `quotaRefusal` 差一处，但那一处是**这个动作特有的**：recall 的语义正是
+ * 「记忆 + kb 一起找」，而 kb 用的是**另一档**配额（默认 2 次），很可能还满额 ——
+ * 只说「换 layer 读记忆层」会把模型推回原地转圈（独立复核 P3-5）。
+ */
+function recallRefusal(decision, stage) {
+    return [
+        quotaRefusal(decision, stage),
+        '- 另外：`recall` 的记忆侧与 `read` 带 query 共用这条界，但**知识块检索是另一档**'
+        + '（默认 2 次）—— 这一回合它可能还满额，可以直接用 action:\'kb-search\' 查来源原文。',
+    ].filter((line) => line !== '').join('\n');
 }
+
+/** Pack 文件的默认位置：记忆目录下按时间戳命名，不覆盖上一份。 */
+function defaultPackPath(exec, config, ctx = null) {
+    const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+$/, '').replace('T', '-');
+    return join(memoryOf(exec, config, ctx).paths.dir, `pack-${stamp}.json`);
+}
+
+/**
+ * `read` / `recall` 共用的时间窗参数收口。
+ *
+ * 时间窗参数**不许静默丢弃**：非字符串（对象 / 数组 / 布尔）直接拒绝 —— 静默丢弃
+ * 等于「传了 since 但结果没过滤」，那会把「没过滤」读成「那段时间没有」。
+ * 两个入口各写一份的话，后加的那个迟早漏掉这条纪律（`recall` 就是后加的那个）。
+ */
+function readWindowArgs(raw) {
+    for (const [name, value] of [['since', raw.since], ['until', raw.until]]) {
+        if (value !== undefined && value !== null && typeof value !== 'string' && typeof value !== 'number') {
+            return { error: `${name} 需要一个字符串（如 "2026-09-27"、"上周"、"最近7天"），收到的是 ${typeof value}。` };
+        }
+    }
+    const timeArg = (value) => (value === undefined || value === null ? '' : String(value));
+    return { since: timeArg(raw.since), until: timeArg(raw.until) };
+}
+
+/**
+ * `read` / `recall` 共用的分区键收口（新-12）。
+ *
+ * 给了 tags / entities 就是按它做**硬过滤**，传成字符串 / 数字时若静默当没给，
+ * 模型会把「分区外的条目一条没给」读成「记忆里没有」。同样的理由：只写一份。
+ */
+function readPartitionArgs(raw) {
+    for (const [name, value] of [['tags', raw.tags], ['entities', raw.entities]]) {
+        if (value === undefined || value === null) continue;
+        if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
+            return { error: `${name} 需要一个字符串数组（如 ["发布流程"]）—— 读记忆时给它就是按它分区。` };
+        }
+    }
+    return { tags: Array.isArray(raw.tags) ? raw.tags : [], entities: Array.isArray(raw.entities) ? raw.entities : [] };
+}
+
+/**
+ * 受会话知识库范围约束的 action（第十轮起）：范围由宿主状态决定，这些分支拒绝
+ * 在范围外读写。recall 不在表里 —— 它的记忆层部分不碰知识库，只在下探那一步
+ * 被同一个范围约束（解析失败就跳过下探，而不是把整条 recall 判死）。
+ */
+const KB_SCOPED_ACTIONS = new Set([
+    'kb-ingest', 'kb-search', 'kb-list', 'kb-tree', 'kb-read', 'kb-drop',
+    'kb-update', 'kb-edit', 'kb-link', 'kb-related', 'kb-summarize', 'kb-summaries',
+]);
 
 /**
  * 读/写三层记忆。
@@ -1169,24 +1149,34 @@ function defaultPackPath(exec, config) {
  * 把设置里的「记忆范围」改成 both / global（全局层默认在 $DSH_HOME/.office/memory）——
  * 这是本轮并进来的 mnemon 跨项目层，不再是「一份记忆走天下」。
  */
-async function executeMemory(rawArgs, exec, config, quota) {
+async function executeMemory(rawArgs, exec, config, quota, ctx = null) {
     const args = rawArgs !== null && typeof rawArgs === 'object' ? rawArgs : {};
     const action = typeof args.action === 'string' && args.action.trim() !== '' ? args.action.trim() : 'read';
     if (config?.memory?.enabled === false) {
         return { ok: false, action, text: '记忆已关闭（设置页里关掉的）。要看内容请先把「记忆」打开。' };
     }
-    const memory = memoryOf(exec, config);
+    const memory = memoryOf(exec, config, ctx);
+
+    /*
+     * 会话级知识库范围：解析一次，后面所有 kb-* 分支共用。
+     *
+     * 判据全部来自插件宿主状态（scope 文件 + 会话 header），**不看**调用参数里的
+     * folder / path —— 模型把 folder 写成库根也出不去，这是这条能力的全部意义。
+     * 无 session（纯内部调用、测试、脚本）→ scope 为 null，保持旧契约。
+     * 真会话但 scope 未设置 / 状态读不出来 → fail-closed，不给全库。
+     */
+    const callScope = await resolveCallScope({ ctx, exec });
+    if (!callScope.ok && KB_SCOPED_ACTIONS.has(action)) {
+        return { ok: false, action, text: callScope.text };
+    }
+    const kbScope = callScope.ok ? callScope.scope : null;
 
     if (action === 'read') {
         const query = typeof args.query === 'string' ? args.query.trim() : '';
-        // 时间窗参数**不许静默丢弃**：非字符串（对象 / 数组 / 布尔）直接拒绝。
-        // 静默丢弃等于「传了 since 但结果没过滤」，那会把「没过滤」读成「那段时间没有」。
-        for (const [name, value] of [['since', args.since], ['until', args.until]]) {
-            if (value !== undefined && value !== null && typeof value !== 'string' && typeof value !== 'number') {
-                return { ok: false, action, text: `${name} 需要一个字符串（如 "2026-09-27"、"上周"、"最近7天"），收到的是 ${typeof value}。` };
-            }
-        }
-        const timeArg = (value) => (value === undefined || value === null ? '' : String(value));
+        const window = readWindowArgs(args);
+        if (window.error !== undefined) return { ok: false, action, text: window.error };
+        const partition = readPartitionArgs(args);
+        if (partition.error !== undefined) return { ok: false, action, text: partition.error };
         // 只有「带关键词的检索」才占配额：不带 query 的浏览是看现状，不是查资料。
         let recallGate = null;
         if (query !== '') {
@@ -1200,8 +1190,10 @@ async function executeMemory(rawArgs, exec, config, quota) {
                 layer: typeof args.layer === 'string' ? args.layer : 'all',
                 query,
                 limit: Number.isFinite(args.limit) ? args.limit : 0,
-                since: timeArg(args.since),
-                until: timeArg(args.until),
+                since: window.since,
+                until: window.until,
+                tags: partition.tags,
+                entities: partition.entities,
             });
         } catch (error) {
             // 同一个道理（复核 P3 的同类）：时间词解析不了会抛错，那次没有产生任何结果，
@@ -1212,6 +1204,75 @@ async function executeMemory(rawArgs, exec, config, quota) {
             throw error;
         }
         return { ok: true, action, text: renderRead(value) };
+    }
+
+    /*
+     * 统一入口路由（第五十七轮 19-8 的 P2-8）。
+     *
+     * 一条调用先走记忆层，再由 `read` 现算的**门控**（`gateVerdictOf`：命中数 /
+     * 查询词覆盖 / 最高重要度）决定要不要下探知识库 —— 判据不在模型手里，也不在
+     * 这个函数里，而在 `memory.js` 那个纯函数里，所以同一份输入永远给同一个结论。
+     *
+     * 两条配额各自守界，且**不因为换了入口就多给一次**：
+     *   · 记忆侧与 `read` 带 query 走同一档（初查 / 细化）—— 否则交替调两个动作
+     *     就能把「一个回合查几次」这条界绕过去；
+     *   · 真的下探了才吃 `kbSearchPerTurn`（默认 2），被挡住时如实说明「没下探」，
+     *     并给一条**真的能走**的路（`kb-read` / `kb-list` / 调设置）。
+     */
+    if (action === 'recall') {
+        const query = typeof args.query === 'string' ? args.query.trim() : '';
+        if (query === '') {
+            return { ok: false, action, text: 'recall 需要 query（要找什么）。它是一条统一入口：先查记忆层，门控判定不够答时再下探知识库。' };
+        }
+        const window = readWindowArgs(args);
+        if (window.error !== undefined) return { ok: false, action, text: window.error };
+        const partition = readPartitionArgs(args);
+        if (partition.error !== undefined) return { ok: false, action, text: partition.error };
+        const gate = takeRecallQuota(quota, exec);
+        if (!gate.allowed) return { ok: false, action, text: recallRefusal(gate.decision, gate.stage) };
+        const stage = gate.stage === 'recall' ? 'recallPerTurn' : 'recallRefinePerTurn';
+        let value;
+        try {
+            value = await memory.read({
+                layer: typeof args.layer === 'string' ? args.layer : 'all',
+                query,
+                limit: Number.isFinite(args.limit) ? args.limit : 0,
+                since: window.since,
+                until: window.until,
+                tags: partition.tags,
+                entities: partition.entities,
+            });
+        } catch (error) {
+            quota.release(stage, exec);
+            throw error;
+        }
+        const verdict = value.gate?.verdict ?? 'empty';
+        let kb = null;
+        let kbNote = verdict === 'enough' ? '记忆层够答，不必再查来源原文' : '';
+        // 会话范围解析不了时不下探：记忆层照常答，但要如实说「这次没查来源」以及为什么，
+        // 否则模型会以为库里没有，转头把同一个词再搜一遍。
+        if (!callScope.ok) kbNote = callScope.text;
+        if (verdict !== 'enough' && callScope.ok) {
+            const kbGate = quota.take('kbSearchPerTurn', exec);
+            if (!kbGate.allowed) {
+                // 不是「没有来源」而是「这个回合的知识块检索次数用完了」——两者混说会把
+                // 模型推向「换个词再试」，而那条路这次也走不通。**要给真的能走的那条路**
+                // （kb-read / kb-list / 调设置），否则这条路由行等于只说了一半。
+                kbNote = `知识块检索配额已用完（${kbGate.reason}）—— ${kbEscapeRoutes()}`;
+            } else {
+                try {
+                    kb = await memory.kbSearch({ query, limit: Number.isFinite(args.limit) ? args.limit : 0, scope: kbScope });
+                } catch (error) {
+                    // 与 kb-search 同一条纪律：没产生结果就不算查过一次。
+                    // 照实说一句：这个分支在当前入参下**打不到**（query 已判非空、tier / path
+                    // 恒空，kbSearch 的抛错点只有那三处），它是防御 —— 但错误路径的纪律与
+                    // 别的调用一样，不留「抛了却把名额吃掉」的缺口。
+                    quota.release('kbSearchPerTurn', exec);
+                    kbNote = `下探失败：${error instanceof Error ? error.message : String(error)}`;
+                }
+            }
+        }
+        return { ok: true, action, text: renderRecall({ query, gate: value.gate, read: value, kb, kbNote }) };
     }
 
     if (action === 'log') {
@@ -1242,6 +1303,17 @@ async function executeMemory(rawArgs, exec, config, quota) {
         const value = await memory.kbIngest({
             path: typeof args.path === 'string' ? args.path : '',
             tier: typeof args.tier === 'string' ? args.tier : '',
+            scope: typeof args.scope === 'string' ? args.scope : '',
+            folder: typeof args.folder === 'string' ? args.folder : null,
+            // AI 建库（可选，默认关）：ai 打开才用模型；model 可覆盖设置里的选择。
+            ai: args.ai === true,
+            aiModel: typeof args.aiModel === 'string' ? args.aiModel : '',
+            aiChunking: typeof args.aiChunking === 'boolean' ? args.aiChunking : null,
+            aiSummary: typeof args.aiSummary === 'boolean' ? args.aiSummary : null,
+            aiEstimate: args.aiEstimate === true,
+            aiResume: args.aiResume === true,
+            aiRunLimit: Number.isFinite(args.aiRunLimit) ? args.aiRunLimit : 0,
+            sessionScope: kbScope,
         });
         return { ok: true, action, text: renderKb(value) };
     }
@@ -1259,6 +1331,9 @@ async function executeMemory(rawArgs, exec, config, quota) {
                 limit: Number.isFinite(args.limit) ? args.limit : 0,
                 tier: typeof args.tier === 'string' ? args.tier : '',
                 path: typeof args.path === 'string' ? args.path : '',
+                folder: typeof args.folder === 'string' ? args.folder : '',
+                recursive: args.recursive !== false,
+                scope: kbScope,
             });
         } catch (error) {
             // 名额是在参数校验**之前**申请的（不先占名额就去做重活，两件事都不对），于是
@@ -1271,7 +1346,17 @@ async function executeMemory(rawArgs, exec, config, quota) {
     }
 
     if (action === 'kb-list') {
-        const value = await memory.kbList({ limit: Number.isFinite(args.limit) ? args.limit : 0 });
+        const value = await memory.kbList({
+            limit: Number.isFinite(args.limit) ? args.limit : 0,
+            folder: typeof args.folder === 'string' ? args.folder : '',
+            recursive: args.recursive !== false,
+            scope: kbScope,
+        });
+        return { ok: true, action, text: renderKb(value) };
+    }
+
+    if (action === 'kb-tree') {
+        const value = await memory.kbTree({ origin: typeof args.origin === 'string' ? args.origin : '', scope: kbScope });
         return { ok: true, action, text: renderKb(value) };
     }
 
@@ -1279,6 +1364,7 @@ async function executeMemory(rawArgs, exec, config, quota) {
         const value = await memory.kbRead({
             id: typeof args.id === 'string' ? args.id : '',
             path: typeof args.path === 'string' ? args.path : '',
+            scope: kbScope,
         });
         return { ok: true, action, text: renderKb(value) };
     }
@@ -1287,53 +1373,90 @@ async function executeMemory(rawArgs, exec, config, quota) {
         const value = await memory.kbDrop({
             id: typeof args.id === 'string' ? args.id : '',
             path: typeof args.path === 'string' ? args.path : '',
+            scope: typeof args.scope === 'string' ? args.scope : '',
+            sessionScope: kbScope,
         });
         return { ok: true, action, text: renderKb(value) };
     }
 
-    if (action === 'link') {
-        const value = await memory.link({
+    if (action === 'kb-update') {
+        const value = await memory.kbUpdate({
+            id: typeof args.id === 'string' ? args.id : '',
+            title: typeof args.title === 'string' ? args.title : '',
+            folder: typeof args.folder === 'string' ? args.folder : null,
+            tier: typeof args.tier === 'string' ? args.tier : '',
+            sessionScope: kbScope,
+        });
+        return { ok: true, action, text: renderKb(value) };
+    }
+
+    if (action === 'kb-edit') {
+        const value = await memory.kbEdit({
+            id: typeof args.id === 'string' ? args.id : '',
+            text: typeof args.text === 'string' ? args.text : '',
+            sessionScope: kbScope,
+        });
+        return { ok: true, action, text: renderKb(value) };
+    }
+
+    // 块间联系与摘要（第八十五轮）：kb-link 写块边，kb-related 查邻居，kb-summarize 把多块
+    // 合成一块摘要（摘要作为独立块参与检索）。
+    if (action === 'kb-link') {
+        const value = await memory.kbLink({
             sourceId: typeof args.sourceId === 'string' ? args.sourceId : '',
             targetId: typeof args.targetId === 'string' ? args.targetId : '',
-            kind: typeof args.kind === 'string' ? args.kind : '',
+            kind: typeof args.kind === 'string' ? args.kind : 'related',
             note: typeof args.note === 'string' ? args.note : '',
-            // 冲突三态只在 kind:'contradicts' 时有意义（不传就是「未分类 / 未决」）。
-            conflict: typeof args.conflict === 'string' ? args.conflict : '',
-            state: typeof args.state === 'string' ? args.state : '',
+            sessionScope: kbScope,
         });
-        return { ok: true, action, text: renderLink(value) };
+        return { ok: true, action, text: renderKb(value) };
     }
 
-    if (action === 'unlink') {
-        const value = await memory.unlink({ id: typeof args.id === 'string' ? args.id : '' });
-        return { ok: true, action, text: renderUnlink(value) };
-    }
-
-    if (action === 'related') {
+    if (action === 'kb-related') {
         const gate = quota.take('relatedPerTurn', exec);
         if (!gate.allowed) return { ok: false, action, text: quotaRefusal(gate, 'denied') };
-        const value = await memory.related({
-            id: typeof args.id === 'string' ? args.id : '',
+        const value = await memory.kbRelated({
+            chunkId: typeof args.chunkId === 'string' ? args.chunkId : (typeof args.id === 'string' ? args.id : ''),
             depth: Number.isFinite(args.depth) ? args.depth : 1,
-            kind: typeof args.kind === 'string' ? args.kind : '',
-            limit: Number.isFinite(args.limit) ? args.limit : 0,
+            limit: Number.isFinite(args.limit) ? args.limit : 20,
+            sessionScope: kbScope,
         });
-        return { ok: true, action, text: renderRelated(value) };
+        return { ok: true, action, text: renderKb(value) };
     }
 
-    if (action === 'entities') {
-        const value = await memory.entities({
-            query: typeof args.query === 'string' ? args.query : '',
-            limit: Number.isFinite(args.limit) ? args.limit : 0,
+    if (action === 'kb-summarize') {
+        const value = await memory.kbSummarize({
+            title: typeof args.title === 'string' ? args.title : '',
+            text: typeof args.text === 'string' ? args.text : '',
+            chunkIds: Array.isArray(args.chunkIds) ? args.chunkIds : [],
+            sessionScope: kbScope,
         });
-        return { ok: true, action, text: renderEntities(value) };
+        return { ok: true, action, text: renderKb(value) };
+    }
+
+    if (action === 'kb-summaries') {
+        const value = await memory.kbSummaries({ limit: Number.isFinite(args.limit) ? args.limit : 50, sessionScope: kbScope });
+        return { ok: true, action, text: renderKb({ action: 'kb-summaries', items: value }) };
+    }
+
+    // 审美参考图库：一个统一 action，op 分 list/search/add/tag/describe/index/status/remove。
+    // 会联网的动作（describe / 图片向量 / 以图搜图）必须 allowUpload:true，工具层不替用户点头。
+    if (action === 'gallery') {
+        const value = await executeGalleryAction(args, {
+            galleryFor: () => memory.gallery(),
+            hostOf: () => ({
+                attachments: typeof ctx?.get === 'function' ? ctx.get('attachments') : null,
+                llm: hostLlmOf(ctx),
+            }),
+        });
+        return { ok: value.ok !== false, action, text: renderGalleryValue(value), value };
     }
 
     if (action === 'export') {
         const pack = await memory.exportPack();
         const target = typeof args.packPath === 'string' && args.packPath.trim() !== ''
             ? (isAbsolute(args.packPath) ? args.packPath : join(cwdOf(exec), args.packPath))
-            : defaultPackPath(exec, config);
+            : defaultPackPath(exec, config, ctx);
         await mkdir(dirname(target), { recursive: true });
         const text = `${JSON.stringify(pack, null, 2)}\n`;
         await writeFile(target, text, 'utf8');
@@ -1380,6 +1503,7 @@ async function executeMemory(rawArgs, exec, config, quota) {
         // 重建引用（空数组就是清掉）。区分「没传」与「传了空」是必要的，否则一条引用了
         // 单源块的旧条目永远清不掉引用（改一个字仍被门拦住）。
         source: Array.isArray(args.source) ? args.source : null,
+        scope: typeof args.scope === 'string' ? args.scope : '',
     });
     return { ok: true, action, text: renderMutation(value) };
 }
@@ -1666,7 +1790,7 @@ export function buildTools(config, ctx) {
         {
             name: 'office_help',
             description:
-                '办公模式用法查询：Word / Excel / PPT 的写法、LaTeX 学位论文（thuthesis）的生成与编译、PDF 的读法、Python 科学计算与绘图（python）、可用主题、批量改文件、缓存规则、三层记忆（memory）。'
+                '办公模式用法查询：Word / Excel / PPT 的写法、LaTeX 学位论文（thuthesis）的生成与编译、PDF 的读法、Python 科学计算与绘图（python）、写作规划、自检与去 AI 味（writing）、可用主题、批量改文件、缓存规则、三层记忆（memory）。'
                 + '第一次用某种格式前先查一次（如 office_help({ topic: "word" })）。'
                 + '默认只回最小事实集（接口签名与必需边界），够写出对的调用；要看例子与全部解释再传 detail:true —— 文档会留在后续每个请求的前缀里，能省则省。'
                 + '返回值末尾附记忆投影：按本话题只给相关条目与最近台账（无话题或定期重贴时给全文），动笔前照着它办。'
@@ -1681,14 +1805,15 @@ export function buildTools(config, ctx) {
             async execute(rawArgs, exec) {
                 const args = rawArgs !== null && typeof rawArgs === 'object' ? rawArgs : {};
                 const { topic, text } = await buildHelp(args.topic, { detail: args.detail === true });
-                return { ok: true, topic, text: await attachMemoryDigest(withProxyStatus(topic, text), exec, config, 'help', signalOf({ topic: args.topic })) };
+                return { ok: true, topic, text: await attachMemoryDigest(withRuntimeFacts(topic, text), exec, config, 'help', signalOf({ topic: args.topic }), ctx) };
             },
         },
         {
             name: 'office_run',
             description:
-                '一次调用完成一批办公操作：生成或修改 Word(.docx) / Excel(.xlsx) / PPT(.pptx)，生成 LaTeX 学位论文源码并编译 PDF（office.tex），读 PDF（office.pdf），用 Python 做科学计算与绘图（office.python），以及批量修改文本文件。'
-                + 'script 里用 office 对象直接写多步；每次调用都从零开始，不要把状态留到下次。'
+                '一次调用完成一批办公操作：生成或修改 Word(.docx) / Excel(.xlsx) / PPT(.pptx)，生成 LaTeX 学位论文源码并编译 PDF（office.tex），读 PDF（office.pdf），文档互转与统一出 PDF（office.convert），录音与视频转文字、抽帧（office.av），用 Python 做科学计算与绘图（office.python），按难度 / 读者收益规划长文、自检与去 AI 味（office.writing），以及批量修改文本文件。'
+                + '写正文/改稿 ≥300 字先用 office.writing.audit，交付前用 office.writing.deai；长文先 office.writing.plan，不要等用户提醒。'
+                + 'script 里用 office 对象直接写多步；长脚本先 office.files.write 落成 .js，再用 scriptFile 跨调用复用。'
                 + '写出的文件会自动重新打开检查，返回真实统计与排版风险。'
                 + '没查过用法请先调用 office_help。',
             parameters: runParameters,
@@ -1703,21 +1828,21 @@ export function buildTools(config, ctx) {
         {
             name: 'office_memory',
             description:
-                '办公记忆：三层长期记忆 + 知识库（kb），跨会话保留在会话工作目录的 .office/memory 与 .office/kb。'
-                + '热记忆（layer:hot）装用户偏好与项目约定，动笔前照它办；'
-                + '台账（layer:ledger）自动登记每份交付物（路径、格式、来源、复检统计），用来找「上次那份东西」；'
-                + '归档（layer:archive）是下沉的旧条目与旧台账，只读；'
-                + 'kb 放入库的外部原文（块 + 字符区间 span）：kb-ingest 入库、kb-search 找来源（词法：bigram，语义改写召不回，换词别换工具）、kb-read 逐字引用。'
-                + '带 query 的读取走召回分档并占每回合配额；被挡住时会说明原因，别换工具重复检索。'
-                + '只记用户说过的偏好、纠正与稳定事实，不记检索原文、一次性进度与猜测；用户说出偏好时当场记一条，不必等他说「记住」。'
-                + 'office_help / office_run 的反馈末尾本来就带热记忆投影，平常不必特意 read。',
+                '办公记忆：三层记忆 + 知识库（kb）+ 图库（gallery），存 .office/memory 与 .office/kb。'
+                + '热记忆装偏好与项目约定，动笔前照办；台账自动登记交付物，找「上次那份」；归档只读。'
+                + 'kb 放入库原文：kb-ingest 入库、kb-search 找来源（词法，语义改写召不回）、kb-read 逐字引用。'
+                + 'gallery 存参考图：搜索 / 标签 / 描述。'
+                + '带 query 的读取占配额；被挡会说明原因。'
+                + 'read 的 tags/entities 是硬过滤。'
+                + '只记偏好、纠正与稳定事实。'
+                + 'office_help / office_run 已带热记忆投影。',
             parameters: memoryParameters,
             output: {
                 schema: memoryOutputSchema,
                 render: (_args, value) => textBlock(String(value?.text ?? '（没有记忆）')),
             },
             isConcurrencySafe: () => false,
-            execute: (rawArgs, exec) => executeMemory(rawArgs, exec, config, quota),
+            execute: (rawArgs, exec) => executeMemory(rawArgs, exec, config, quota, ctx),
         },
         {
             name: 'office_web_search',
@@ -1725,8 +1850,8 @@ export function buildTools(config, ctx) {
                 '查一个事实点（插件的网页抓取通道，免 Key）：给 1-5 条查询，抓 DuckDuckGo HTML 结果页解析'
                 + '（配了自建 SearXNG 也会用；两条抓取通道都通不了时退到宿主 web 服务兜底，反馈里会写明），'
                 + '来源清单直接回到对话，不落盘、不起子代理。'
-                + '站内 / 平台内容加 site: 限定（如 "site:zhihu.com 某事件"）。'
-                + '要按渠道覆盖或让材料落盘可复核，用 office_search_run / office_search_brief + office_search_dispatch；'
+                + '站内 / 平台内容加 site: 限定。'
+                + '要按渠道覆盖或让材料落盘可复核，用 office_search_run / office_search_dispatch；'
                 + '打开单个页面取正文用 office_web_fetch。'
                 + '连不上多半是出口问题：设置页「检索编排 → 出口代理」填代理。',
             parameters: webSearchParameters,
@@ -1754,12 +1879,11 @@ export function buildTools(config, ctx) {
         {
             name: 'office_search_run',
             description:
-                '三步走链路之外的旁路直查（不经 brief / dispatch / parse_findings 那三段）：输入是 1-5 条查询，'
+                '渠道覆盖检索之外的旁路直查：输入是 1-5 条查询，'
                 + '输出是落盘的结果文件加一份紧凑来源清单。'
-                + '适合「不想派子代理、但要让来源与摘录落盘可复核」的场合；'
                 + '只查一个页面用 office_web_fetch，只找一个事实点用 office_web_search。'
-                + '通道有多条：默认按设置页的顺序自动挑（免 Key 抓取 duckduckgo → 自建 SearXNG → 宿主 web 服务兜底；'
-                + '三方检索 API 不在默认顺序里），也可以用 provider 参数按次点名（bocha 中文好、serper 就是 Google、duckduckgo 免 Key …）。'
+                + '通道有多条：默认按设置页的顺序自动挑（缺省直连 DeepSeek Search API → 宿主 web 服务 → 免 Key 抓取兜底；'
+                + '三方检索 API 要显式点名或加进顺序），也可以用 provider 参数按次点名（bocha 中文好、serper 就是 Google …）。'
                 + '取回来的网页会先过预处理（去导航与样板）再进上下文，preprocess 参数可以按次改强度；'
                 + '来源是 PDF 时正文由 office.pdf 抽文本（不做网页预处理）。'
                 + '清单只是线索不是结论：写进文档前按 URL 核对。',
@@ -1772,30 +1896,15 @@ export function buildTools(config, ctx) {
             execute: (rawArgs, exec) => executeSearchRun(rawArgs, exec, config, ctx),
         },
         {
-            name: 'office_search_brief',
-            description:
-                '三步走链路的第 1 段（出提纲）：输入是一个主题，输出是提纲文件 brief.md 与渠道清单 —— 它不联网、不查资料。'
-                + '按内容类型（热点事件 / 知识类 / 手册类）给出该走哪些渠道、每个渠道为什么必要、查到什么程度算够。'
-                + '规则是固定的——热点走权威媒体加各社交平台，知识走百科、需要更深再下沉文献，手册只认官方参考文档；'
-                + '每个类型都先做一轮不限定来源的泛搜，避免只看一个来源。'
-                + '交给第 2 段 office_search_dispatch 执行。'
-                + '只查一两个事实点用 office_search_run。',
-            parameters: briefParameters,
-            output: {
-                schema: briefOutputSchema,
-                render: (_args, value) => textBlock(String(value?.text ?? '（没有提纲）')),
-            },
-            isConcurrencySafe: () => false,
-            execute: (rawArgs, exec) => executeBrief(rawArgs, exec, config),
-        },
-        {
             name: 'office_search_dispatch',
             description:
-                '三步走链路的第 2 段（执行提纲）：输入是第 1 段写下的 briefPath，输出是每个渠道一个结果文件 —— 材料只落盘，不进主上下文。'
-                + '每个渠道一个子代理，各自用 office_web_search / office_web_fetch 抓网页检索。'
-                + '组合里没有子代理服务时，它会自动改用插件的内置检索通道在进程内跑同样的渠道'
-                + '（同一批结果文件、同一种格式，接着照样用 office_parse_findings 读）。'
-                + '要改渠道或查更深时，先 office_search_brief 重新出提纲。',
+                '渠道覆盖检索（原三步走的第 1+2 段合并）：输入是 topic（自动按内容类型出提纲，'
+                + 'brief.md 落盘、可审计可复用）或上一轮提纲的 briefPath（复用重跑），'
+                + '输出是每个渠道一个结果文件 —— 材料只落盘，不进主上下文。'
+                + '每个渠道一个子代理，各自用 office_web_search / office_web_fetch 抓网页检索；'
+                + '组合里没有子代理服务时，自动改用插件的内置检索通道在进程内跑同样的渠道'
+                + '（同一批结果文件、同一种格式）。跑完用 office_parse_findings 读成摘要。'
+                + '只查一两个事实点用 office_search_run。',
             parameters: dispatchParameters,
             output: {
                 schema: dispatchOutputSchema,
@@ -1807,10 +1916,11 @@ export function buildTools(config, ctx) {
         {
             name: 'office_parse_findings',
             description:
-                '三步走链路的第 3 段（收口）：输入是第 2 段写下的结果文件 paths，输出是一份紧凑摘要 —— 它不联网。'
-                + '按渠道归类结论、算出来源覆盖度、标出只有单一来源背书、以及完全没带 URL 的条目。'
-                + '写文档前用它读结果，这样进上下文的是几十行摘要而不是整页材料；'
-                + '摘要里的「仍缺渠道」「待核」提示要照着补检索或照实标注。',
+                '渠道覆盖检索的收口段：输入是派工写下的结果文件 paths，输出是一份紧凑摘要 —— 它不联网。'
+                + '按渠道归类结论、算来源覆盖度、标出单一来源与没带 URL 的条目。'
+                + '写文档前用它读结果（进上下文的是几十行摘要而不是整页材料）；'
+                + '摘要里的「仍缺渠道」「待核」要照着补检索或照实标注；'
+                + '产物落盘后给 draft 还会做句级引用审计。',
             parameters: parseParameters,
             output: {
                 schema: parseOutputSchema,

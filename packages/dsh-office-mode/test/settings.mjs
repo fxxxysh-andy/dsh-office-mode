@@ -24,8 +24,7 @@ import {
 } from '../src/config.js';
 import { DEFAULT_QUOTA } from '../src/memory.js';
 import { buildTools } from '../src/tools.js';
-import { createOfficeSettings, OFFICE_SETTINGS_NS, SUBAGENT_TOOL_CATALOG, LIMITS } from '../src/settings.js';
-import { CHANNEL_TOOLS } from '../src/search.js';
+import { createOfficeSettings, OFFICE_SETTINGS_NS, LIMITS } from '../src/settings.js';
 
 const results = [];
 async function check(name, fn) {
@@ -88,10 +87,10 @@ if (z === undefined) {
 
 // ── 工具开关（不依赖 schemastery） ────────────────────────────────────────
 
-await check('默认全开：空配置下九个工具都在', () => {
+await check('默认全开：空配置下八个工具都在', () => {
     const tools = buildTools(resolveConfig({}));
     assert.deepEqual(tools.map((t) => t.name), [
-        'office_help', 'office_run', 'office_memory', 'office_web_search', 'office_web_fetch', 'office_search_run', 'office_search_brief', 'office_search_dispatch', 'office_parse_findings',
+        'office_help', 'office_run', 'office_memory', 'office_web_search', 'office_web_fetch', 'office_search_run', 'office_search_dispatch', 'office_parse_findings',
     ]);
 });
 
@@ -111,7 +110,7 @@ await check('全部关掉时工具面为空，但不报错', () => {
 await check('未知的工具键被忽略，不会让配置失效', () => {
     const tools = buildTools(resolveConfig({ tools: { 未来才有的工具: false, office_run: false } }));
     assert.ok(!tools.some((t) => t.name === 'office_run'));
-    assert.equal(tools.length, 8);
+    assert.equal(tools.length, 7);
 });
 
 await check('非布尔值不会把开关误判成关闭', () => {
@@ -184,23 +183,27 @@ await check('记忆参数可调，且在安全区间内收敛', () => {
 await check('关掉记忆后 office_memory 工具不再注册', () => {
     const tools = buildTools(resolveConfig({ tools: { office_memory: false } }));
     assert.ok(!tools.some((t) => t.name === 'office_memory'));
-    assert.equal(tools.length, 8);
+    assert.equal(tools.length, 7);
 });
 
 await check('文档参数沿用既有默认，不被设置层改坏', () => {
     const cfg = resolveConfig({});
     assert.equal(cfg.defaultTheme, 'plain');
     assert.equal(cfg.scriptTimeoutMs, 60000);
-    assert.equal(cfg.cacheDir, '.office/cache');
+    assert.equal(cfg.cacheDir, '.office/runtime/cache');
 });
 
 // ── schema 形状（需要 schemastery） ───────────────────────────────────────
 
-await check('schema 覆盖七组：工具 / 记忆 / 检索 / 后台模型 / 文档 / Python / 音频与视频', async () => {
+await check('schema 覆盖十组：工具 / 守卫 / 记忆 / 检索 / 后台模型 / 文档 / Python / 音频与视频 / 文件识别 / 图库', async () => {
     if (z === undefined) return;
     const S = createOfficeSettings(z);
     const value = plain(S({}));
-    assert.deepEqual(Object.keys(value).sort(), ['av', 'documents', 'memory', 'python', 'search', 'subagentModel', 'tools']);
+    assert.deepEqual(Object.keys(value).sort(), ['av', 'documents', 'gallery', 'guard', 'memory', 'ocr', 'python', 'search', 'subagentModel', 'tools']);
+    assert.equal(value.gallery.vision.channel, 'off', '视觉描述默认关');
+    assert.equal(value.gallery.imageEmbedding.provider, 'none', '图片向量默认不配置');
+    // 守卫组只有一个布尔，且默认 **false**（用户选择「做成设置项、默认不隐藏」）。
+    assert.equal(value.guard.hideDevToolsInOffice, false, '守卫默认不隐藏：隐藏是削减能力，该由用户明确要求');
     for (const name of Object.keys(DEFAULT_TOOLS)) {
         assert.equal(typeof value.tools[name], 'boolean', `tools.${name} 应是布尔`);
     }
@@ -288,24 +291,6 @@ await check('越界数值被 schema 拒绝（设置页调不坏插件）', async
     assert.throws(() => S({ python: { timeoutMs: 10 } }), /timeoutMs/);
 });
 
-await check('子代理工具白名单默认就是极简五项', async () => {
-    if (z === undefined) return;
-    const value = plain(createOfficeSettings(z)({}));
-    assert.deepEqual(value.search.subagentTools, [...CHANNEL_TOOLS]);
-    assert.equal(value.search.subagentTools.length, 5);
-});
-
-await check('设置页目录里的工具与实际白名单一一对应', () => {
-    // 设置页按 SUBAGENT_TOOL_CATALOG 渲染多选；它若与 CHANNEL_TOOLS 漂移，
-    // 用户会看到勾选项和实际生效的工具对不上。
-    assert.deepEqual(SUBAGENT_TOOL_CATALOG.map((item) => item.id), [...CHANNEL_TOOLS]);
-    for (const item of SUBAGENT_TOOL_CATALOG) {
-        assert.equal(typeof item.label, 'string');
-        assert.ok(item.label.length > 0, `${item.id} 缺少显示名`);
-        assert.equal(typeof item.note, 'string');
-    }
-});
-
 await check('命名空间合法（小写字母开头，只含小写/数字/连字符）', () => {
     assert.match(OFFICE_SETTINGS_NS, /^[a-z][a-z0-9-]*$/);
 });
@@ -324,7 +309,7 @@ await check('office_help 的 settings 话题讲清了开关与参数', async () 
     const { buildHelp } = await import('../src/docs.js');
     const help = await buildHelp('settings');
     assert.equal(help.topic, 'settings');
-    for (const wanted of ['工具开关', 'maxParallel', 'resultLimit', 'subagentTools', 'outputDir', 'defaultTheme', '记忆', 'userLimitBytes', 'ledgerLimit']) {
+    for (const wanted of ['工具开关', 'maxParallel', 'resultLimit', 'maxChannels', 'outputDir', 'defaultTheme', '记忆', 'userLimitBytes', 'ledgerLimit']) {
         assert.ok(help.text.includes(wanted), `settings 话题缺 ${wanted}`);
     }
     const index = await buildHelp('');
@@ -359,6 +344,44 @@ await check('服务端 schema 能被浏览器侧还原（设置页拿得到值�
     assert.equal(decoded.tools.office_run, true);
     assert.equal(decoded.search.maxParallel, DEFAULT_SEARCH.maxParallel);
     assert.equal(decoded.documents.defaultTheme, resolveConfig({}).defaultTheme);
+});
+
+await check('旧配置残留键（memory.links / quota 旧值）不让 resolveConfig 抛错', () => {
+    const cfg = resolveConfig({ memory: { links: false, quota: { relatedPerTurn: 2 } } });
+    assert.equal(cfg.memory.links, undefined, 'links 已删除，残留键被忽略');
+    assert.equal(cfg.memory.quota.relatedPerTurn, 2, '仍被 kb-related 使用的配额保留');
+});
+
+await check('五个 apiKey 字段标成 secret（宿主才会回显掩码而不是明文）', async () => {
+    if (z === undefined) return;
+    const served = JSON.stringify(createOfficeSettings(z).toJSON());
+    assert.equal((served.match(/"role":"secret"/g) || []).length, 5, 'ocr / memory.embedding / memory.llm / gallery.vision / gallery.imageEmbedding 的 apiKey 都要 secret');
+    const cfg = resolveConfig({});
+    assert.equal(cfg.ocr.apiKey, '', '默认不内置 Key');
+    assert.equal(cfg.memory.embedding.apiKey, '');
+    assert.equal(cfg.memory.llm.apiKey, '');
+    assert.equal(cfg.memory.llm.mode, 'off', '大模型建库默认关');
+    assert.equal(cfg.gallery.vision.channel, 'off', '视觉描述默认关');
+    assert.equal(cfg.gallery.imageEmbedding.provider, 'none', '图片向量默认不配置');
+    assert.equal(cfg.gallery.vision.apiKey, '');
+    assert.equal(cfg.gallery.imageEmbedding.apiKey, '');
+});
+
+await check('复用 deepseek-official 凭据：schema 默认关，resolveConfig 只认严格 true', async () => {
+    // 授权「借用宿主里已保存的 deepseek-official 凭据」是高风险操作：缺省必须关，
+    // 而且不能被字符串 "true" / 1 这类宽松值悄悄打开 —— 后端据此决定要不要花宿主的钱。
+    assert.equal(resolveConfig({}).ocr.reuseOfficialProvider, false, '缺省必须关');
+    assert.equal(resolveConfig({ ocr: { reuseOfficialProvider: true } }).ocr.reuseOfficialProvider, true);
+    for (const loose of ['true', 1, 'yes', {}, []]) {
+        assert.equal(resolveConfig({ ocr: { reuseOfficialProvider: loose } }).ocr.reuseOfficialProvider, false,
+            `只有严格 true 才算开：${JSON.stringify(loose)}`);
+    }
+    if (z === undefined) return;
+    const S = createOfficeSettings(z);
+    assert.equal(plain(S({})).ocr.reuseOfficialProvider, false, 'schema 默认值也必须是 false');
+    assert.equal(plain(S({ ocr: { reuseOfficialProvider: true } })).ocr.reuseOfficialProvider, true);
+    assert.throws(() => S({ ocr: { reuseOfficialProvider: 'true' } }), /reuseOfficialProvider/,
+        'schema 层直接拒掉字符串，别指望运行时再收敛');
 });
 
 const failed = results.filter((item) => !item.ok);

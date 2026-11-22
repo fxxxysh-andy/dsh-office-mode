@@ -16,15 +16,19 @@
  * 分层的判据只有一条：**模型照着默认这一层就能写出对的调用**。为此签名与参数
  * 名一个都不省 —— 省的是解释与举例，不是接口。
  *
- * 真实量级（本机实测，UTF-8 字节）：默认层与全文层相比，ppt 17906→约 2200、
- * memory 9311→约 2000、settings 3137→约 900、search 4225→约 1300、
- * pdf 2275→约 900、python 2784→约 1000、index 3083→约 1300、
- * guide 6676→约 700。
+ * 真实量级（本机实测，UTF-8 字节；**第七十三轮重测**，上一版这几个数字停在第六十轮、
+ * 而写作话题与 guide 已在那之后扩过）：默认层与全文层相比，memory 3674→28248、
+ * ppt 7223→25490、search 4001→12944、settings 2028→4878、tex 4068→6357、
+ * av 2610→6238、run 1965→5169、convert 1834→5076、word 2292→4697、index 2304→4774、
+ * guide 2266→9404；全文层超过 3 KB 的还有 writing（5865）、image（4925）、
+ * excel（3228）与 python（3180），其余话题都在 3 KB 以下。（这一段没有套件守门 ——
+ * 第六十轮复核就是靠现测抓到末句写错了一处：初稿把 excel / image 漏掉了，改完记得
+ * 再量一遍再落笔；第七十三轮同样按现测重写。）
  *
  * @module dsh-office-mode/docs
  */
 import { OFFICE_GUIDE } from './guide.js';
-import { DEFAULT_PDF_MAX_PAGES } from './config.js';
+import { DEFAULT_PDF_MAX_PAGES, RETURN_ECHO_CHARS } from './config.js';
 import { PYTHON_STDOUT_CHARS } from './python.js';
 import { renderThemeTable, themeCatalog } from './engine/theme.js';
 import { loadAllFormats, loadFormat, formatIds } from './registry.js';
@@ -33,7 +37,11 @@ const BASE_TOPICS = {
     run: `office_run 的用法
 
 参数
-- script（必填）：一段 JavaScript。可以直接写多步，最后 return 一个值（会回显）。
+- script（与 scriptFile 二选一）：一段 JavaScript。可以直接写多步，最后 return 一个值（会回显）。
+- scriptFile（与 script 二选一）：读工作目录里的一份 .js 当脚本跑 —— 长脚本先
+  office.files.write('build.js', code) 落盘，之后每次调用复用同一段，改动只改那份文件；
+  错误行号是那份文件里的行号，它也会记进台账的 source。配 args 按参数复用。
+- args（选填）：传给脚本的参数，脚本里以全局 args 读到。
 - purpose（选填）：一句话说明这次要做什么，只用于显示。
 - keepCache（选填）：false 时这次调用结束就清空缓存目录；不传则按设置里的
   「保留中间产物」（默认保留）。中间产物默认跨调用留着，才会命中缓存。
@@ -46,8 +54,9 @@ const BASE_TOPICS = {
 - office.python —— 科学计算与绘图：run / file / check（见 office_help({topic:'python'})）
 - office.av —— 音频与视频的内容提取：check / info / transcribe / frames / extract
   （见 office_help({topic:'av'})）
-- office.preview / office.image / office.archive —— 渲染预览 / 图库取图与署名 / 读压缩包
-  （见 preview、image、archive 三个话题）
+- office.preview / office.image / office.writing / office.archive —— 渲染 / 配图 / 写作规划 /
+  读压缩包（见各自话题）
+- office.convert —— 互转与统一出 PDF（见 convert）
 - office.files —— 读写改文件；批量替换只写一次盘
 - office.cache —— 中间产物目录（可命中复用）
 - office.theme —— 主题清单
@@ -59,21 +68,18 @@ const BASE_TOPICS = {
 office_run 会把写出的文档自动登记进台账；要主动记偏好或查记忆，用
 office_memory 工具（见 office_help({topic:'memory'})）。
 路径一律相对当前工作目录；也可以用绝对路径。
-能调外部程序的地方只有五处，都由插件自己探测、脚本里给不了命令：
-- PDF 渲染（office.pdf.pages，探测 poppler / PyMuPDF / Ghostscript 等）；
-- LaTeX 编译（office.tex.compile，探测 latexmk / xelatex / lualatex）；
-- Python（office.python，探测 python / python3 / py）；
-- ffmpeg（office.av，探测 ffmpeg / ffprobe；推理由插件的子进程跑本机 SenseVoice）；
-- 文档渲染预览（office.preview，用宿主随部署安装的 LibreOffice 引擎渲染成图或 PDF）。
+能调外部程序的地方只有六处，都由插件自己探测、脚本里给不了命令：
+PDF 渲染（poppler / PyMuPDF / Ghostscript 等）、LaTeX 编译（latexmk / xelatex / lualatex）、
+Python（python / python3 / py）、ffmpeg（office.av）、预览与转换（LibreOffice 随部署装）、
+pandoc（office.convert）。
 
 反馈里会有什么
 - 每个写出的文件都会被自动重新打开检查一遍，附上真实统计和结构摘要。
 - warnings 是排版风险提示，不是错误；按提示调整通常能明显变好看。
-- 脚本返回的 JSON 超过 4000 字符会被截断；长内容写进文件再读，不要靠返回值带。
+- 脚本返回的 JSON 超过 ${RETURN_ECHO_CHARS} 字符会被截断；长内容写进文件再读，不要靠返回值带。
 
-三个真实用例（第十八轮 P1-2 / 18-12：这三个形状是从真实会话里反复重建出来的，
-照它们改参数就够；每行参数的完整含义见对应话题的 detail:true。**默认层不带例子** ——
-例子只在全文层，因为它一次就占几百字节、又不必每次重发）
+三个真实用例（第十八轮 P1-2 / 18-12：这三个形状是从真实会话里重建出来的，照它们
+改参数就够；每行参数的完整含义见对应话题的 detail:true。**默认层不带例子**）
 
 【例 1】Word 报告（.docx）
     const wb = office.word.create({ path: '季度汇报.docx', title: '2026 年 Q1 汇报' });
@@ -110,7 +116,7 @@ office_memory 工具（见 office_help({topic:'memory'})）。
     ].join('\\n');
     const py = await office.python.run(code);            // 图必须落在 OUT_DIR 才会出现在 files 里
     const png = py.files.find((file) => file.kind === 'image');
-    wb.image(png.path, { widthCm: 12, caption: '季度趋势' });   // PPT 用 deck.image(png.path)
+    wb.image(png.path, { widthCm: 12, caption: '季度趋势' });   // PPT 用 deck.image({ path: png.path })
     // 长脚本先 office.files.write('analysis.py', code)，再 office.python.file('analysis.py', { args: [...] })`,
 
     pdf: `PDF 的读法（office.pdf）
@@ -134,7 +140,7 @@ PDF 分两类，读法完全不同，先问一句再动手：
     扫描件、图表都靠这一步进上下文。这是读图能力，不是 OCR，认得出字。
     dpi 默认 120（手写建议 120-200，越大越慢）；format 默认 png，也可 jpeg。
     单次最多渲染 ${DEFAULT_PDF_MAX_PAGES} 页，超了要分批传 from/to。
-    结果按「文件内容 + dpi + 格式 + 引擎」缓存在 .office/cache 里：同样的页码再渲染
+    结果按「文件内容 + dpi + 格式 + 引擎」缓存在 .office/runtime/cache 里：同样的页码再渲染
     就是 reused（缓存命中），不重算。
 
 - office.pdf.engines() —— 本机探测到的引擎（渲染 / 抽文本 / 页数）
@@ -164,9 +170,10 @@ stdout / stderr 与产出的文件一起带回来。装包、改环境、开 she
     - ok = 退出码为 0。脚本自己报错时 ok:false，stderr 里是完整回溯，
       行号就是代码里的行号，直接照着那一行改。
     - files 是这次跑出来的产物，图片标 kind:'image'，路径可以直接交给
-      Word 的 builder.image(path, { widthCm, caption }) 或 PPT 的 deck.image(path)。
+      Word 的 builder.image(path, { widthCm, caption }) 或 builder.images(items),
+      也可以用 PPT 的 deck.image({ path }) / deck.images(items)。
     - stdout 超过 ${PYTHON_STDOUT_CHARS} 字符会截断，完整输出在 logFiles.stdout 里。
-    - 产物默认落在缓存目录的 python/out（即 .office/cache/python/out）。
+    - 产物默认落在缓存目录的 python/out（即 .office/runtime/cache/python/out）。
     - args 会变成脚本的 sys.argv[1:]（参数化跑同一段分析用）。
 
 脚本里多出来的三个名字
@@ -189,7 +196,9 @@ stdout / stderr 与产出的文件一起带回来。装包、改环境、开 she
 几条边界（照实说，不要试）
 - **要图表对象就别画 PNG**：Excel 的 sheet.chart({type, title, categories, series})
   与 PPT 的 deck.chart({...}) 生成原生图表部件（可改类型、可编辑数据）；
-  Python 画 PNG 适合示意图与 Office 画不出来的形状。
+  Python 画 PNG 适合示意图与 Office 画不出来的形状。Excel 要放真实位图时用
+  sheet.image(path, {at, widthCm, heightCm, alt})（PNG / JPEG 原生图片部件）；
+  Word / PPT 也可以直接嵌 Python 画出来的 PNG。
 - 数据要交付就写成 CSV 放 OUT_DIR；要当交付物的文本仍走 office.files.write ——
   Python 直接写工作目录的文件不进台账，也不会被复检。
 - 没有网络（pip install 装不了包）、没有 stdin（input() 会立刻 EOFError）、
@@ -199,8 +208,11 @@ stdout / stderr 与产出的文件一起带回来。装包、改环境、开 she
 
     files: `office.files 的用法
 
-- office.files.read(path)              读文本
-- office.files.write(path, text)       整份覆盖写
+- office.files.read(path)              读文本（二进制会当场报错并指路，不给乱码）
+- office.files.readBytes(path)         读原始字节（二进制安全，返回的字节视图可直接交给 write / copy）
+- office.files.write(path, 文本或字节)  整份覆盖写（**顶层**字节按字节写；嵌在对象里的字节、Map / Set、函数与 undefined 一律被拒绝，不静默写成坏文件）
+- office.files.copy(from, to, {overwrite?})   整份复制（二进制安全，走内核复制、不经过脚本内存）
+- office.files.move(from, to, {overwrite?})   移动 / 改名（同一份文件换个位置或名字）
 - office.files.edit(path, edits)       批量字面替换，只写一次盘
       写法：[[旧, 新], [旧, 新]]  或  [{ find, replace, all }]
       没命中的 find 会出现在结果 missing 里，不会静默跳过
@@ -209,9 +221,18 @@ stdout / stderr 与产出的文件一起带回来。装包、改环境、开 she
 
 改 Markdown 或长文本就用 edit/template：一次调用改完所有位置，
 不要一条一条改。
+二进制（PNG / PDF / 压缩包 / Office 文档）不能用 read 读：**前 8 KB 里有空字节**、
+或**开头命中已知二进制魔数**（%PDF- / PNG / JPEG / GIF / ELF）就会直接报错
+并指路 —— 要字节用 readBytes，要整份搬用 copy / move，要看内容用对应的 office.* 读取器
+（PDF → office.pdf，docx/xlsx/pptx → 对应格式的 read）。
 压缩包（zip / gz / zst，含会话导出）不能用 read 读：用 office.archive，
 见 office_help({topic:'archive'})。read 遇到压缩包会直接报错并指到那里，
 不会给你一段乱码。
+copy / move 的目标已存在时要显式传 overwrite:true（与 preview.pdf / image.fetch
+同一条口径）；复制会把源文件登记成这次读过的输入，移动不会（移动后源路径已不存在）。
+两个动作只处理**单个文件**：源或目标是目录会直接报错（不递归、不跟随链接）；
+源与目标指向同一个文件（含硬链接 / 符号链接别名）也会拒绝。
+路径按工作目录解析，相对路径里的 ../ 可以出目录（与 write / remove 一致），绝对路径也允许。
 office.archive 的判型按**魔数**（ZIP / gzip / zstd / 纯文本），不看扩展名；
 zstd 要 Node 22.15 以上；返回全部有界（text 可翻页、find 有命中上限）。`,
 
@@ -269,7 +290,7 @@ office.word.read / excel.read / ppt.read 报的是**结构**（统计、大纲�
       配 range（A1 区域），**pages 与 sheet 不能同时给**。
     - dpi 默认 110（范围 24-600）；maxPages 默认 12、上限 30 —— 文件比 maxPages 多时
       只渲前 maxPages 页并在 hint 里说明（不会因为页数多就失败）；要看别的页传 pages。
-    - 拿到 images[].path 之后**逐张 read_image**。图落在 .office/cache/preview/ 下，
+    - 拿到 images[].path 之后**逐张 read_image**。图落在 .office/runtime/cache/preview/ 下，
       是中间产物；同一份文件（内容未变）+ 同样的参数会命中已有图，reused:true 不重渲染
       （命中的返回形状与新渲染一致：pageCount / backend / missingFonts 都在）。
     - missingFonts 是「文档声明了但本机没有的字体」：渲染出来会有替换字体，不是文件坏了。
@@ -283,11 +304,74 @@ office.word.read / excel.read / ppt.read 报的是**结构**（统计、大纲�
 时调，别每写一份都调。典型：写完 pptx → office.preview.render('汇报.pptx') →
 逐张 read_image → 发现某页文字溢出 → office.ppt.revise 就地改 → 再 render 一次确认。`,
 
-    image: `配图的来源与获取（office.image）—— 网络取图、图库检索、署名
+    convert: `文档互转与统一出 PDF（office.convert）—— tex / md / word 互相转，认识的文档格式都能出 PDF
+
+三件引擎各管一段，都在运行期探测（office.convert.check() 报实况）：
+- pandoc：md / docx / tex 之间的互相转换（也认 odt / html / rst / txt 源）；
+- 本机 TeX 发行版：.tex → PDF（latexmk / xelatex）；
+- 宿主随部署安装的 LibreOffice 引擎：docx / xlsx / pptx → PDF（老格式 .doc / .xls / .ppt
+  与 OpenDocument 的 .ods / .odp 同样走它，那几种 pandoc 读不了、只给出 PDF）。
+
+矩阵（源 → 可转的目标）
+- md   → docx / tex / pdf
+- docx → md / tex / pdf
+- tex  → md / docx / pdf
+- html / rst / txt / odt → md / docx / tex / pdf
+- pdf / xlsx / pptx / doc / odf → pdf（pdf 是原样留一份，其余只有出 PDF 这一条）
+pandoc 读不了 PDF 的正文：要 PDF 里的文字用 office.pdf.text，要画面用 office.pdf.pages。
+
+- await office.convert.check()
+    → { available, pandoc:{path,version}|null, latex, libreoffice, cjkFont,
+        sources, targets, matrix:[{source, targets:[{target, engine, available, reason?}]}], hint }
+    只报探到的入口；缺哪样只影响它那几条路（hint 里写了缺什么、怎么装）。
+- await office.convert.file(path, { to, out?, overwrite?, engine?, timeoutMs?,
+                                   media?, fragment?, reference?, font?, texEngine?, clean? })
+    → { ok, from, to, path, bytes, engine, steps, reused, warnings?, media?, hint }
+    - to（必填）：md / docx / tex / pdf（也认 markdown / word / latex 与带点的写法）。
+    - out：目标路径；不传就写到**源文件同目录同名**换扩展名。
+    - engine：只对出 PDF 有意义 —— auto（默认）/ libreoffice（宿主引擎）/ tex（本机 TeX 排版）。
+      matrix[].engine 是**路线名**（direct / docx / latex / tex / copy），不是 file() 的 engine 取值。
+    - media：docx / odt → md / tex 时把内嵌图片抽成 \`<目标名>.media/\`（默认抽；false 只出文本）。
+    - fragment：md → tex 只要正文片段（默认出**能直接编译**的整份，导言区与中文字体都配好）。
+    - reference：md → docx 的参考样式文档（一份本机 .docx，Word 里做好样式另存即可）。
+    - font：LaTeX 路线用的中文字体名；默认自动探（Windows 微软雅黑 / Linux Noto CJK / macOS 苹方）。
+    - texEngine：.tex 出 PDF 时指定编译入口（latexmk / xelatex / lualatex）；
+      clean 只管中间产物（'aux' 默认 / 'none'）—— 传 'all' 按 'aux' 处理，它会把 PDF 一起删掉。
+
+出 PDF 的路线（engine 不传时按源格式挑）
+- .tex → 本机 TeX 编译（只有 \\documentclass{thuthesis} 的论文项目才拷那套模板）。
+- .docx / .xlsx / .pptx 以及老格式 .doc / .xls / .ppt、OpenDocument 的 .odt / .ods / .odp
+  → 宿主 LibreOffice 引擎直接渲染（与 office.preview 同一份引擎）。
+- .md / .html / .rst / .txt → 默认先 pandoc 成 docx 再交给 LibreOffice（中文字体不用配）；
+  LibreOffice 不在时自动退到 pandoc --pdf-engine=xelatex —— 那条退路上，**源里有中文
+  （或读不出正文的二进制源）而探不到中文字体时直接报错不做**：pandoc 找不到字体会静默
+  丢字（退出码仍是 0，PDF 里只剩空白）。源里没有中文时不需要字体，照常出。
+
+四条边界
+- 覆盖：目标已存在且内容不同时要显式 overwrite:true；内容一致就不重写（reused:true）。
+  **例外**：\`.tex → pdf\` 的默认落点就是 TeX 自己写 PDF 的位置（源文件旁边同名）——
+  那里**已经有一份 PDF 时，不传 overwrite:true 会被当场拒绝**（编译会直接覆盖它，事后再报
+  就晚了）；传了就重写并把这次产物登记上，\`reused\` 恒为 false。想两份都留就传 out。
+  .tex 编译与 LibreOffice 产物里带生成时间戳，同一份源重转后字节仍会不同，重写要显式说一声。
+- 复用：pandoc 的 SOURCE_DATE_EPOCH 钉在**源文件的修改时间**（mtime）上，所以「同一份文件
+  （没改过、mtime 也没变）重复转换得到同一份产物」；git checkout / 从别处复制会把 mtime 换掉，
+  那时产物字节不同，第二次会被覆盖闸拦下 —— 确认要重转就传 overwrite:true。
+- 版式：tex → md 只保证正文与公式，thuthesis 的自定义命令、版式与参考文献样式都会丢；
+  要留版式就留 .tex / .pdf，别拿 md 当中转。
+- 交给谁：转换只换容器，不改内容判断 —— 要按目标格式的规矩重排版（封面、目录、版式助手）
+  仍然用 office.word / excel / ppt / tex 的 create。
+
+引擎缺失：pandoc 从 pandoc.org 装（winget install JohnMacFarlane.Pandoc）；TeX 装
+TeX Live / MiKTeX；LibreOffice 由 DSH 随部署安装。便携版用环境变量 DSH_OFFICE_PANDOC
+（可执行文件或命令名）与 DSH_OFFICE_CJK_FONT（字体名）指路，装了不用改配置。`,
+
+    image: `配图（office.image）—— 图库检索 / 网页选图 / 抽文档内嵌图 / 元信息 / 署名
 
 office.python 只能画数据图；照片 / 素材要么用户自己放进工作目录，要么从这里取。
 两条免 Key 的公开图库通道：维基共享资源（commons，署名信息最全）与 Openverse
 （聚合多个 CC 图库）。要 Key 的图库不在默认清单里 —— 取一张图不该先配 Key。
+除了图库，还有三条路：看本地图片的元信息（info）、从网页列候选（fromPage）、
+把 docx / pptx / xlsx 里已经嵌好的图抽出来复用（extract）。
 
 - office.image.channels()
     → [{ id, label, needsKey, note }]；可用 id：commons / openverse
@@ -312,6 +396,26 @@ office.python 只能画数据图；照片 / 素材要么用户自己放进工作
       明确报「不是图片」，不当成下载成功。相对路径的 to 必须在工作目录内（写成 ../ 会被拒绝），
       目标已存在且不同要显式传 overwrite:true。
     - 取回来的依据（来源页 + 许可）会进这次调用的引用列表 → office_run 写进台账 source。
+- office.image.info(path)
+    → { ok:true, path, bytes, mime, ext, width, height, aspectRatio, sha256,
+        insertableInWord, insertableInPpt }；读不到 / 不是位图时回 { ok:false, path, reason }
+    - 不联网、不落盘。只按魔数认 PNG / JPEG / GIF / WebP（WebP 三种块头都读宽高）；
+      SVG / TIFF / BMP 这些不做元信息。嵌之前先看这一条：Word 只吃 PNG / JPEG。
+- await office.image.fromPage(url, { limit?, minWidth? })
+    → { ok, url, finalUrl, title, count, results:[候选], skipped:[{url?, reason}], hint }
+    - 候选与 search 同构（可直接交给 image.fetch），另带 alt 与 role（og = 社交卡片主图）。
+      顺序 og:image / twitter:image → <img>；相对地址按 <base href> 解析，srcset 取最大一份；
+      data: / blob: / 非 http(s) 记进 skipped，按解析后的 URL 去重。
+    - 只解析服务端返回的 HTML：纯 JS 渲染的页面可能 0 条；网页图的许可通常未知，
+      正式发布前自己核对来源（这里只给「图片在哪个页面上」，不给 license）。
+- office.image.extract(path, { out?, overwrite? })
+    → { ok, format, path, dir, count, files:[{path, part, bytes, mime, width, height, sha256}],
+        skipped, hint }
+    - 抽 docx / pptx / xlsx 包里的 word/media、ppt/media、xl/media；默认落
+      assets/<stem>-media/，文件名带内容哈希前 8 位 —— 同 basename 的不同文档不会互覆。
+    - 每张都经统一文件环境落盘（进这次调用的产物清单）；目标已存在默认跳过，
+      要重写传 overwrite:true。EMF / WMF / SVG / TIFF 抽得出来，但 Word / PPT 不认，
+      要先转成 PNG。
 
 配图必须带来源（正式文档尤其）：拿到 credit 之后嵌进文档时传 source ——
     const picked = (await office.image.search('风力发电机 照片')).results[0];
@@ -319,6 +423,97 @@ office.python 只能画数据图；照片 / 素材要么用户自己放进工作
     wb.image(img.path, { widthCm: 12, caption: '陆上风电场', source: img.credit });
 Word 会在图注下面加一行小字「来源：…」；PPT 并进题注那一行。直接给 URL 取图也行，
 但那时署名只能自己写（结果里的 license / author 是空的）。`,
+
+    writing: `写作规划与自检（office.writing）—— 生成前分注意力，生成后按同一张表查
+
+这不是提示词，也不是结构模板。它把「哪一节该多写、哪一节该收住」算成一张表：
+按每节的内容难度与读者收益分配字数，难点 / 跃迁点多给笔墨，背景与常识压到一两句；
+写完再用同一张表查句长、套话、锚点、让步与重点节是否写透。
+
+- office.writing.plan(input, options)
+    input：string（一句话 brief）或 { title, genre, audience, goal, targetChars, throughLine, sections }
+    sections 每项：string（节名）或 { heading, kind, difficulty, value, purpose, mustCover,
+      moves, register, figurative, rhythm, avoid }
+    → { version, brief, strategy, sections:[{ id, heading, kind, difficulty, value, weight,
+        share, targetChars, depth, depthLabel, registerLabel, figurativeLabel, purpose,
+        readerQuestion, mustCover, moves, register, figurative, rhythm, avoid }], checks,
+        totalChars, markdown }
+    - genre：academic / explainer / report / memo / essay / howto / general（也认论文、科普、
+      汇报、提案、评论、指南等中文别名）；不给就是 general。
+    - kind：context / problem / method / theory / evidence / analysis / leap / implication /
+      example / howto / limitation / summary / faq。给节名时也会按关键词猜（「机制」→theory，
+      「局限」→limitation），猜错就显式传 kind。
+    - difficulty / value 都是 0–3，越大越该多写。权重 = base × (1 + difficulty×0.16) ×
+      (1 + value×0.10)；单节上限按节数（1 节 100% / 2 节 65% / 3 节 50% / 4 节及以上 40%），
+      目标字数会精确加总到 targetChars。
+    - depth：share ≥ 0.25 是 dwell（写透），≥ 0.15 是 develop（展开），≥ 0.08 是 touch
+      （点到），否则 compress（收住）。sections 缺省时按 genre 给一套可改的骨架。
+    - checks 是写前确认：读者要同时拿住几个新概念（>2 就拆步）、这一节改变读者哪个判断
+      （不改变就删）、全文最长的一节是不是最难的那点；另有目标 / 主线 / 权重 / 节数提醒。
+    - markdown 是可直接 office.log 的版本（含篇幅表、全局质感、逐节写法与写前确认）。
+- office.writing.audit(text, planOrOptions)
+    → { ok, score, band, chars, signals, sections, warnings, suggestions, note }
+    - 传 plan 时按节名对表：重点节低于目标 68% 报 underdeveloped，收住节超过 1.7 倍报
+      overexpanded；各节实际篇幅仍平均报 uniform-allocation；最长节不是最难/最值钱的节报
+      longest-not-hardest。
+    - 不传 plan 也能查：句长过匀 / 段长持平 / 套话密度 / 抽象名词过多 / 锚点不足 / 比喻过密 /
+      过度对冲 / 通篇无让步 / 每节总结 / 重复句首。
+    - score 只是启发式加权（≥82 自然、≥68 尚可、否则模板感重），**不是「像人程度」的证明**；
+      改稿看 warnings 与 suggestions，不看分数。
+- office.writing.deai(text, options)
+    options：{ mode: 'report' | 'safe', register: 'platform' | 'official' | 'academic' |
+      'personal' | 'general'（默认，也认中文）, styleRef?: string }
+    → { ok, mode, register, chars, flags, stats, styleRef, notes, note,
+        ...(mode:'safe' ? { text, edits } : {}) }
+    - 只报可解释的句式：A1 对举 / A2 提示语冒号 / M1 元话语起手式；每条带 spans、count、
+      density、confidence、reason 与 falsePositiveHint。**没有 0–100 分，也没有「AI 含量%」**，
+      不推断作者；人类也会写 A1/A2。
+    - register 调口径：platform 与 general 全高置信；official 把 A2 降为提示、A1 中置信；
+      academic 把 A1 降为中、A2 降为提示；personal 把 A1 降为提示。F1 破折号 / A4 长定语 /
+      A5 顿号 / B1 抽象 / C2 连接词只进 stats，不进默认 flags。
+    - styleRef 传一段人类参考稿：比较句长、段长、对举/提示语/锚点/套话/问句密度，
+      报「与参考稿的偏离」，不报 AI 概率；参考稿不足 200 字只作方向。
+    - mode:'safe' 只做机械删改：删「先说结论：」「说白了：」「一句话：」等元话语前缀；
+      「原因不复杂：」改成「原因是」，「这个原因：」改成「这个原因，」；A1 只报不改，
+      事实、数据与论证不动。改完必须人复核，不要直接当终稿。
+- office.writing.signals(text)：只给表面量（句长 / 段长 / 套话 / 锚点 / 比喻 / 让步 / 问句），
+  不判分；调阈值或自己接评测时用。
+- office.writing.render(plan)：把规划对象重新渲染成 Markdown。
+
+一条完整用法（Word / Markdown 都适用；脚本里只规划，正文自己写）：
+    const plan = office.writing.plan({
+        title: '检索噪声为什么会拖垮答案',
+        genre: 'academic',
+        audience: '做过 RAG、但不熟悉检索噪声的工程师',
+        goal: '让读者相信扩库后的正确率下降主要来自噪声，而不是模型变弱',
+        targetChars: 1200,
+        sections: [
+            { heading: '反差的来处', kind: 'context', difficulty: 1, value: 1.5 },
+            { heading: '两条机制假设', kind: 'theory', difficulty: 2.8, value: 3 },
+            { heading: '可证伪的预测与实验', kind: 'evidence', difficulty: 2.4, value: 3 },
+            { heading: '边界', kind: 'limitation', difficulty: 1.8, value: 2 },
+        ],
+    });
+    office.log(plan.markdown);       // 篇幅表与逐节写法进反馈，模型照着写
+    // …生成正文…
+    const report = office.writing.audit(text, plan);
+    if (report.warnings.length > 0) office.log(JSON.stringify(report.warnings, null, 2));
+
+写作口径（与 guide 一致）：
+- 学术 / 困难 / 跃迁节多花笔墨：机制链条、替代解释、反例、可证伪预测；说明性内容可以用
+  日常比喻、短句与放松语气，但每个比喻要说明「哪里像、哪里不像」，一段最多一个。
+- 每 150 字至少一个可核对锚点（数字带口径 / 日期 / 专名 / 原话 / 具体场景）；没有就写「推测」。
+- 每个核心主张配一条最强反对或竞争解释；不要用「有人认为」设稻草人。
+- 连接词只在关系可能被误读时用；「首先/其次/最后」全文只许出现一组。
+- 语言强度跟证据强度对齐：相关性写「与……相关（n=…）」，未验证机制写「一种解释是」，外推
+  写「在……条件下」。
+- 背景与常识压到 1–2 句；省下的字数给新定义、机制、跃迁点与边界。
+- 不编造个人经历、对话或数据；不为了「像人」加错别字、同义词替换或伪口语。
+
+大模型评测：仓库的 scripts/writing-eval.mjs 做 baseline 与 planned 两臂 A/B（A 学术难点 /
+B 说明文 / C 汇报），自动匿名化、换序控位置偏差、限长、记录 audit 与反模板清单；没有
+WRITING_EVAL_API_KEY / DEEPSEEK_API_KEY 时打印 SKIP，不伪造结果。--mock 可离线跑通流程。
+这不是「人类化改写器」：不做同义替换、不改写正文，也不以检测器分数为目标。`,
 
     settings: `设置界面（Settings > 插件 > 办公模式 / 记忆系统）
 
@@ -340,27 +535,41 @@ Word 会在图注下面加一行小字「来源：…」；PPT 并进题注那�
 「办公模式」页
 工具开关 —— 关掉的工具不出现在模型面前，也不占每次请求的 schema 开销。
 - office_help / office_run / office_memory
-- office_search_run / office_search_brief / office_search_dispatch / office_parse_findings
+- office_search_run / office_search_dispatch / office_parse_findings
 开关即时生效：改完立刻重建工具面，不用重启。
 
+工具面守卫（第五十四轮 新-15①）
+- guard.hideDevToolsInOffice  默认**关闭**。preset 里那段「关掉编程类工具」的
+  disabled:true 行运行期不生效（那些能力挂在全局层，preset 的禁用行只作用于
+  它自己那一层），这一项打开后由插件在**办公会话**里真正掩掉它们：命令行（bash /
+  pwsh）、后台任务（job_*）、workflow / ralph、子代理及其控制面、待办、技能、
+  目标、插件管理、任务看板。代价写清：模型**自己**起子代理、命令行、后台任务、
+  待办与技能入口都没了；检索三步走的派工**不受影响**（它用的是宿主 subagents 服务，
+  不是被掩掉的那个工具）。**即时生效**：已经在跑的办公会话也会立刻重算掩码
+  （那些入口当场消失，不必重开）。
+
+办公模式插件（第六十三轮 新-21）
+- 这一组列的是**办公 preset 自己声明的插件行**（读的是 preset 文件本身，不是当前会话的
+  设置）：每行一个开关，改的是那一行的 disabled。宿主侧同时同步 profile 上已有的覆盖行，
+  写前自动落一份备份，页面上的「还原上一次备份」把两个文件一起写回去。
+- **生效范围是新建的办公会话**：preset 在新建会话时才读，已经在跑的会话不受影响 ——
+  用户问「关了怎么没变化」时先看这一条。
+- 列表是实时的：外部（git / 手改）动了 preset 文件，点一次「刷新」就会跟着变。
+
 检索编排
-- subagentTools   检索子代理的工具白名单（默认极简七项）
 - maxParallel     同时铺开几个检索子代理，1-8，默认 4
 - resultLimit     解析结果最多列几条，1-40，默认 40
 - maxChannels     一次提纲最多几个渠道，1-12，默认 12
 - outputDir       提纲与结果文件目录，默认 .office/search
-- requireCrossSource     单一来源的结论是否点名要求补检索，默认开
-- fallbackOnPlatformError 平台直连失败时是否改用网页搜索兜底，默认开
 - engine          auto（默认，先派子代理、跑不了用内置）/ subagent / builtin
 - provider        用哪条联网通道：auto（按 providerOrder 依次试）/ 固定某一条
 - providerOrder   auto 的尝试顺序
 - providers.<id>  每条通道各自的 apiKey / apiKeyEnv / baseURL / model / timeoutMs
 - preprocess      网页预处理：mode（article | plain | off）/ dropBoilerplate /
                   dedupeLines / minLineChars / keepTitle
-- builtin         Anthropic 兼容通道（也是 providers.anthropic 的老入口）：
-                  apiKeyEnv / apiKey / baseURL / model / maxUses / maxTokens /
-                  maxResults / fetchPages / searchTimeoutMs / fetchTimeoutMs /
-                  maxBytes / maxChars / maxRedirects
+- fetch           取正文与 PDF 的上限（与用哪条通道无关）：maxResults / fetchPages /
+                  fetchTimeoutMs / maxBytes / maxChars / maxRedirects /
+                  pdfMaxBytes / pdfMaxPages
 
 文档与缓存
 - defaultTheme / scriptTimeoutMs / maxScriptChars / cacheDir / keepCache
@@ -402,11 +611,14 @@ Word 会在图注下面加一行小字「来源：…」；PPT 并进题注那�
    - office_run 每写出一份 Office 文档就自动登记：路径、格式、主题、字节、
      复检统计、结构摘要、这次的目的、以及**这次脚本经 office.files 读过的输入文件**
      （source）、复检告警（note）。模型不用为此多调一次工具。
-   - source 只记同一段脚本里真的读过内容的文件（office.files.read → readFile /
-     readText），而且排除这次自己写出来的那些：原地 revise 读的是同一份产物，
-     记进去是同义反复。**不经 office.files 的读取不在其中**：office.pdf 直接读盘、
+   - source 只记同一段脚本里真的读过内容的文件（office.files.read / readBytes →
+     readFile / readText）；office.files.copy 也算 —— 复制出来的那一份，来源就是被复制的那一份。
+     这次自己写出来的那些要排除：原地 revise 读的是同一份产物，记进去是同义反复；
+     office.files.move 同样排除源路径（移动之后它已经不存在了）。
+     **不经 office.files 的读取不在其中**：office.pdf 直接读盘、
      office.av 走 ffmpeg、office.python 在工作目录里跑，这三条路拿到的输入不会进
-     source —— 要追溯就把依据写进 purpose。
+     source —— 要追溯就把依据写进 purpose。脚本本身也走这条路：用 scriptFile 跑时，
+     那份 .js 会记成 source（「这份产物是拿哪段脚本构建的」）。
    - 其它情况（依据是口述、检索结果或用户给的临时事实）source 就是空的 ——
      那是如实的「没有文件来源」，不是漏记。
    - 找「上次那份东西」用它：office_memory({ action:'read', layer:'ledger',
@@ -433,8 +645,28 @@ Word 会在图注下面加一行小字「来源：…」；PPT 并进题注那�
 
 读回执每行去掉行首的「- 」之后**第二段**就是条目 id（热记忆紧跟「[重要度]」、
 台账紧跟日期、归档紧跟「[月份]」；形如 m-… / L-… / mnemon:… / b-…）：
-link / unlink / related 要它，replace / remove 也可以直接给 id 代替 oldText。
+replace / remove 可以直接给 id 代替 oldText（旧图关系的 link/unlink/related 已下线）。
 要引用某条记忆就先把 id 抄下来。
+
+**分区读取（第五十四轮 新-12）**：read 给 tags / entities 就是按它**分区** ——
+硬过滤，只出**显式声明过**这些标签 / 实体的条目（正文里出现不算）。这是「一个工作目录
+一份记忆、里面混装多主题」时唯一能**只读某一类**的入口；不给分区 = 老行为（全给）。
+
+- 三层各自的归类字段不同：热记忆与归档条目看写条目时声明的 tags / entities；
+  台账行看 theme（登记时的主题 id 就是它的归类键）。台账**没有实体** —— 拿
+  entities 分区时它一行都不会出现，回执里如实报「分区外的条目」，不装作「台账里没有」。
+- 同一个维度里给多个词是**合取**（每一个都要声明过），不是「任一命中」：分区是一把
+  钥匙，不是一串检索词 —— tags:['发布','模板'] 问的是同时属于这两个分区的那一批。
+- 分区与 query 是两件事，都排在**打分之前**：分区是过滤器（硬隔离），query 也是**过滤器**
+  （一个词都没命中的条目不出现，与台账 / 归档同口径）。**热记忆的排序不随 query 变** ——
+  仍是「重要度永远是主键 → 新在前」：热记忆装的是**约束**，一条 low 的笔记命中两个词不该
+  压过一条 critical 的「永远不要…」；同族两版里也不该让旧版靠命中数冒到当前版前面。
+  与那两层的第二处区别是热记忆**不套** strict-v1 的分档丢弃：它条目少、每条都短，
+  命中了一个词就不该因为占比低被丢掉。要不带过滤地看全量，去掉 query。
+- 分区对 layer:'all' 也生效：三层各自过滤，回执首行印出这次的分区口径与隔掉的条数。
+  非数组 / 数组里有非字符串会被**拒绝**；全是空白的分区键（tags:['']）同样被拒绝 ——
+  它不等于「没给分区」（静默当没给会让回执连分区行都不印）。要不过滤就传空数组 []。
+  （同 since / until 的口径：过滤器不许静默丢弃。第五十七轮顺手删掉了这里重复的一遍。）
 
 4) 知识库（kb，第四十一轮）—— 外部原文的块与字符区间，存在 .office/kb/
    - 它装的**不是结论而是来源原文**：一份文档一行（manifest.jsonl），正文按内容哈希
@@ -442,27 +674,69 @@ link / unlink / related 要它，replace / remove 也可以直接给 id 代替 o
      与块正文逐字相等）、标题路径、以及块头「标题路径 · 来源 · 日期」——
      块头是 Anthropic Contextual Retrieval 的零依赖版本（官方数字全部来自「给块前置
      50—100 token 专属上下文」）。切块是**结构切块**（Markdown 标题分层 + 段落聚合，
-     块大小按来源分档），不做语义切块，也不用嵌入。
-   - 读法有两条：**检索**与**显式挑读**。
-       office_memory({ action:'kb-search', query:'切块 结构' })      词法检索（推荐先走这条）
-       office_memory({ action:'kb-ingest', path:'资料.md', tier:'user' })  入库（幂等）
-       office_memory({ action:'kb-list' })                                  清单
-       office_memory({ action:'kb-read', id:'<文档 id 或块 id>' })           读块（逐字引用走这条）
-       office_memory({ action:'kb-drop', id 或 path })                      删除
+     块大小按来源分档），不做语义切块；默认词法，配了 embedding 才走向量混合。
+   - 读法有两条：**检索**与**显式挑读**；浏览走文件夹树。
+       office_memory({ action:'kb-tree' })                          整棵树（每层的文档数）
+       office_memory({ action:'kb-search', query:'切块 结构', folder:'参考' }) 在子树里检索
+       office_memory({ action:'kb-ingest', path:'资料.md', tier:'user', folder:'参考/合同' }) 入库并归到虚拟文件夹
+       office_memory({ action:'kb-list', folder:'参考', recursive:false }) 只看当前层
+       office_memory({ action:'kb-read', id:'<文档 id 或块 id>' })   读块（逐字引用走这条）
+       office_memory({ action:'kb-drop', id 或 path, scope:'global' }) 只删全局根那一份
+       office_memory({ action:'kb-update', id, title?, folder?, tier? }) 改文档信息（不重切块）
+       office_memory({ action:'kb-edit', id, text })                 改文本源正文并重新入库
+       office_memory({ action:'kb-link', sourceId, targetId, kind:'supports', note }) 建块间关系
+       office_memory({ action:'kb-related', chunkId })               看相邻块（双向）
+       office_memory({ action:'kb-summarize', title, text, chunkIds:['<块 id>', …] }) 多块合成摘要块
+       office_memory({ action:'kb-summaries' })                     摘要块清单
+   - **虚拟文件夹**（第八十四轮）：folder 只是 manifest 上的一段相对路径（如「参考/合同」），
+     不复制磁盘目录；空文件夹不显示。folder 同时是**检索范围**：recursive 默认 true（整棵
+     子树），false 只看当前层；根 '' 表示整个库。非法路径（绝对路径 / 盘符 / ..）当场报错。
+   - **按次指定根**（第八十轮）：kb-ingest / kb-drop 可带 scope:'workspace' | 'global'，
+     只动那一个根（同路径可以两份并存：一份全局、一份工作区）；根没在设置里打开就报错，
+     不会悄悄写到别处。省略 scope 时：有全局根就写全局（知识库语义上是这台机器的资料库），
+     否则写工作区；显式 scope:'workspace' 仍可写工作区。
+     全局根的 kb 在全局记忆目录的兄弟目录（默认 $DSH_HOME/.office/kb）。kb-list / kb-search /
+     kb-ingest / kb-drop 的回执会在全局那份上标「（全局）」；未标的是工作区根。
+   - **归档并入知识库**：面板不再有独立归档页签；归档条目以只读虚拟文档出现在「归档/YYYY-MM」
+     文件夹（id kb:<hash>，固定一块），不复制、不迁移，也删不掉（kb-drop 碰不到）。
    - 入库是显式的（没有后台扫描）：同路径同内容再入库不写任何字节；同路径新内容是**换代**
      （旧块删掉、边同事务清掉、旧块 id 留墓碑）。删除与换代都保持「悬空引用 == 0」这条不变量。
-   - 检索是**词法**的：中文按字符二元组（bigram）展开、拉丁词与数字整词保留，排序用
-     BM25（k1=1.2 / b=0.75），正文与块头（「标题路径 · 来源 · 日期」，Contextual
-     Retrieval 的零依赖版本）两路各自归一化后加权（0.75 / 0.25）。它**不做嵌入**，
-     所以边界要照实说：**语义改写召不回**（查询与正文用词完全对不上时给不出结果）——
-     那不是故障，换一个更贴近原文的词再试。
+   - 检索默认是**词法**的：中文按字符二元组（bigram）展开、拉丁词与数字整词保留，排序用
+     BM25（k1=1.2 / b=0.75），正文与块头两路各自归一化后加权（0.75 / 0.25）。
+     显式配 embedding（远端 /embeddings、本机推理服务或 mode:'local'）后升级成 SQLite
+     混合检索：词法 + 向量余弦按 hybrid 权重融合。向量先走 ANN（纯 JS HNSW）取候选，
+     再按库里的原始向量精确重算；索引缺失 / 损坏 / 超规模时退回精确扫描。selector.mode:'llm'
+     时再让一个独立模型从候选里挑编号，主上下文只拿选中的块。**任一段失败都退回上一步**，
+     不阻断检索。**auto 无端点时仍是词法**，所以语义改写仍可能召不回 —— 换更贴近原文的词。
    - **零重叠就弃答**：没有一块的词表与查询沾边时，回执明说「弃答」，不会把「最像的那块」
-     端出来当命中。分数是**同一批命中里的相对次序**（每路都归一化过），不是置信度。
+     端出来当命中。混合检索的向量单独命中要求余弦 ≥ 0.25，本地向量必须显式开启。
+     分数是**同一批命中里的相对次序**（每路都归一化过），不是置信度。
+   - **索引**：manifest 是唯一真源；kb.sqlite 只是可重建的索引（docs / chunks / FTS /
+     embeddings / chunk_links / summaries）。拿不到 node:sqlite 时自动回退 manifest + 词法，
+     入库 / 读取 / 删除不受影响。全局库目录由设置 memory.kbDir 指定，默认 $DSH_HOME/.office/kb。
+   - **多格式入库**：文本直读；PDF / DOCX / PPTX / XLSX 抽文本；图片落 assets/ 并把
+     ![名](assets/…) 写进正文，图片块可检索。单文件上限 8 MB；PDF 只抽文本层，不抽内嵌图。
    - 命中给块 id / 路径 / 块号 / 字符区间 / 块头 / 预览（每块开头若干字符）。要逐字引用
      就把块 id 给 kb-read 读整块 —— 预览只是让你决定要不要读。检索有界：单次最多扫
      2000 块、最多给 8 条命中（limit 可收小，硬上限 20），被截断时回执会说明。
    - 次数占**每回合配额**里的「知识块检索」一档（默认 2，0 = 不限制）—— 词法检索最容易
      被「没查到就换个词再查」拖着走。tier / path 可以当筛选（只看某一档或某一份）。
+   - **块间关系与摘要**（第八十五轮）：kb-link 写 chunk_links，两端都必须在索引里；
+     kb-related 走 1–2 跳邻居（双向）；kb-summarize 把多块合成一条独立摘要块
+     （summary_of 记录来源块），摘要块照常进检索，来源块仍保留。关系不会自动连边，
+     摘要默认仍是手写；开了下面的 AI 增强才由模型自动生成。
+    - **AI 建库**（可选，默认关）：设置 memory.llm 里选 mode（host = 宿主已配置模型，
+      openai = 任意 OpenAI 兼容 /chat/completions 端点）与 provider/model（Key 可走环境变量）。
+      kb-ingest({ ai:true, aiModel? }) 才走模型：chunking 让模型只给「哪些小节并成一块」的
+      分组，正文仍按原文偏移 source.slice 切出，不改写、不删字；summary 生成摘要另存
+      summaries 表，不替代原文块，检索命中摘要会带来源块 id。aiEstimate:true 只预估
+      批数 / 调用数与预算，不调用模型；超预算直接拒绝；单次有 maxCallsPerRun，到顶返回
+      paused + stateKey，aiResume:true 续跑。任一次调用失败 / 超时都按确定性切块回退
+      （degraded 计数），不会让入库失败在半路。
+    - **千万字长篇**：单文件上限 2 MB（约 60 万汉字），先按卷 / 章切成多个文件入库；
+      全局词法检索单次最多扫 2000 块，几十卷的书会截断后半（bounded=true 会说明）。
+      精准召回靠「先定位再检索」：folder 收窄到卷 / 章、path 锁定某一份，再在范围内
+      查关键词 / 人物 / 事件；AI 摘要可给每卷一段导语帮助选卷。不保证 100% 召回。
    - **来源三档是硬规则，不是权重**：user（用户放进工作目录的文档）/ verified（≥2 个
      独立来源确认过）/ unverified（单源未核实）。unverified 可以进 kb 的待核区，但
      **永远不能进热记忆** —— add 时声明 tier:'unverified'、或引用一块 unverified 的
@@ -482,6 +756,27 @@ link / unlink / related 要它，replace / remove 也可以直接给 id 代替 o
      不做自动裁决（模型对冲突的行为自相矛盾，且系统性偏好更早的证据）；同一条冲突边
      再调一次可以改状态，related 的回执里会带着「冲突：未决 / 偏向哪一端」。
 
+5) 统一入口路由（第五十七轮 19-8 的 P2-8）—— 一条 recall 决定要不要下探 kb
+   office_memory({ action:'recall', query:'…' })：先查记忆三层，再按**现算的门控**决定
+   要不要下探知识库，并在回执首行自报这次的路由。门控是纯判据（memory.js 的
+   gateVerdictOf），四档按顺序判：
+     empty   命中 0 条 —— 记忆里没有这件事；
+     partial 查询词没被命中条目的词表全覆盖 —— 有一半问题记忆答不了；
+     weak    词全覆盖、但没有一条约束级 —— 有相关内容，却没有「必须 / 永远」可依；
+     enough  词全覆盖 + 至少一条 critical —— 停在记忆层，不再花 kb 配额。
+   除 enough 之外都下探 kb；下探被「知识块检索」配额挡住时，回执如实写「未下探」并给出
+   那条真的能走的路（kb-read / kb-list / 调设置）—— **不把「被挡住」说成「不必查」**。
+   三项原料（命中数、查询词覆盖、最高重要度）都在回执里印出来，判据可以逐次核对。
+   两条要记住的边界：① **覆盖是三层命中的并集**，不是「有一条命中覆盖了整句查询」——
+   所以 enough 只表示「词都对上了、而且有约束级可依」，不保证一条就答得全；
+   ② **约束级看的是热记忆层与归档里的 hot 条目**（台账行没有重要度这个字段），
+   所以热层被挤空、critical 沉到归档之后，门控照样认得出它。
+   配额上与 read 带 query **共用同一条界**（初查 / 细化各一次）：换一个入口不该换来额外的
+   检索次数；只有真的下探了才再吃一档 kb 配额。
+   什么时候仍该直接用 read / kb-search：只想要记忆层（或只要台账 / 归档、要看现状）时用
+   read；已经知道要查来源原文、也不怕多花一次配额时用 kb-search。recall 是「不知道该查
+   哪边」时的默认入口，不是它们的替代品。
+
 写入（action: add / replace / remove）
 - add     新记一条：content 要一两句、自包含，下次不看上下文也读得懂。
 - replace 改一条：oldText 给一段能**唯一**命中原文的片段，或直接给 read 行首的 id；
@@ -489,9 +784,12 @@ link / unlink / related 要它，replace / remove 也可以直接给 id 代替 o
 - remove  删一条：同上要求唯一命中。只在用户明确要求、或确有证据说明作废时删。
 - target  user = 用户是谁、偏好、要求、忌讳；project = 项目约定、环境事实、
           工具坑、可复用的做法。选错层会让「项目的事实」被当成「用户的偏好」。
+- scope   选填 workspace / global：这一条只写进指定根，不按设置走。省略时 user 在
+          userScope=global 下落全局、其余按 scope；显式指定时替换 / 删除也**只在那一个根里找**，
+          不跨根兜底（找不到就报错，不静默跑到另一个根）。
 - importance  critical（明确的必须 / 永远不要）/ normal / low（只对一段时间有用）。
-- entities / tags  选填。entities 填了才会出现在实体视图里（实体是声明的，不猜）；
-  tags 参与归档检索。
+- entities / tags  选填。entities 填了才能按它分区读取（实体是声明的，不猜；
+  第九十一轮起不再有实体视图）；tags 参与归档检索。
 
 只记什么 / 不记什么
 - 记：用户说过的偏好、纠正、要求「记住」的事；稳定的项目约定与环境事实；
@@ -511,37 +809,24 @@ purpose:'作为版式参考', source:['9-15文以载道.md'] })。
 记忆范围与层开关（设置页可改）
 - 范围 scope：workspace = 只跟当前工作目录（一个项目一份，默认）；global = 所有
   项目共用一份；both = 两者并存 —— 读的时候**全局在前、工作区在后**，因为具体
-  项目的约定比通用偏好更该被最后看到。每条结果都带 origin（全局 / 工作区）。
+  项目的约定比通用偏好更该被最后看到。来自全局根的行标「（全局）」，未标的是工作区根。
 - 全局层默认在 $DSH_HOME/.office/memory（globalDir 可改；相对路径相对用户主目录，
-  不相对工作目录 —— 全局层跟着工作目录走就没有意义了）。
+  不相对工作目录 —— 全局层跟着工作目录走就没有意义了）；它的 kb 在兄弟目录
+  $DSH_HOME/.office/kb。
 - userScope：memory = 「用户偏好」跟着上面的范围；global = 始终落全局层，
   这样换一个工作目录不必把「用户是谁」重记一遍。
+- 按次指定根（第八十轮）：add / replace / remove / kb-ingest / kb-drop 都可带
+  scope:'workspace' | 'global'，只动那一个根；根没开就报错。它不改变读的可见范围：
+  读仍按 scope 合并各根。典型用法是把跨项目通用的偏好写进全局、项目流程留在工作区：
+  office_memory({ action:'add', target:'user', content:'…', scope:'global' })。
 - layers.hot / ledger / archive：每层独立开关。关掉只是不再读 / 不再写，
   **已有数据不会被删除**，重新打开就回来。
 
-图关系（action: link / unlink / related / entities）
-- link 给两条记忆建一条**双向**类型化关系：{ action:'link', sourceId, targetId,
-  kind }。kind：related（默认）/ refines / supersedes / contradicts / supports /
-  derives。两个 id 都必须真实存在，否则报错 —— 允许悬空边会让关系图慢慢烂掉，
-  而悬空边在遍历时表现为「静默少一条」，比直接报错难查得多。
-- id 从哪儿来：read 的结果里热记忆与归档条目都带 id（热记忆下沉进归档时
-  **保留 id**，所以关系不会因为下沉而断）。
-- 删除引用完整性：remove 一条记忆时，落在它上面的边**同事务**清掉，并留一条墓碑
-  （tombstones.jsonl，只有 id + 时刻 + 原因，没有正文）。所以「悬空引用 == 0」是一条
-  不变量 —— status 里会报 dangling（在这个插件打开的根范围内恒应为 0）与墓碑条数。
-  跨根写会同时持有**所有根**的写入队列（只锁一侧等于没锁：并发下会丢边、会造出悬空边、
-  Windows 上还会 rename EPERM）。
-- 墓碑的作用与边界：被删掉的 id 不能再被 link（会明确说「已被删除」），也**不会**被一份
-  旧 Pack 导入复活（删掉的信息不该从备份里爬回来）。但墓碑**不锁死活着的 id** ——
-  如果同一个 id 又真的活过来了（迁移重跑、归档块合并、固定 id 的 pointer:archive 被重建），
-  link / related 以「活着」为准，不会拿着陈旧墓碑永久拒绝。
-- 万一还是出现了悬空边（老数据、外部改过文件），related 会把它单独列出来，且**不会
-  穿过它继续遍历** —— 旧实现会把已删节点当成一座桥，报出隔着一层删除内容才够得到的
-  条目。看到「另有 N 条悬空边」就用 unlink 把边删掉。
-- related 沿关系找相邻条目：{ action:'related', id, depth?:1-3, kind? }。
-  默认只走一跳 —— 图一旦放开很容易把整个记忆库拉进上下文。
-- entities 看实体视图：实体来自条目**显式声明**的 entities 数组（add / replace
-  时可以传），不做抽取。猜出来的实体比没有实体更误导。
+图关系已下线（第九十一轮）
+- 旧的 link / unlink / related / entities 动作、面板图谱页与实体视图都已移除；这些数据不再参与浏览或召回。
+- 历史 links.jsonl 与旧 Pack 里的关系数据**不删除**：export / import 继续兼容，删除条目时内部仍会清掉落在它上面的旧边并留墓碑，避免悬空引用污染后来的导入。
+- 条目自带的 entities 字段仍可作为分区读取的硬过滤条件，但不再有「实体视图」。
+- 新需求请用知识库块关系（kb-link / kb-related），它有自己的限流与面板。
 
 召回质量（strict-v1）
 - 带 query 的检索会分档：按「命中了查询里几成的**词**」算相关度（**不是**向量余弦
@@ -591,16 +876,16 @@ purpose:'作为版式参考', source:['9-15文以载道.md'] })。
   依赖的性质。将来若要拿它做别的（比如「很久没被用过的先下沉」），那是另一条链，得先量。
 
 每回合配额
-- 一个回合里第一次带 query 的记忆检索、后续的换词细化、**知识库（kb）检索**、图关系
-  遍历各有次数上限（默认 1 / 1 / 2 / 1）。回合号是从会话日志的 turn/start 事件读出来的。
+- 一个回合里第一次带 query 的记忆检索、后续的换词细化、**知识库（kb）检索**、知识块
+  关系遍历（kb-related）各有次数上限（默认 1 / 1 / 2 / 1）。回合号是从会话日志的 turn/start 事件读出来的。
 - kb 检索单独一档：它的语料是几百块长原文、代价与记忆层不同，共用名额会让「查一次记忆」
   把「查一次来源」的机会一起吃掉。改它去设置页「记忆系统 → 每回合配额 → 知识块检索」。
 - 用完会**明确拒绝并说明原因**（kb 那一档会直接给出「改走 kb-read」这条路），不要以为是
   检索坏了然后换个工具重复同样的检索。不带 query 的 read 是看现状、不是查资料，不占配额。0 = 不限制。
 
 备份与迁移（action: export / import）
-- export 把热记忆 + 台账 + 归档（索引 + 两投影全文：.md 与 .jsonl）+ 关系 + 墓碑整包
-  写成一个 JSON 单文件：{ action:'export', packPath?:'...' }（不传就写到记忆目录下的
+- export 把热记忆 + 台账 + 归档（索引 + 两投影全文：.md 与 .jsonl）+ 历史关系数据 + 墓碑
+  整包写成一个 JSON 单文件（旧图关系已下线，但数据随包保留，导入不会丢）：{ action:'export', packPath?:'...' }（不传就写到记忆目录下的
   pack-<时间戳>.json）。
 - import 读回来：{ action:'import', packPath:'...' }。口径是**只增不改**，按 id
   幂等：热记忆 / 台账 / 关系同 id（或同 source+target+kind）已存在就跳过，不覆盖
@@ -612,9 +897,10 @@ purpose:'作为版式参考', source:['9-15文以载道.md'] })。
 - 这份 Pack 含私有记忆，不要当公开文件传。
 
 浏览面板
-- 设置对话框左侧「记忆系统」是配置页；侧栏的「记忆」入口是**浏览**页：热记忆 /
-  台账 / 归档 / 关系 / 实体五个页签，带搜索与工作目录切换。它走一个只读的本地
-  端点（/office-memory/snapshot），且只服务「本进程真的跑过办公工具的工作目录」。
+- 设置对话框左侧「记忆系统」是配置页；会话页签行里的「记忆」是**浏览**页（排在
+  「上下文」「编队」的右侧，要开着会话才看得见）：记忆（热记忆 / 台账 / 归档）与知识库
+  两个一级页签，带搜索与工作目录切换。它走一个只读的本地端点
+  （/office-memory/snapshot），且只服务「本进程真的跑过办公工具的工作目录」。
 
 边界（与 mnemon 的差别，说清楚免得误期待）
 - 没有远端记忆体、没有多 Provider 后端：全部落在工作目录与全局层的普通文件里。
@@ -630,8 +916,8 @@ mnemon 关掉之后，原来存在它那里的记忆可以整批搬过来：
   target=user 的进 USER.md，target=memory 的进 MEMORY.md；全局那份会被**复制**
   进本工作目录（换项目要各迁一次，记忆本来就是按工作目录的）。
 - 长期记忆（Memory Spaces 的 insights）→ 归档：内容、类别、重要度、标签、实体
-  与「有多少条关系边」都随条目保留。**图边本身不迁**（mnemon 的图在它自己的库里），
-  只保留计数；迁完之后可以用 action:'link' 按需要重建关系。
+  与「有多少条关系边」的计数都随条目保留；**图边本身不迁**（mnemon 的图在它自己的库里，
+  本插件的图关系也已下线），计数只作历史记录。
   已软删（deleted_at 非空）的不迁。
 - Documents（项目档案）→ 办公记忆没有对应层：只报告数量并提醒原件仍在原地。
 - 幂等：热记忆按内容去重、归档按 mnemon 的原始 id 去重，重复跑不会产生第二份；
@@ -642,17 +928,17 @@ mnemon 关掉之后，原来存在它那里的记忆可以整批搬过来：
   node scripts/migrate-mnemon.mjs --dry-run
   node scripts/migrate-mnemon.mjs`,
 
-    search: `检索与结果解析（office_web_search / office_web_fetch / office_search_run / office_search_brief / office_search_dispatch / office_parse_findings）
+    search: `检索与结果解析（office_web_search / office_web_fetch / office_search_run / office_search_dispatch / office_parse_findings）
 
-办公模式自带联网检索（第三十轮起走插件自己的网页抓取通道；第三十三轮起带宿主 web 服务兜底）
+办公模式自带联网检索（第六十五轮起默认顺序 deepseek-api → seam → 免 Key 抓取）
 - 查一个事实点：office_web_search({ queries: [...] })；打开一个页面：office_web_fetch({ url })。
-  两者先走插件的免 Key 抓取通道（抓 DuckDuckGo HTML 结果页解析，配了自建 SearXNG 也会用），
-  不依赖宿主的联网工具，也不走 Tavily 这类要 Key 的三方 API；两条抓取通道都通不了时
-  退到**宿主 web 服务**兜底，反馈里会写明「这一轮是兜底给的」。来源直接回到对话，不落盘。
-- 要让材料落盘可复核、或要按渠道覆盖，走 office_search_run / 三步走。通道有多条，
+  默认先走 **DeepSeek Search API 直连**（一次请求直接拿结果，不跑辅助模型；结果自带摘要），
+  再退到宿主的 web 服务，最后走插件的免 Key 抓取（DuckDuckGo HTML 结果页 / 自建 SearXNG）。
+  都不依赖宿主的联网工具，也不走 Tavily 这类要 Key 的三方 API。来源直接回到对话，不落盘。
+- 要让材料落盘可复核、或要按渠道覆盖，走 office_search_run / 渠道覆盖检索。通道有多条，
   按顺序自动挑或者由你点名：
-  duckduckgo=免 Key 抓取（默认第一）/ searxng=自建实例（免 Key）/
-  seam=宿主 web 服务（兜底）/ anthropic=Anthropic 兼容 + 原生 web_search（默认 DeepSeek 官方）/
+  deepseek-api=DeepSeek Search API 直连（默认第一，要 DEEPSEEK_API_KEY）/
+  seam=宿主 web 服务 / duckduckgo=免 Key 抓取 / searxng=自建实例（免 Key）/
   openai=OpenAI 兼容 / tavily / brave / bocha=博查（中文长尾好）/ exa / serper=Google 结果代理。
   auto（默认）按 providerOrder 依次试，第一条成功的就用它；三方检索 API 不在默认顺序里，
   要用就显式点名（office_search_run({ provider:'bocha' })）或在设置页加回 providerOrder。
@@ -679,22 +965,58 @@ mnemon 关掉之后，原来存在它那里的记忆可以整批搬过来：
   直接放弃而不是截断 —— 截断的 PDF 抽不出文本；抽不出文本的多半是扫描件，那种要
   用 office.pdf.pages() 渲染成图再看。标着 PDF 而内容其实是 HTML 错误页时按
   「不支持的类型」报（不会误导成去装引擎）；notice 里的页数是**抽到了几页**，不是总页数。
-- 要按渠道逐项覆盖（下一条的分流规则）：走下面三步走。
+- 要按渠道逐项覆盖（下一条的分流规则）：走下面两步走。
 
-三步走，顺序不要颠倒
-1. office_search_brief({ topic, type?, audience? })
-   出提纲：按内容类型决定该搜哪些渠道，并把提纲写成文件。
+两步走：派工与解析，顺序不要颠倒
+1. office_search_dispatch({ topic, type?, audience? })
+   给 topic 就自动按内容类型出提纲（brief.md 落盘，渠道分流规则与固定要求都在
+   文件里，可审计可复用）并逐渠道执行；briefPath 可复用上一轮的提纲重跑或改渠道，
+   outputPaths 不给就按渠道数自动生成。
    type 可选 hotspot（热点）/ knowledge（知识）/ manual（手册）/ mixed；
-   省略时按主题文字自动判断。
-2. office_search_dispatch({ briefPath, outputPaths })
-   按提纲逐渠道执行。组合里有子代理服务时派子代理（每个渠道一个，
+   省略时按主题文字自动判断。组合里有子代理服务时派子代理（每个渠道一个，
    各自用 office_web_search / office_web_fetch 抓网页）；没有时自动改用
-   插件的内置检索通道，在进程内跑同样的渠道。两条通道写出的结果文件同一种
-   格式，所以第三步一样用。
+   插件的内置检索通道，在进程内跑同样的渠道，结果文件同一种格式。
    材料都只落盘，主上下文不会被搜索结果灌满。
-3. office_parse_findings({ paths, type?, topic? })
+2. office_parse_findings({ paths, type?, topic?, draft? })
    把结果文件读成摘要：按渠道归类、算来源覆盖度、标出只有单一来源背书
    与没带 URL 的条目。摘要是几十行，不是整页原文。
+   给了 draft（产物正文，md / txt）还会做**句级引用审计** —— 见下面「引用纪律」。
+
+引用纪律（第五十七轮 19-8 的 P2-9）
+- 产物写完之后，把**正文**（Markdown / 纯文本）当 draft 传进来，插件逐句对账：
+  ① 声称外部事实的句子有没有给出处；
+  ② 正文里写下的每个地址，在**本次材料**里对不对得上（材料就是刚落盘的那几份结果
+     文件里的**全部**地址，含写在散文 / 表格里的那些；对不上就是编的）。
+  没过时工具结果 ok:false，并**带句号**点名要改的那几句与哪条地址（最多列 8 条）。
+- 事实句的判据是**显式的、可以逐条核对的**五条，一项都不做语义判断：
+    · 年份 —— 必须带「年」字（2024 年）：光看四位数字会把 1920×1080 判成年份；
+    · 百分比 —— 数字后面跟 % 或 ％；
+    · 带**外部**量词的数字 —— 钱 / 人 / 倍 / 吨 / 公里 / 平方米 / ℃；刻意不收
+      「个 / 项 / 条 / 页 / 份」，那多半是在说这份产物自己的形状；
+    · 句首归因 —— 据 / 根据 / 依据 + 16 字内出现来源性名词（通报 / 数据 / 用户…）
+      （光有「按 Enter 继续」「根据判据」不算：那是在讲方法）；
+    · 句中归因 / 统计词 —— 表明 / 报道 / 统计 / 宣布 / 公布 / 同比 / 环比 / 占比 /
+      首次，以及「数据 / 报告 / 通报… + 显示 / 表明 / 称」这种带主语的引述。
+  整行**不判**的三类（有意为之，属边界）：Markdown 标题、分隔线（三个连字符）、引用块
+  （行首 >）与表格行（行首 |）—— 把带数字的事实放进引用块或表格，这次审计就不看它；
+  另外长度不到 6 字的片段不判。
+- 句界：句末标点（。！？!?）才算，**分号不算**（「一是…；二是…。（来源：X）」是最常见
+  的写法，按分号切会把前两个分句判成没出处）；句号**后面**的「（来源：…）」会并回上一句，
+  但**绝不跨标题 / 分隔线**并（跨过去会让上一节那句白捡一个出处）。围栏代码块与行内
+  代码里的地址是示例，先剔掉再判。
+- 指标口径（ALCE 三项里哪几项算得出，必须写清，不许含糊）：
+    · 召回 = 事实句里带引用的比例（ALCE 原定义要蕴含判断，这里只是它的**词法代理**）；
+    · 精确率 = 正文里的地址**逐字**对上材料的比例。同站不同页只算「站点级对上」，
+      单独报数、**不计入分子**；同一路径不同参数（?id=1 / ?id=2）算**对不上**
+      （那可能是另一个页面）；kb 块 id 只核形状，出处标记与编号引用**不进分母**；
+    · 正确性 = **算不出**，恒为 null。它要蕴含判断与事实真值 —— 不许拿上面两项冒充。
+- 三态，不许混说：**通过**（真有事实句、地址也逐字对上）/ **未过**（ok:false）/
+  **没判出可核的东西**（没有可判的事实句、或正文里一个地址都没有 —— 这不是「引用都齐了」，
+  也不会印成「通过」）。
+- 边界照实说：Office 三件套 / PDF / ODF 的正文回读不了（read() 只给结构与统计），
+  传这些文件会被当场拒绝并指三条路（传写文档用的 Markdown 源 / office.convert 转成 md /
+  PDF 先 office.pdf.text 抽文本）。draft 给了空串或非字符串同样当场报错 —— 静默当
+  「没给」会让调用方以为审过了。
 
 渠道分流规则（固定，不靠临场发挥）
 - 热点事件：权威媒体（定事实骨架）+ 各社交平台（现场与争议）；两边都要。
@@ -726,16 +1048,13 @@ office_help / office_run / office_memory（不生成文档）、bash / pwsh（�
 
 内置检索怎么配（设置页「办公模式 → 检索编排」）
 - search.provider     auto（默认，按顺序自动挑）/ 固定成某一条通道 id
-- search.providerOrder  auto 的尝试顺序（免 Key 抓取在前、接缝兜底；三方 API 不进默认顺序）
-- search.providers.<id> 每条通道各自的 apiKey / apiKeyEnv / baseURL / model / timeoutMs。
-                       anthropic 与老的 search.builtin 是同一件事的两个入口，
-                       同名键以 providers.anthropic 为准
+- search.providerOrder  auto 的尝试顺序（默认 deepseek-api → seam → duckduckgo → searxng；
+                       三方 API 不进默认顺序）
+- search.providers.<id> 每条通道各自的 apiKey / apiKeyEnv / baseURL / model / timeoutMs
 - search.preprocess   mode（article | plain | off）/ dropBoilerplate / dedupeLines /
                        minLineChars / keepTitle
-- search.builtin      Anthropic 通道的细项：apiKeyEnv（默认 DEEPSEEK_API_KEY，
-                       先问宿主凭据服务、再看环境变量、最后看 $DSH_HOME/.credentials.yaml）/
-                       baseURL / model（要支持原生 web_search）/ maxUses / maxTokens /
-                       maxResults / fetchPages / 各类超时与体积上限 /
+- search.fetch        取正文与 PDF 的上限（与通道无关）：maxResults / fetchPages /
+                       fetchTimeoutMs / maxBytes / maxChars / maxRedirects /
                        pdfMaxBytes 与 pdfMaxPages（取正文撞上 PDF 时的体积与页数上限）
 - search.proxy        出口代理（留空 = 直连）。填了让本插件自己发起的联网走它；
                       只认 http / https，本地地址不经代理
@@ -801,7 +1120,7 @@ Word 保持白纸黑字，都不加任何背景填充；要配色必须显式选
       跨在切点上的短音能在同一块里解完；跨得更深的长句由边界回退兜住。
       rolls 是这次转写里边界回退的次数，0 表示每块都正好切在句子之间。
       maxSeconds 是单次时长上限（默认 3600 秒），超过就报错要求先切段。
-    - 解码出来的规范 WAV 按内容键缓存在 .office/cache/av/audio 下：同一份文件
+    - 解码出来的规范 WAV 按内容键缓存在 .office/runtime/cache/av/audio 下：同一份文件
       再转一次是 audio.reused=true，不重解码。
     - words:true 才给词级时间：每句多一个 words:[{text,start,end}]（中日韩按**字**、
       西文按**词**，标点并进前一个词），顶层多一个 wordTimings 计数。
@@ -815,7 +1134,7 @@ Word 保持白纸黑字，都不加任何背景填充；要配色必须显式选
     - 时间点优先级：at（明确给秒，数组或单值）> every（定步长秒）> count（默认 6 张均匀铺开）。
     - 拿到 path 之后**逐张 read_image({ file_path })**。图上有字也认得出来，那是读图能力。
     - 单次上限 maxFrames（默认 12 张）；4K 视频建议给 width（如 1280），图小、读得快。
-    - 抽出来的帧落在 .office/cache/av/frames/<文件名>/ 下，是中间产物，不进交付物。
+    - 抽出来的帧落在 .office/runtime/cache/av/frames/<文件名>/ 下，是中间产物，不进交付物。
 
 一次做完：await office.av.extract(path, { ...转写参数, ...抽帧参数, out?, frames?, transcript? })
     → { info, transcript, frames, notes, next }
@@ -867,23 +1186,27 @@ const COMPACT_TOPICS = {
     theme: COMPACT_THEME,
     run: `office_run 的用法（批处理脚本）
 
-- script（必填）：一段 JavaScript，可以写多步，最后 return 一个值（会回显）。
+- script（与 scriptFile 二选一）：一段 JavaScript，可以写多步，最后 return 一个值（会回显）。
+- scriptFile（与 script 二选一）：读工作目录里的一份 .js 当脚本跑 —— 长脚本先
+  office.files.write('build.js', code) 落盘，之后每次调用复用同一段，不必重复内联。
+- args（选填）：传给脚本的参数，脚本里以全局 args 读到。
 - purpose（选填）：一句话说明这次做什么。
 - keepCache（选填）：false 结束即清空缓存目录（默认保留，保留才能跨调用复用）。
 
 脚本里能用：office.word / office.excel / office.ppt（造、读、改文档）、office.tex
-（学位论文，见 tex）、office.pdf（见 pdf）、office.python（见 python）、office.av
+（学位论文，见 tex）、office.pdf（见 pdf）、office.convert（md / docx / tex 互转、
+认识的文档格式出 PDF，见 convert）、office.python（见 python）、office.av
 （音频转写与视频抽帧，见 av）、office.preview（把自家文档渲染成页面图 / PDF，
-见 preview）、office.image（免 Key 图库取图与署名，见 image）、office.archive
-（读 zip / gz / zst，见 archive）、office.files、office.cache、office.theme、
+见 preview）、office.image（取图与用图，见 image）、office.writing（写作规划与自检，见 writing）、
+office.archive（读 zip / gz / zst，见 archive）、office.files、office.cache、office.theme、
 office.log / warn / note、office.assert(条件, 说明)。
 
 没有：process / require / fs / 网络 / 计时器；也没有 office.memory（记忆走
 office_memory 工具）。路径相对当前工作目录。能调外部程序的只有 PDF 渲染、
-LaTeX 编译、Python、ffmpeg（office.av）、文档渲染预览（office.preview）五处，
-都由插件自己探测，脚本里给不了命令。
+LaTeX 编译、Python、ffmpeg（office.av）、文档渲染预览（office.preview）、
+文档转换（office.convert）六处，都由插件自己探测，脚本里给不了命令。
 反馈：每个写出的文件都会被重新打开复检（真实统计 + warnings）；脚本返回的 JSON
-超过 4000 字符会截断，长内容写进文件再读。
+超过 ${RETURN_ECHO_CHARS} 字符会截断，长内容写进文件再读。
 三个真实用例（docx / xlsx / Python 绘图）在全文层：office_help({ topic: 'run', detail: true })。`,
     pdf: `PDF 的读法（office.pdf）—— 先 info 判断类型，再决定怎么读
 
@@ -907,7 +1230,8 @@ LaTeX 编译、Python、ffmpeg（office.av）、文档渲染预览（office.prev
     → { ok, code, stdout, stderr, files, script, outDir, logFiles, elapsedMs }
     ok = 退出码为 0；报错时 stderr 是完整回溯，行号就是代码里的行号。
     files 是这次跑出来的产物，图片标 kind:'image'，路径可直接交给
-    Word 的 builder.image(path, …) 或 PPT 的 deck.image(path)。
+    Word 的 builder.image(path, …) / builder.images(items)，或 PPT 的
+    deck.image({ path }) / deck.images(items)。
     stdout 超过 ${PYTHON_STDOUT_CHARS} 字符会截断，完整输出在 logFiles.stdout。
 - await office.python.file('analysis.py', { args? })   长脚本先落成 .py 再跑。
 
@@ -921,7 +1245,8 @@ WORK_DIR（当前工作目录）、use_cjk_font()（matplotlib 中文与负号�
 先问一句：await office.av.check() → { available, missing, ffmpeg, ffprobe,
     sensevoice, chunkSeconds, overlapSeconds, maxSeconds, maxFrames, hint }。
     ffmpeg / ffprobe / SenseVoice 模型 / sherpa-onnx 运行时缺任何一样都**直接报错**，
-    不静默降级；hint 里写了缺什么、怎么补。
+    不静默降级；hint 里写了缺什么、怎么补。推理由插件的子进程跑（在脚本沙箱之外，
+    不占宿主事件循环），所以脚本里只管 await。
 
 - await office.av.info(path) → { kind, container, durationSeconds, hasAudio, hasVideo,
     audio:[{codec,sampleRate,channels}], video:[{codec,width,height,fps,frames}] }
@@ -948,8 +1273,11 @@ WORK_DIR（当前工作目录）、use_cjk_font()（matplotlib 中文与负号�
 细节（返回字段全表、典型流程、配置项）用 office_help({ topic: 'av', detail: true })。`,
     files: `office.files 的用法（改 Markdown 或长文本就用它，一次改完所有位置）
 
-- office.files.read(path)               读文本
-- office.files.write(path, text)        整份覆盖写
+- office.files.read(path)               读文本（二进制会报错并指路，不给乱码；判据是空字节或已知魔数）
+- office.files.readBytes(path)          读原始字节（二进制安全，交给 write / copy 用）
+- office.files.write(path, 文本或字节)   整份覆盖写（顶层字节按字节写；嵌在对象里的字节、Map / Set、函数与 undefined 会被拒绝）
+- office.files.copy / move(from, to, {overwrite})   整份复制 / 移动（二进制安全；
+      目标已存在要显式 overwrite:true）
 - office.files.edit(path, edits)        批量字面替换，只写一次盘
       写法：[[旧, 新], [旧, 新]] 或 [{ find, replace, all }]；没命中的 find 在结果
       missing 里报出来，不会静默跳过。
@@ -978,13 +1306,36 @@ read 报的是结构（统计 / 大纲 / 排版风险），看不了画面；要
     → { dir, dpi, pageCount, count, images:[{index,page,width,height,bytes,path}], missingFonts, reused }
     pages 默认 'all'，也可给页码数组（从 1 开始）；xlsx 用 sheet（工作表名）配 range（A1 区域），
     pages 与 sheet 不能同时给。dpi 默认 110，maxPages 默认 12（上限 30）。
-    **拿到 images[].path 逐张 read_image**；图落 .office/cache/preview/，内容与参数没变就 reused。
+    **拿到 images[].path 逐张 read_image**；图落 .office/runtime/cache/preview/，内容与参数没变就 reused。
 - await office.preview.pdf(path, { to? }) → { path, bytes, reused }
     不传 to 只放缓存；传 to 写到工作目录（交付物，出现在反馈的 otherFiles 里）。
 
 渲染一次 2-5 秒，**按需调**（写完想确认版式、交付前看一眼），别每写一份都调。
 细节（页选择、缺字体、缓存键、支持的全部输入格式）用 office_help({ topic:'preview', detail:true })。`,
-    image: `配图的来源与获取（office.image）—— 网络取图 / 图库检索 / 署名
+    convert: `文档互转与统一出 PDF（office.convert）—— md / docx / tex 互相转，认识的文档格式都能出 PDF
+
+三件引擎各管一段（都在运行期探测）：pandoc（互转）/ 本机 TeX（.tex 出 PDF）/
+宿主 LibreOffice（Office 三件套与老格式 .doc/.xls/.ppt/.ods/.odp 出 PDF）。
+
+- await office.convert.check()
+    → { available, pandoc, latex, libreoffice, cjkFont, sources, targets, matrix, hint }
+    只报探到的入口；缺哪样只影响它那几条路。
+- await office.convert.file(path, { to, out?, overwrite?, engine?, media?, fragment?, reference?, font? })
+    → { ok, from, to, path, bytes, engine, steps, reused, warnings?, media?, hint }
+    to：md / docx / tex / pdf（也认 markdown / word / latex 与带点的写法）。
+    默认写到源文件同目录同名换扩展名；out 指定别的路径。
+    docx / odt → md / tex 默认把内嵌图片抽成 \`<目标名>.media/\`（media:false 只出文本）。
+    md → tex 默认出能直接编译的整份（fragment:true 只要正文片段）。
+    engine 只对出 PDF 有意义：auto / libreoffice（宿主引擎）/ tex（本机 TeX 排版）。
+    .md 出 PDF 默认「先转 docx 再渲染」，LibreOffice 不在时自动退到 pandoc + xelatex。
+
+目标已存在且内容不同要显式 overwrite:true；.tex 编译与 LibreOffice 产物带生成时间戳，
+同一份源重转也不会字节相同。.tex 出 PDF 的默认落点由 TeX 自己写：那里**已经有一份 PDF** 时，
+不传 overwrite:true 会被拒（传了就重写并登记，reused 恒为 false；想两份都留就传 out）。
+PDF 正文读不出来：要文字用 office.pdf.text，要画面用 pages。
+
+细节（矩阵、路线、中文字体、边界与引擎环境变量）用 office_help({ topic: 'convert', detail: true })。`,
+    image: `配图（office.image）—— 图库检索 / 网页选图 / 抽内嵌图 / 元信息 / 署名
 
 两条免 Key 的图库通道：commons（维基共享资源，署名信息最全）/ openverse（CC 图库聚合）。
 
@@ -998,9 +1349,40 @@ read 报的是结构（统计 / 大纲 / 排版风险），看不了画面；要
     → { path, bytes, mime, width, height, source, credit, attribution }
     默认落 assets/；先校验魔数（返回 HTML 说明页会明确报「不是图片」）；来源页与许可
     会进台账的 source。
+- office.image.info(path) → { ok, path, bytes, mime, ext, width, height, aspectRatio, sha256,
+    insertableInWord, insertableInPpt }；读不到 / 不是位图回 { ok:false, reason }，不抛。
+    只按魔数认 PNG / JPEG / GIF / WebP；嵌 Word 前先确认 insertableInWord。
+- await office.image.fromPage(url, { limit?, minWidth? })
+    → { ok, url, finalUrl, title, count, results, skipped, hint }。候选与 search 同构，
+      直接交给 fetch；og:image 优先，srcset / 懒加载属性也认；网页图许可未知，发布前自己核对。
+- office.image.extract(docx|pptx|xlsx, { out?, overwrite? })
+    → { ok, format, path, dir, count, files, skipped, hint }。抽包内 media，默认
+      assets/<stem>-media/，文件名带内容哈希；已存在默认跳过，要重写传 overwrite:true。
 
 配图必须带来源：拿到 credit 后嵌进文档时传 source（Word 在图注下加一行小字，
 PPT 并进题注）。示例与细节用 office_help({ topic:'image', detail:true })。`,
+
+    writing: `写作规划与自检（office.writing）—— 生成前分注意力，生成后按同一张表查
+
+- office.writing.plan(input, options) → { brief, strategy, sections, checks, totalChars, markdown }
+    input：string 或 { title, genre, audience, goal, targetChars, sections }；
+    genre：academic / explainer / report / memo / essay / howto / general；
+    section：{ heading, kind, difficulty, value, ... }，缺省按 genre 给可改骨架。
+    每节按难度 / 读者收益分配 targetChars 与 depth（dwell 写透 / develop 展开 / touch 点到 /
+    compress 收住）：难点、机制、跃迁多给，背景与常识 1–2 句。plan.markdown 直接 office.log。
+- office.writing.audit(text, plan?) → { score, band, warnings, suggestions, signals }
+    传 plan：重点节没写透 / 收住节超长 / 各节仍平均 / 最长节不是最难，都会报；
+    不传也查：句长过匀、段长持平、套话、锚点不足、比喻过密、过度对冲、无让步、每节总结。
+    score 是启发式，不是「像人程度」的证明；改稿看 warnings 与 suggestions。
+- office.writing.deai(text, { mode, register, styleRef }) → { flags, stats, styleRef, edits? }
+    只报 A1 对举 / A2 提示语冒号 / M1 元话语与文体偏离，不给分；register 调口径；
+    safe 只删提示语前缀（「先说结论：」「原因不复杂：」），A1 只报不改。
+- office.writing.signals(text)：只看表面量；office.writing.render(plan)：重渲染规划。
+口径：每 150 字至少一个可核对锚点；核心主张配最强反例；连接词能删就删；学术段少比喻，
+说明文可用日常比喻但每个都要标「哪里不像」。大模型 A/B 用 scripts/writing-eval.mjs
+（无 Key 会 SKIP，--mock 可离线跑通）。细节、例子与 kind 全表用
+office_help({ topic: 'writing', detail: true })。`,
+
     cache: `office.cache 的用法（中间产物目录，跨调用保留）
 
 - office.cache.dir() / write(n, 数据) / list() / stats() / clear()
@@ -1011,13 +1393,15 @@ office_run({ keepCache:false }) 或 office.cache.clear() 才整目录清空。
 
 「办公模式」页
 - 工具开关：office_help / office_run / office_memory / office_search_run /
-  office_search_brief / office_search_dispatch / office_parse_findings
+  office_search_dispatch / office_parse_findings
   关掉的工具不出现在模型面前，也不占每次请求的 schema 开销；改完即时生效。
-- 检索编排：subagentTools（子代理白名单）/ maxParallel 默认 4 / resultLimit 默认 40 /
-  maxChannels / outputDir 默认 .office/search / requireCrossSource /
-  fallbackOnPlatformError / engine（auto|subagent|builtin）/
+- 办公模式插件：列的是办公 preset 自己声明的插件行（读 preset 文件本身），开关直接回写
+  那一行的 disabled（preset 真源 + profile 侧已有的覆盖行），写前自动落备份。
+  **生效范围是新建的办公会话**，已经在跑的会话不受影响。
+- 检索编排：maxParallel 默认 4 / resultLimit 默认 40 / maxChannels /
+  outputDir 默认 .office/search / engine（auto|subagent|builtin）/
   provider（用哪条联网通道）/ providerOrder / providers.<id>（各通道的 Key 与端点）/
-  preprocess（网页预处理强度）/ builtin.*（Anthropic 兼容通道的细项）
+  preprocess（网页预处理强度）/ fetch.*（取正文与 PDF 的上限）
 - 文档与缓存：defaultTheme / scriptTimeoutMs / maxScriptChars / cacheDir / keepCache /
   cacheTtlMinutes 默认 720 / pdfDpi / pdfMaxPages / pdfEngine /
   texEngine / texTimeoutMs / texTemplateDir
@@ -1045,47 +1429,57 @@ office_run({ keepCache:false }) 或 office.cache.clear() 才整目录清空。
   按月份装订成 .office/memory/archive/YYYY-MM.md。
 
 读：office_memory({ action:'read', layer:'hot'|'ledger'|'archive'|'all', query? })。
-    每行去掉行首「- 」之后的第二段就是条目 id（m-… / L-… / mnemon:…）：link、unlink、
-    related 要它，replace / remove 也可以直接给 id。
+    每行去掉行首「- 」之后的第二段就是条目 id（m-… / L-… / mnemon:…）：
+    replace / remove / kb-link / kb-related 可以直接给 id。
     带 query 是检索（按命中词占比分档，占每回合配额）；不带 query 是看现状。
+    给 tags / entities 就是**分区**（硬过滤：只出**声明过**这些标签 / 实体的条目，
+    台账按 theme 算；三层各自过滤；entities 只是条目字段，不再有实体视图）。细节见全文层。
+找资料（记忆 + 知识库）用 office_memory({ action:'recall', query })：统一入口 —— 插件先查记忆层，
+    按「命中数 / 查询词覆盖 / 最高重要度」判够不够答，不够才下探 kb，并在回执首行自报路由。
+    它与 read 带 query 共用同一条每回合配额；真的下探了才再吃一档「知识块检索」配额，
+    被挡住时如实写「未下探」并给出真的能走的那条路。
 写：add / replace / remove（target: user = 用户偏好与要求，project = 项目约定与环境）。
     replace 与 remove 给 oldText（一段能**唯一**命中原文的片段）或直接给 id，命中多条会被拒绝。
     importance：critical（明确的必须 / 永远不要）/ normal / low。
+    scope：workspace / global，只动指定根（跨项目通用偏好写 global，项目流程留 workspace）。
 只记：用户说过的偏好、纠正、要求「记住」的事；稳定的项目约定与环境事实；踩过的坑。
 不记：检索结果原文、一次性进度、自己的推测与复述、刚从记忆里读出来的东西。
 记完一句说明即可，不要把条目整段念给用户听。
 知识库 kb（.office/kb/）装的是外部原文的块 + 字符区间，不是结论；找来源用 kb-search
 （**词法**检索：中文 bigram + BM25，语义改写召不回；零重叠就弃答 —— 查不到就换更贴近原文的
 词，别换工具重复检索），逐字引用走 kb-read（有界），入库 kb-ingest（tier: user / verified /
-unverified，单源 unverified 永不进热记忆），删除 kb-drop，清单 kb-list。
+unverified，单源 unverified 永不进热记忆；scope 可指定 workspace / global），删除 kb-drop
+（也可带 scope），清单 kb-list。
 把块 id 写进 add、log 的 source 就是「依据哪块来源」。kb 检索单独占一档每回合配额（默认 2）。
-其他动作：log（手工登记外部产物）/ link·unlink·related（图关系，contradicts 边可带 conflict 与 state）/
-    entities（实体视图）/ status / export·import（Pack 备份，只增不改）/ migrate（从 mnemon 迁移）。
+其他动作：log（手工登记外部产物）/ status / export·import（Pack 备份，只增不改，
+    旧图关系数据随包兼容保留）/ migrate（从 mnemon 迁移）。
 记忆按工作目录存（一个项目一份）—— 运行时的记忆目录默认为会话工作目录下的
-.office/memory（设置页可改）。跨项目共享在设置页把 scope 改成 both / global。
+.office/memory（设置页可改）。跨项目共享有两层：设置页把 scope 改成 both / global
+（常开全局根），或单条写 scope:'global'；全局根默认在 $DSH_HOME/.office/memory。
 细节（范围与层开关、召回质量、每回合配额、面板、与 mnemon 的差别、迁移映射）用
 office_help({ topic:'memory', detail: true })。`,
     search: `检索（office_web_search / office_web_fetch / office_search_run / 三步走）
 
 办公模式自带网页抓取通道（免 Key，preset 不声明宿主的 tool-web）：
 查一个事实点 office_web_search({ queries })，打开一个页面 office_web_fetch({ url })，
-都不落盘、不走 Tavily 这类要 Key 的三方 API；两条抓取通道都通不了时退到宿主 web 服务兜底。
-直查与渠道覆盖：auto 按顺序自动挑（duckduckgo 免 Key 抓取 → searxng → 宿主 web 服务兜底），
+都不落盘、不走 Tavily 这类要 Key 的三方 API；
+直查与渠道覆盖：auto 按顺序自动挑（deepseek-api 直连 → 宿主 web 服务 → 免 Key 抓取），
 也可以用 provider 参数点名（bocha 中文好 / serper 就是 Google …，三方 API 不在默认顺序里）。
 取回来的网页先过预处理（去导航与样板），preprocess 参数可按次改强度；来源是 PDF 时
 正文交给 office.pdf 抽文本。出口要走代理在设置页「检索编排 → 出口代理」填。
 
 - 只查一两个事实点、要落盘：office_search_run({ queries: [...] }) —— 一轮直查，来源与摘录
   落 .office/search/，聊天里只回紧凑清单；写进文档前按 URL 核对。
-- 要按渠道逐项覆盖：三步走，顺序不要颠倒
-  1. office_search_brief({ topic, type?, audience? }) 出提纲并落盘
+- 要按渠道逐项覆盖：两步走，顺序不要颠倒
+  1. office_search_dispatch({ topic, type?, audience? }) 自动出提纲（brief.md 落盘，可审计
+     可复用）并逐渠道执行；briefPath 可复用上一轮提纲，outputPaths 不给就自动生成。
      type：hotspot（热点）/ knowledge（知识）/ manual（手册）/ mixed（判不准）
-  2. office_search_dispatch({ briefPath, outputPaths }) 逐渠道执行
      有子代理服务就派子代理（用 office_web_search / office_web_fetch 抓网页）；否则自动走
      内置通道，并在反馈里说一次原因（那是装配期就知道的事实，不是错误 —— 不用绕路去派
      spawn_teammate）。结果文件格式一样。材料只落盘，不进主上下文。
-  3. office_parse_findings({ paths, type?, topic? }) 读成摘要（按渠道归类、算来源
-     覆盖度、标出单一来源与没带 URL 的条目）
+  2. office_parse_findings({ paths, type?, topic?, draft? }) 读成摘要（按渠道归类、算来源
+     覆盖度、标出单一来源与没带 URL 的条目）；给了 draft（产物正文 md / txt）还会做
+     **句级引用审计**：事实句没出处、或地址对不上本次材料，都当场点名且 ok:false。
 - 派工反馈说「N 个渠道空手而归 / 一条来源都没拿到」时，那是**通道没通**，不是「这个题目
   没有资料」；摘要里的「未找到」不算结论（「到手结论 0 条 + 空手渠道 N 个」就是这个形状）。
   先 office_search_run 直查一轮确认哪条通道是活的，或在设置页配出口代理，再重新派工。
@@ -1109,8 +1503,8 @@ office_help({ topic:'search', detail: true })。`,
 /** 默认层的索引短语（全文层那份在 indexText() 里）。 */
 const COMPACT_INDEX = `办公模式能力索引（默认只给一行摘要；要细节传 detail:true）
 
-- word：Word 文档（.docx）—— 生成 / 读取 / 批量改写：封面、标题层级、列表、引用、表格、图片、公式、页码、目录
-- excel：Excel 工作簿（.xlsx）—— 表格、公式、统计、条件格式、原生图表（sheet.chart）
+- word：Word 文档（.docx）—— 生成 / 读取 / 批量改写：封面、标题层级、列表、引用、表格、图片与多图网格（builder.images）、公式、页码、目录
+- excel：Excel 工作簿（.xlsx）—— 表格、公式、统计、条件格式、原生图表（sheet.chart）、原生图片（sheet.image，PNG/JPEG）
 - ppt：演示文稿（.pptx）—— 版式助手、图片、生成后审阅与就地微调
 - tex：LaTeX 学位论文（thuthesis）—— 生成源码并编译 PDF
 - pdf：PDF（.pdf，只读）—— 先 info 判断文本层，文本型抽文字、图像型渲染成页图再 read_image
@@ -1120,7 +1514,9 @@ const COMPACT_INDEX = `办公模式能力索引（默认只给一行摘要；要
 - files：文件读写与批量替换
 - archive：zip / gz / zst 归档与会话导出怎么读（office.archive）
 - preview：把自家 docx / xlsx / pptx 渲染成页面图或 PDF（office.preview）
-- image：配图的来源与获取（office.image）—— 免 Key 图库检索、取图、署名（credit）
+- convert：文档互转与统一出 PDF（office.convert）—— md / docx / tex 互转，tex / Office 三件套与老格式 / OpenDocument 都能出 PDF
+- image：配图（office.image）—— 元信息 / 免 Key 图库检索 / 网页选图 / 抽文档内嵌图 / 取图 / 署名（credit）
+- writing：写作规划与自检（office.writing）—— 按难度 / 读者收益分篇幅、逐节写法、句长 / 套话 / 锚点 / 让步自检
 - cache：中间产物目录与清理规则
 - memory：三层记忆（热记忆 / 台账 / 归档）+ 知识库 kb（入库 / 检索 / 按块读）怎么读写、记什么不记什么
 - search：联网检索（内置通道 / 三步走 / 渠道分流规则 / 结果解析）
@@ -1131,15 +1527,18 @@ const COMPACT_INDEX = `办公模式能力索引（默认只给一行摘要；要
 查详情：office_help({ topic: 'word' }) 这样传话题名；要看例子与全部解释再加 detail:true。
 传错话题时这份索引会原样退回，一次调用就能自我纠正。`;
 
-/** 默认层的 guide（全文层是 OFFICE_GUIDE，约 6.7 KB）。 */
+/** 默认层的 guide（全文层是 OFFICE_GUIDE，约 9.4 KB —— 第六十轮实测 9,373 B）。 */
 const COMPACT_GUIDE = `办公模式的工作方式（默认层；完整版 office_help({ topic:'guide', detail:true })）
 
 说话：直接说结果，先说做了什么、文件在哪；短句，少术语；不寒暄、不复述用户的话；
-内容一多就单独建文件，聊天里只留结论与文件位置。
-动手：一次工具调用完成一批操作（office_run 一次写完），不要分很多次试探；
-改已有文件先读回来、一次改完写回；交付物写工作目录，中间产物写 .office/cache。
+内容多就建文件，聊天只留结论与位置。
+动手：一次工具调用完成一批操作（office_run 一次写完），不要多次试探；
+改已有文件先读后一次写回；交付物写工作目录，中间产物写 .office/runtime/cache。
 文档：先 office_help 查写法，再用 office_run 一次写成；不传主题就是 plain（素色无底纹），
 要配色显式选主题；生成后看反馈里的 stats / outline / warnings，有 warning 就按提示调。
+写作：动笔前 office.writing.plan（按难度/收益分篇幅），重点给足、铺垫收住；篇幅表是草稿，
+总长以它为准，写完用 office.writing.audit 自查；去 AI 味用
+office.writing.deai（register/styleRef 只报，safe 只删提示语）。
 PPT 多走一步：生成 → office.ppt.read 审阅（版式与内容量是否匹配）→ office.ppt.revise
 就地微调（改文字 / 字号 / 位置）→ 再 read 复检一次。一轮就够，不要整篇重生成。
 PDF：先 office.pdf.info 看有没有文本层，文本型抽文字、图像型渲染成页图再 read_image。
@@ -1152,7 +1551,7 @@ office.av.extract（视频：逐字稿 + 抽帧）或 office.av.transcribe（只
 检索：一两个事实点走 office_search_run；要渠道覆盖走 brief → dispatch → parse_findings。
 记忆：热记忆动笔前照办、台账由 office_run 自动记、归档按需检索；office_help 末尾会带
 一份热记忆投影，所以平常不用特意 read；用户说明偏好或纠正你时当场记一条。
-报告时给的文件路径要原样引用，方便用户直接打开。`;
+文件路径原样引用，方便用户打开。`;
 
 /** 帮助索引。 */
 async function indexText(detail = false) {
@@ -1182,12 +1581,19 @@ ${lines.join('\n')}
   office.files.read 读到压缩包会直接报错并指到这里）
 - preview：把自家 docx / xlsx / pptx 渲染成页面图（交给 read_image 看版式）
   或转成 PDF（office.preview；引擎是宿主随部署安装的 LibreOffice，按需调用）
-- image：配图的来源与获取（office.image）—— 免 Key 图库（维基共享资源 / Openverse）
-  检索、取图（校验魔数、落 assets/）、一行署名 credit（嵌文档时传 source，
+- convert：文档互转与统一出 PDF（office.convert）—— md / docx / tex 互相转；
+  tex / md / Office 三件套与老格式 / OpenDocument 都能出 PDF（认识的格式见 check 的矩阵）；
+  三条引擎（pandoc / TeX / LibreOffice）各自探测，缺哪样只影响它那几条路
+- image：配图（office.image）—— 元信息（尺寸 / 哈希 / 可嵌入性）、免 Key 图库
+  （维基共享资源 / Openverse）检索、网页选图（og:image / srcset）、抽 docx / pptx / xlsx
+  内嵌图、取图（校验魔数、落 assets/）、一行署名 credit（嵌文档时传 source，
   配图必须能追到来源）
+- writing：写作规划与自检（office.writing）—— 按每节难度与读者收益分配字数与深度
+  （重点 / 机制 / 跃迁多写，背景收住），逐节给写法、语言与比喻边界；写完查句长、套话、
+  锚点、让步与重点节是否写透。plan.markdown 可直接 office.log；不是结构模板，也不是检测器
 - cache：中间产物与清理规则（跨调用保留、可命中复用）
 - memory：三层办公记忆（热记忆 / 台账 / 归档）与知识库 kb 怎么读写、记什么不记什么，
-  以及记忆范围、图关系、来源三档、召回质量、每回合配额、备份迁移与浏览面板
+  以及记忆范围、来源三档、召回质量、每回合配额、备份迁移与浏览面板
 - theme：视觉主题（默认 plain 素色，无背景填充）
 - search：联网检索（内置通道 / 三步走 / 渠道分流规则 / 结果解析）
 - settings：设置界面（工具开关与参数调节）
@@ -1220,7 +1626,7 @@ export function availableHelpTopics() {
 const HELP_TOPIC_ORDER = [
     'guide', 'run',
     'word', 'excel', 'ppt', 'tex', 'pdf', 'python', 'av',
-    'preview', 'image', 'archive',
+    'preview', 'convert', 'image', 'writing', 'archive',
     'files', 'cache', 'theme',
     'memory', 'search', 'settings',
 ];

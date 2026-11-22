@@ -16,7 +16,7 @@
  *
  *   - office_web_search / office_web_fetch 适合查一个事实点、打开一个页面
  *     （第三十轮新增的两个插件工具，走的正是本模块的免 Key 抓取通道）；
- *   - office_search_brief / dispatch / run / parse_findings 负责渠道覆盖与取证落盘，
+ *   - office_search_dispatch / run / parse_findings 负责渠道覆盖与取证落盘，
  *     而且在没有子代理工具的部署（别的 product、精简组合）里仍然要能单独跑通。
  *
  * 另外 web_search 的检索由宿主定策略，本模块的多通道能按机器情况换出口（含代理），
@@ -24,13 +24,14 @@
  *
  * ## 三层结构（第二十轮起，第三十轮调整主次）
  *
- *   1. **多路通道（src/web-providers.js）**：DuckDuckGo（免 Key 抓取）、自建
- *      SearXNG、接缝（宿主 ctx.web）、Anthropic 兼容 + 原生 web_search、
- *      OpenAI 兼容、Tavily、Brave、博查、Exa、Serper。每条通道自己发 HTTP、
- *      自己解析，返回统一形状。**默认顺序（第三十轮）是 duckduckgo → searxng →
- *      seam**：办公模式的资料搜索走自己的网页抓取通道；三方检索 API
- *      （tavily / bocha / serper …）不进默认顺序，只有显式点名（provider 参数
- *      或设置页固定）才用。`search.provider` 指定一条就只用那一条。
+ *   1. **多路通道（src/web-providers.js）**：接缝（宿主 ctx.web）、
+ *      DeepSeek Search API（直连）、OpenAI 兼容、DuckDuckGo（免 Key 抓取）、
+ *      自建 SearXNG、Tavily、Brave、博查、Exa、Serper。每条通道自己发 HTTP、
+ *      自己解析，返回统一形状。**默认顺序（第六十五轮）是 deepseek-api → seam →
+ *      duckduckgo → searxng**：先走直连 Search API（快、不跑辅助模型），宿主
+ *      接缝做第二手，免 Key 抓取做第三手。三方检索 API（tavily / bocha / serper …）
+ *      不进默认顺序，只有显式点名（provider 参数或设置页固定）才用。
+ *      `search.provider` 指定一条就只用那一条。
  *   2. **取正文**：自带的安全抓取优先（公网地址校验、只跟同源跳转、限长限时、
  *      PDF 交给 office.pdf 抽文本），宿主接缝兜底；两者拿到的页面都要过
  *      **成败哨兵**与**脚本式预处理**（见下）。
@@ -49,6 +50,14 @@
  * **配置缺失 / 网络出口不可达 / 目标站拒绝 / 没拿到结果**。四类的修法完全不同，
  * 压成一句「查不到」会让模型把「被墙」读成「环境不提供这项能力」（session6 就这么
  * 写进过长期记忆）。`test/web.mjs` 有一条漂移守卫：新加错误码必须登记分类。
+ *
+ * ## 失败状态按层记（第七十八轮补：S-07）
+ *
+ * 一张以 provider id 为键、检索与取正文共用的失败表，会把**一个页面的错误**升级成
+ * **整条通道的错误**：某个 URL 被目标站拒绝 → 记接缝失败 → 同批其它 URL 不再走接缝
+ * 兜底，后续检索也跳过它。现在状态分三份：检索通道健康（只记配置 / 认证 / 确定的
+ * 连接级失败）、取正文通道健康（只有接缝**调用本身**没走通才记）、页面级失败
+ * （按 URL 记，只影响这个 URL）。`empty` 这类查询级失败不升级成通道状态。
  *
  * ## 取回来的页面先清洗（第二十轮补）
  *
@@ -80,7 +89,7 @@ import { isIP } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 
-import { DEFAULT_BUILTIN_WEB } from './config.js';
+import { DEFAULT_FETCH_WEB } from './config.js';
 import { pdfText } from './pdf.js';
 import { activeDispatcher, shouldBypassProxy } from './web-proxy.js';
 import {
@@ -97,8 +106,8 @@ import {
     withTimeout,
 } from './web-errors.js';
 import {
-    mapSearchResponse,
     PROVIDER_IDS,
+    mapDeepSeekApiResponse,
     providerOf,
     probeProvider,
     resolveApiKey,
@@ -118,7 +127,6 @@ export const WEB_ENGINE_BUILTIN = 'builtin';
 // 从第十六轮起就只认 `./web.js` 这一个入口，第二十轮拆模块不改变这个契约。
 export {
     describeWebFailure,
-    mapSearchResponse,
     summarizeWebFailures,
     WebAccessError,
     webFailureKind,
@@ -134,6 +142,7 @@ export {
     resolveProviderOrder,
     searchProvider,
     resolvePreprocessOptions,
+    mapDeepSeekApiResponse,
 };
 /**
  * 多条查询的结果按 URL 去重合并，整体截到 maxResults 条。
@@ -179,44 +188,40 @@ export function webSeamOf(ctx) {
  * 合并调用方给的选项与默认值。
  *
  * 接受的形状有**两种**，这是刻意的：
- *   - 第十六～十九轮的形状：直接传 `search.builtin` 那一份参数（老配置与老测试）；
- *   - 第二十轮的形状：传整个 `search` 段（含 provider / providerOrder /
- *     providers / preprocess）。
- * 判据是「有没有那些新键」。返回对象仍然是**扁平的既有一组字段**（apiKey、
- * baseURL、model、maxResults…），因为外部一直按扁平字段读它；同时多出
- * `provider` / `providerOrder` / `providers` / `preprocess` 四个新字段。
+ *   - 直接传 `search.fetch` 那一份参数（取正文的上限，单测与老调用点这样用）；
+ *   - 传整个 `search` 段（含 provider / providerOrder / providers / preprocess）。
+ * 判据是「有没有那些新键」。返回对象是**取正文的一组扁平字段**（fetchTimeoutMs、
+ * maxResults、fetchPages、maxBytes、maxChars、maxRedirects、pdfMaxBytes、
+ * pdfMaxPages、userAgent），同时多出 `provider` / `providerOrder` / `providers` /
+ * `preprocess` 四个编排字段。
+ *
+ * 第六十五轮之前这里叫 resolveBuiltinOptions，且还要从 `search.builtin` 里取
+ * Key / 端点 / 模型 —— 那些是 Anthropic 通道的参数；通道删掉后这一层只剩
+ * 「取正文」的刹车，参数名也因此改成 `search.fetch`。
  */
-export function resolveBuiltinOptions(raw) {
+export function resolveWebOptions(raw) {
     const source = raw !== null && typeof raw === 'object' ? raw : {};
-    const isSearchConfig = ['builtin', 'provider', 'providerOrder', 'providers', 'preprocess']
+    const isSearchConfig = ['fetch', 'provider', 'providerOrder', 'providers', 'preprocess']
         .some((key) => Object.prototype.hasOwnProperty.call(source, key));
-    const builtinRaw = isSearchConfig ? (source.builtin ?? {}) : source;
-    const pick = (key, fallback) => (asText(builtinRaw[key]) !== '' ? asText(builtinRaw[key]) : fallback);
+    const fetchRaw = isSearchConfig ? (source.fetch ?? {}) : source;
+    const pick = (key, fallback) => (asText(fetchRaw[key]) !== '' ? asText(fetchRaw[key]) : fallback);
     const num = (key, fallback, min, max) => {
-        const value = typeof builtinRaw[key] === 'number' ? builtinRaw[key] : Number.parseFloat(String(builtinRaw[key]));
+        const value = typeof fetchRaw[key] === 'number' ? fetchRaw[key] : Number.parseFloat(String(fetchRaw[key]));
         if (!Number.isFinite(value)) return fallback;
         return Math.min(max, Math.max(min, value));
     };
-    const maxResultsDefault = DEFAULT_BUILTIN_WEB.maxResults;
+    const maxResultsDefault = DEFAULT_FETCH_WEB.maxResults;
     const providers = isSearchConfig && source.providers !== null && typeof source.providers === 'object' ? source.providers : {};
     return {
-        apiKey: asText(builtinRaw.apiKey),
-        apiKeyEnv: pick('apiKeyEnv', DEFAULT_BUILTIN_WEB.apiKeyEnv),
-        baseURL: pick('baseURL', DEFAULT_BUILTIN_WEB.baseURL).replace(/\/+$/, ''),
-        model: pick('model', DEFAULT_BUILTIN_WEB.model),
-        apiVersion: pick('apiVersion', DEFAULT_BUILTIN_WEB.apiVersion),
-        maxUses: num('maxUses', DEFAULT_BUILTIN_WEB.maxUses, 1, 20),
-        maxTokens: num('maxTokens', DEFAULT_BUILTIN_WEB.maxTokens, 256, 16_384),
-        searchTimeoutMs: num('searchTimeoutMs', DEFAULT_BUILTIN_WEB.searchTimeoutMs, 5_000, 300_000),
-        fetchTimeoutMs: num('fetchTimeoutMs', DEFAULT_BUILTIN_WEB.fetchTimeoutMs, 5_000, 300_000),
+        fetchTimeoutMs: num('fetchTimeoutMs', DEFAULT_FETCH_WEB.fetchTimeoutMs, 5_000, 300_000),
         maxResults: num('maxResults', maxResultsDefault, 1, 20),
-        fetchPages: num('fetchPages', DEFAULT_BUILTIN_WEB.fetchPages, 0, 5),
-        maxBytes: num('maxBytes', DEFAULT_BUILTIN_WEB.maxBytes, 32_768, 32 * 1024 * 1024),
-        maxChars: num('maxChars', DEFAULT_BUILTIN_WEB.maxChars, 1_000, 400_000),
-        maxRedirects: num('maxRedirects', DEFAULT_BUILTIN_WEB.maxRedirects, 0, 10),
-        pdfMaxBytes: num('pdfMaxBytes', DEFAULT_BUILTIN_WEB.pdfMaxBytes, 1024 * 1024, 128 * 1024 * 1024),
-        pdfMaxPages: num('pdfMaxPages', DEFAULT_BUILTIN_WEB.pdfMaxPages, 1, 500),
-        userAgent: pick('userAgent', DEFAULT_BUILTIN_WEB.userAgent),
+        fetchPages: num('fetchPages', DEFAULT_FETCH_WEB.fetchPages, 0, 5),
+        maxBytes: num('maxBytes', DEFAULT_FETCH_WEB.maxBytes, 32_768, 32 * 1024 * 1024),
+        maxChars: num('maxChars', DEFAULT_FETCH_WEB.maxChars, 1_000, 400_000),
+        maxRedirects: num('maxRedirects', DEFAULT_FETCH_WEB.maxRedirects, 0, 10),
+        pdfMaxBytes: num('pdfMaxBytes', DEFAULT_FETCH_WEB.pdfMaxBytes, 1024 * 1024, 128 * 1024 * 1024),
+        pdfMaxPages: num('pdfMaxPages', DEFAULT_FETCH_WEB.pdfMaxPages, 1, 500),
+        userAgent: pick('userAgent', DEFAULT_FETCH_WEB.userAgent),
         provider: isSearchConfig && asText(source.provider) !== '' ? asText(source.provider) : 'auto',
         providerOrder: isSearchConfig
             ? resolveProviderOrder('auto', source.providerOrder)
@@ -227,12 +232,13 @@ export function resolveBuiltinOptions(raw) {
 }
 
 /**
- * 某条通道这一次要用的参数：`search.builtin` 是 Anthropic 通道的老家，
- * `search.providers.<id>` 是每条通道各自的家（后者覆盖前者）。
+ * 某条通道这一次要用的参数：`search.providers.<id>` 是每条通道各自的家。
+ *
+ * 第六十五轮删掉 anthropic 的「老入口合流」之后，这里不再有特例 ——
+ * 每条通道只读自己那一格，缺的键由 `resolveProviderOptions` 用默认值补齐。
  */
 export function providerSourceOf(options, id) {
     const overrides = options?.providers?.[id];
-    if (id === 'anthropic') return { ...options, ...(overrides ?? {}) };
     return overrides ?? {};
 }
 
@@ -244,7 +250,7 @@ export function providerLabelOf(id) {
 /** 引擎 + 通道 → 一句话（反馈与结果文件用）。 */
 export function engineDescription(engine, provider) {
     if (engine === WEB_ENGINE_SEAM) return '宿主 web 服务（seam）';
-    return providerLabelOf(provider ?? 'anthropic');
+    return providerLabelOf(provider ?? 'auto');
 }
 
 // ── 取正文：自带的 HTTP 实现 ────────────────────────────────────────────────
@@ -945,11 +951,11 @@ export function htmlTitle(html) {
  * ——「没配 Key」「连不上」「被挡」三类修法不同，压成一句会让人配错东西。
  *
  * @param {object} [ctx] 插件上下文
- * @param {object} [rawOptions] `search` 段或 `search.builtin`（两种形状都认）
+ * @param {object} [rawOptions] `search` 段或 `search.fetch`（两种形状都认）
  * @param {object} [hooks] 测试注入点：{ web, fetch, lookup, home }
  */
 export function createWebAccess(ctx, rawOptions, hooks = {}) {
-    const options = resolveBuiltinOptions(rawOptions);
+    const options = resolveWebOptions(rawOptions);
     const network = {
         lookup: hooks.lookup ?? defaultNetwork.lookup,
         fetch: hooks.fetch ?? defaultNetwork.fetch,
@@ -960,14 +966,25 @@ export function createWebAccess(ctx, rawOptions, hooks = {}) {
     const seam = 'web' in hooks ? hooks.web : webSeamOf(ctx);
 
     /**
-     * 这一次调用里已经明确失败的通道：记住**原因与错误码**，不再重复试（`auto` 下很常见）。
+     * 失败状态按「操作 + 通道 + 页面」分三份记（第七十八轮 S-07）。
      *
-     * 为什么连错误码一起记：只记 message 的话，后续查询命中这条缓存时只能重新包一个
-     * 通用错误 —— 失败分类从「网络出口不可达」退化成「其它」（第三十三轮实测：同一次
-     * 调用里第 1 条查询报 network、第 2 条报 other，而分类正是告诉调用方「该换出口还是
-     * 该换来源」的那句话）。
+     * 旧版只有一张 `failed` 表、以 provider id 为键、检索与取正文共用：某个 URL 被
+     * 目标站拒绝，`rememberFailure('seam')` 就把**整条通道**判死 —— 同批其它 URL
+     * 不再走接缝兜底，后续检索也跳过它。那是把「一个页面的错误」升级成了「通道错误」。
+     *
+     * 现在：
+     *   - `searchFailures`：检索通道健康。只记配置 / 认证 / 确定的连接级失败；
+     *     `empty`（这次查询空手）与参数错误属于查询级，不升级成通道状态。
+     *   - `fetchFailures`：取正文通道健康。只有接缝**这次调用本身没走通**才记
+     *     （服务没就绪、传输层不通）；页面级的拒绝/空壳不算。
+     *   - `pageFailures`：按 URL 记页面级失败，只影响这个 URL 的重试。
+     *
+     * 三份都连错误码一起记：只记 message 的话，后续命中缓存时只能重新包一个通用
+     * 错误 —— 失败分类从「网络出口不可达」退化成「其它」（第三十三轮实测）。
      */
-    const failed = new Map();
+    const searchFailures = new Map();
+    const fetchFailures = new Map();
+    const pageFailures = new Map();
     /** 每条通道解析后的参数（同一通道重复检索不必重算）。 */
     const optionCache = new Map();
 
@@ -976,21 +993,41 @@ export function createWebAccess(ctx, rawOptions, hooks = {}) {
         return optionCache.get(id);
     }
 
-    /** 记下一条通道的失败：原因与错误码一起留，别让后续查询把分类丢了。 */
-    function rememberFailure(id, error) {
-        const entry = {
+    /** 一条失败记录：原因与错误码一起留，别让后续调用把分类丢了。 */
+    function failureRecordOf(error) {
+        return {
             message: messageOf(error),
             code: typeof error?.code === 'string' && error.code !== '' ? error.code : 'OFFICE_WEB_ERROR',
         };
-        failed.set(id, entry);
+    }
+
+    /** 记下一条通道的失败（检索与取正文各用各的表）。 */
+    function rememberFailure(store, id, error) {
+        const entry = failureRecordOf(error);
+        store.set(id, entry);
         return entry;
     }
 
     /** 读回一条通道的失败记录（没有就当场建一条，调用点不必再判 undefined）。 */
-    function failureEntryOf(id) {
-        const entry = failed.get(id);
+    function failureEntryOf(store, id) {
+        const entry = store.get(id);
         if (entry !== undefined) return entry;
         return { message: '这条通道还没试过。', code: 'OFFICE_WEB_ERROR' };
+    }
+
+    /** 页面级失败按 URL 缓存：同一个坏页面不反复打接缝，但不算通道坏了。 */
+    function rememberPageFailure(url, error) {
+        const key = asText(url);
+        if (key === '') return;
+        pageFailures.set(key, failureRecordOf(error));
+    }
+
+    /** 查询级失败：只说明「这次没搜到 / 参数不对 / 被取消」，不说明通道坏了。 */
+    function queryLevelFailure(error) {
+        const code = typeof error?.code === 'string' ? error.code : '';
+        return webFailureKind(error) === 'empty'
+            || code === 'OFFICE_WEB_INVALID_QUERY'
+            || code === 'OFFICE_WEB_ABORTED';
     }
 
     /** 一次接缝检索。 */
@@ -1006,6 +1043,37 @@ export function createWebAccess(ctx, rawOptions, hooks = {}) {
             content: asText(result?.content),
             sources,
             truncated: result?.truncated === true,
+        };
+    }
+
+    /**
+     * 把接缝回来的响应体过哨兵与预处理；判定不过就抛。
+     *
+     * 抛出的错误是**页面级**的（拦截页 / 空壳 / 目标站拒绝），调用方只按 URL 记，
+     * 不升级成接缝通道状态（S-07）。
+     */
+    function readSeamPage(result, url, preprocessOptions) {
+        const body = result?.body ?? {};
+        const content = asText(body.content);
+        const finalUrl = asText(result?.url) || url;
+        const statusCode = Number.isFinite(result?.statusCode) ? result.statusCode : 0;
+        const kind = body.kind === 'html' ? 'html' : 'text';
+        const text = kind === 'html' ? htmlToText(content, options.maxChars) : content.slice(0, options.maxChars);
+        // 接缝也可能把拦截页当正文回来（它直接回响应体），所以这里同样过哨兵；
+        // 判定失败就按失败处理 —— 不再把拦截页当正文返回。
+        const verdict = inspectFetchedPage({ statusCode, url: finalUrl, content: text });
+        if (verdict.ok !== true) throw new WebAccessError(verdict.reason, verdict.code);
+        const processed = withPreprocess({ raw: content, content: text, kind, url: finalUrl, options: preprocessOptions });
+        return {
+            engine: WEB_ENGINE_SEAM,
+            provider: 'seam',
+            url: finalUrl,
+            statusCode,
+            kind,
+            content: processed.content,
+            preprocess: processed.preprocess,
+            truncated: result?.truncated === true,
+            ...(verdict.notice === undefined ? {} : { notice: verdict.notice }),
         };
     }
 
@@ -1040,8 +1108,8 @@ export function createWebAccess(ctx, rawOptions, hooks = {}) {
     const probeChannels = async () => {
         const list = [];
         for (const id of PROVIDER_IDS) {
-            if (failed.has(id)) {
-                list.push({ id, label: providerLabelOf(id), ok: false, verified: false, reason: failureEntryOf(id).message });
+            if (searchFailures.has(id)) {
+                list.push({ id, label: providerLabelOf(id), ok: false, verified: false, reason: failureEntryOf(searchFailures, id).message });
                 continue;
             }
             const verdict = await probeProvider(id, optionsOf(id), ctx, seam !== undefined);
@@ -1054,7 +1122,7 @@ export function createWebAccess(ctx, rawOptions, hooks = {}) {
     const probe = async () => {
         const channels = await probeChannels();
         // 候选集合就是**这次真的会按顺序试的那些通道**：点名一条时只看那一条 ——
-        // 否则「指名 anthropic 但没配 Key」会被别的免 Key 通道兜成「可用」，
+        // 否则「指名 deepseek-api 但没配 Key」会被别的免 Key 通道兜成「可用」，
         // 调用方以为配好了，实际每次检索都在报错。
         const order = options.provider === 'auto' ? options.providerOrder : [options.provider];
         const candidates = order.map((id) => channels.find((item) => item.id === id)).filter((item) => item !== undefined);
@@ -1127,8 +1195,8 @@ export function createWebAccess(ctx, rawOptions, hooks = {}) {
             }
             const errors = [];
             for (const id of order) {
-                if (failed.has(id)) {
-                    const entry = failureEntryOf(id);
+                if (searchFailures.has(id)) {
+                    const entry = failureEntryOf(searchFailures, id);
                     errors.push({ id, label: providerLabelOf(id), error: new WebAccessError(entry.message, entry.code) });
                     continue;
                 }
@@ -1140,7 +1208,9 @@ export function createWebAccess(ctx, rawOptions, hooks = {}) {
                         : await channelSearch(id, text, request, maxResults);
                     return result;
                 } catch (error) {
-                    rememberFailure(id, error);
+                    // 查询级失败（这次空手 / 参数不对 / 被取消）不升级成通道状态：
+                    // 同一条通道换一条查询仍可能出结果（S-07）。
+                    if (!queryLevelFailure(error)) rememberFailure(searchFailures, id, error);
                     errors.push({ id, label: providerLabelOf(id), error });
                 }
             }
@@ -1170,38 +1240,40 @@ export function createWebAccess(ctx, rawOptions, hooks = {}) {
                 lastError = error;
                 errors.push('自带取正文：' + messageOf(error));
             }
-            if (seam !== undefined && !failed.has('seam')) {
-                try {
-                    const result = await seam.fetch({ url }, request.signal);
-                    const body = result?.body ?? {};
-                    const content = asText(body.content);
-                    const finalUrl = asText(result?.url) || url;
-                    const statusCode = Number.isFinite(result?.statusCode) ? result.statusCode : 0;
-                    const kind = body.kind === 'html' ? 'html' : 'text';
-                    const text = kind === 'html' ? htmlToText(content, options.maxChars) : content.slice(0, options.maxChars);
-                    // 接缝也可能把拦截页当正文回来（它直接回响应体），所以这里同样过哨兵；
-                    // 判定失败就按失败处理 —— 不再把拦截页当正文返回。
-                    const verdict = inspectFetchedPage({ statusCode, url: finalUrl, content: text });
-                    if (verdict.ok !== true) throw new WebAccessError(verdict.reason, verdict.code);
-                    const processed = withPreprocess({ raw: content, content: text, kind, url: finalUrl, options: preprocessOptions });
-                    return {
-                        engine: WEB_ENGINE_SEAM,
-                        provider: 'seam',
-                        url: finalUrl,
-                        statusCode,
-                        kind,
-                        content: processed.content,
-                        preprocess: processed.preprocess,
-                        truncated: result?.truncated === true,
-                        ...(verdict.notice === undefined ? {} : { notice: verdict.notice }),
-                    };
-                } catch (error) {
-                    rememberFailure('seam', error);
-                    lastError = error;
-                    errors.push('宿主 web 服务：' + messageOf(error));
+            if (seam !== undefined && !fetchFailures.has('seam')) {
+                // 页面级失败按 URL 记：同一个坏页面不反复打接缝（S-07）。
+                const cachedPage = pageFailures.get(url);
+                if (cachedPage !== undefined) {
+                    lastError = new WebAccessError(cachedPage.message, cachedPage.code);
+                    errors.push('宿主 web 服务：' + cachedPage.message);
+                } else {
+                    let result;
+                    try {
+                        result = await seam.fetch({ url }, request.signal);
+                    } catch (error) {
+                        // 接缝这次调用本身没走通（服务没就绪、传输层不通）：这才是通道级
+                        // 失败，记下来，后面的 URL 不再反复撞它 —— S-07 保留的「不再试
+                        // 确定不可用的通道」，但只限「确定」。
+                        rememberFailure(fetchFailures, 'seam', error);
+                        lastError = error;
+                        errors.push('宿主 web 服务：' + messageOf(error));
+                    }
+                    if (result !== undefined) {
+                        let page;
+                        try {
+                            page = readSeamPage(result, url, preprocessOptions);
+                        } catch (error) {
+                            // 拿到了响应、只是这一页不能当正文（拦截页 / 空壳 / 目标站
+                            // 拒绝）：页面级失败，只影响这个 URL，不把接缝判死（S-07）。
+                            rememberPageFailure(url, error);
+                            lastError = error;
+                            errors.push('宿主 web 服务：' + messageOf(error));
+                        }
+                        if (page !== undefined) return page;
+                    }
                 }
-            } else if (failed.has('seam')) {
-                errors.push('宿主 web 服务：' + failureEntryOf('seam').message);
+            } else if (fetchFailures.has('seam')) {
+                errors.push('宿主 web 服务：' + failureEntryOf(fetchFailures, 'seam').message);
             }
             // 沿用最后一次失败自己的错误码：取正文失败的四类（配置缺失 / 网络不可达 /
             // 目标站拒绝 / 没拿到结果）修法完全不同，包成一句通用错误会丢掉分类（P0-9）。

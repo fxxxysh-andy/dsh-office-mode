@@ -656,7 +656,7 @@ function tempPath(tag) {
  * 成功时删掉这一次的进程日志。
  *
  * 缓存目录只该留有用的东西：ffmpeg 每次调用都会产出 stdout / stderr 两个文件，
- * 成功路径上它们是空的，留在缓存里只会让 `.office/cache/av/` 长出一堆 0 字节
+ * 成功路径上它们是空的，留在缓存里只会让 `.office/runtime/cache/av/` 长出一堆 0 字节
  * 的噪声文件（还会被 office.cache.list 当成产物统计）。失败时**保留**，
  * 那是排查的唯一线索，并且报错文案里给出了路径。
  */
@@ -765,7 +765,7 @@ export async function avInfo(filePath, options, env, cache, config) {
 // ── 解码：任意格式 → 规范 16 kHz 单声道 PCM16 WAV ───────────────────────────
 
 /**
- * 用 ffmpeg 解码成规范 WAV，并按内容键缓存在 `.office/cache/av/audio/` 下。
+ * 用 ffmpeg 解码成规范 WAV，并按内容键缓存在 `.office/runtime/cache/av/audio/` 下。
  *
  * 两个关键点：
  *   1. `-map_metadata -1 -fflags +bitexact` 才会省掉 LIST/INFO 块，`data` 才落在

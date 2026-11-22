@@ -1,0 +1,76 @@
+{
+  "lexical": {
+    "at": "2026-11-21T05:40:49.303Z",
+    "config": {
+      "chunkChars": 1200,
+      "overlap": 0.125,
+      "lexicalWeight": 0.55,
+      "vectorWeight": 0.45,
+      "candidateLimit": 30,
+      "semanticGate": 0.25,
+      "efSearch": 64
+    },
+    "embedding": "none",
+    "metrics": {
+      "recall5": 0.975,
+      "recall10": 1,
+      "mrr": 0.575,
+      "ndcg10": 0.6834038843670991,
+      "misses": [],
+      "annRecall10": null,
+      "chunks": 2067,
+      "ms": 19484
+    }
+  },
+  "hash": {
+    "at": "2026-11-21T05:41:24.823Z",
+    "config": {
+      "chunkChars": 1200,
+      "overlap": 0.125,
+      "lexicalWeight": 0.55,
+      "vectorWeight": 0.45,
+      "candidateLimit": 30,
+      "semanticGate": 0.25,
+      "efSearch": 64
+    },
+    "embedding": "hash",
+    "metrics": {
+      "recall5": 0.875,
+      "recall10": 0.975,
+      "mrr": 0.5523809523809523,
+      "ndcg10": 0.6578109090099533,
+      "misses": [
+        "检索工具面合并与死设置清理"
+      ],
+      "annRecall10": 0.8949999999999999,
+      "chunks": 2067,
+      "ms": 35235
+    }
+  },
+  "local-bge": {
+    "at": "2026-11-21T06:03:50.586Z",
+    "config": {
+      "chunkChars": 1200,
+      "overlap": 0.125,
+      "lexicalWeight": 0.55,
+      "vectorWeight": 0.45,
+      "candidateLimit": 30,
+      "semanticGate": 0.25,
+      "efSearch": 64
+    },
+    "embedding": "local",
+    "metrics": {
+      "recall5": 0.95,
+      "recall10": 0.95,
+      "mrr": 0.5570833333333333,
+      "ndcg10": 0.6576298670791407,
+      "misses": [
+        "中文召回与三层读取预算",
+        "记忆的时间维度与引用完整性"
+      ],
+      "annRecall10": 0.9774999999999998,
+      "chunks": 2067,
+      "ms": 453342
+    }
+  }
+}

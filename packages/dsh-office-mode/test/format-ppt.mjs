@@ -5,7 +5,7 @@
  * 覆盖：全部 builder 方法 → render() 出字节 → unzip 回读 → 逐个 XML/rels 解析 →
  * 关系目标存在性 → read() 复检 stats → 排版警告的真实性。
  *
- * 产物写在仓库根的 .office/tmp/ppt 下，默认结束时删掉；加 --keep 可以留着做人工/COM 检查。
+ * 产物写在仓库根的 .office/runtime/tmp/ppt 下，默认结束时删掉；加 --keep 可以留着做人工/COM 检查。
  *
  *   node test/format-ppt.mjs
  *   node test/format-ppt.mjs --keep
@@ -22,10 +22,10 @@ import { unzip, crc32 } from '../src/engine/zip.js';
 import { parseXml, children as xmlChildren, descendants } from '../src/engine/xml.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-// 测试中间产物统一落在**仓库根**的 .office/tmp/<suite>/ 下（不再用包内的 test/.tmp）。
+// 测试中间产物统一落在**仓库根**的 .office/runtime/tmp/<suite>/ 下（不再用包内的 test/.tmp）。
 // 只用 ppt/ 这个子目录：三个格式的测试会同时跑，
-// 谁都不许对共享的 .office/tmp 做递归删除。
-const TMP = resolve(HERE, '..', '..', '..', '.office', 'tmp', 'ppt');
+// 谁都不许对共享的 .office/runtime/tmp 做递归删除。
+const TMP = resolve(HERE, '..', '..', '..', '.office', 'runtime', 'tmp', 'ppt');
 const KEEP = process.argv.includes('--keep');
 
 const failures = [];
@@ -1931,14 +1931,50 @@ assert(hpReport.outline[7].includes('6 个图标'), `outline[7]：${hpReport.out
     assert((text2?.y ?? 0) >= midY, '第 2 个节点的文字应在轴线之下');
     assert(h7.includes('anchor="b"') && h7.includes('anchor="t"'), '交错的两侧锚点应一个是 b、一个是 t');
     assert(h7.includes('<a:t>Q1</a:t>') && h7.includes('<a:t>Q4</a:t>'), '时间点文字应写入');
-    // 纵向时间线
+    // 纵向时间线：轴线跟着内容收（3-2），整块在版心内垂直居中
     const vt = create({ title: '纵向时间线', theme: 'plain', path: 'timeline-v.pptx' }, env);
     vt.timeline({ title: '纵向', direction: 'vertical', items: [{ time: 'T1', title: '一' }, { time: 'T2', title: '二' }] });
     const vtXml = new TextDecoder('utf-8').decode(unzip(vt.render()).get('ppt/slides/slide1.xml'));
     const vAxis = xOf(vtXml, 'Timeline Axis');
-    assert((vAxis?.h ?? 0) > cmToEmu(13), '纵向时间线的轴应纵向贯穿版心');
+    const boxTop = cmToEmu(3.25);
+    const boxH = cmToEmu(14.45);
     assert((vAxis?.w ?? 999) <= 1, '纵向轴线的宽度应只有线宽');
+    assert((vAxis?.h ?? 0) < cmToEmu(6), `纵向时间线的轴应随内容收高，不再贯穿版心：${((vAxis?.h ?? 0) / cmToEmu(1)).toFixed(2)}cm`);
+    assert((vAxis?.h ?? 0) >= cmToEmu(3.2), '两个节点的轴至少是两倍最小间距');
+    {
+        const top = (vAxis?.y ?? 0) - boxTop;
+        const bottom = boxTop + boxH - ((vAxis?.y ?? 0) + (vAxis?.h ?? 0));
+        assert(Math.abs(top - bottom) <= 2, '收高后整块应在版心内垂直居中');
+        assert(top > cmToEmu(1), '两个节点的轴线不应再贴着版心顶端');
+        // 节点按内容间距等距：第 1 与第 2 个节点各在自己的槽中间
+        const vNode1 = xOf(vtXml, 'Timeline Node 1');
+        const vNode2 = xOf(vtXml, 'Timeline Node 2');
+        const slot = (vAxis?.h ?? 0) / 2;
+        const center1 = (vNode1?.y ?? 0) + (vNode1?.w ?? 0) / 2;
+        const center2 = (vNode2?.y ?? 0) + (vNode2?.w ?? 0) / 2;
+        assert(Math.abs(center1 - ((vAxis?.y ?? 0) + slot / 2)) <= 1, '第 1 个纵向节点应在第 1 槽中间');
+        assert(Math.abs(center2 - ((vAxis?.y ?? 0) + slot * 1.5)) <= 1, '第 2 个纵向节点应在第 2 槽中间');
+    }
     assert(vt.inspect().warnings.length === 0, `纵向 timeline 不应有告警：${vt.inspect().warnings.join(' / ')}`);
+    // 槽高取「各节点需要的最大值」而不是均值：重节点不该被轻节点拖到压字号
+    // （复核打穿项：500 字节点 + 短节点曾从 12pt 无告警退化成 9pt + 「放不下」）
+    {
+        const heavy = { time: 'T1', title: '重', body: '字'.repeat(500) };
+        const one = create({ title: '单节点', theme: 'plain', path: 'timeline-one.pptx' }, env);
+        one.timeline({ title: '单', direction: 'vertical', items: [heavy] });
+        const oneAxis = xOf(new TextDecoder('utf-8').decode(unzip(one.render()).get('ppt/slides/slide1.xml')), 'Timeline Axis');
+        const ht = create({ title: '重节点', theme: 'plain', path: 'timeline-heavy.pptx' }, env);
+        ht.timeline({
+            title: '重', direction: 'vertical',
+            items: [heavy, { time: 'T2', title: '轻', body: '短' }],
+        });
+        const htReport = ht.save();
+        const htAxis = xOf(new TextDecoder('utf-8').decode(unzip(ht.render()).get('ppt/slides/slide1.xml')), 'Timeline Axis');
+        assert((oneAxis?.h ?? 0) > cmToEmu(4), '重节点的槽高应跟着内容长出来');
+        equal(htAxis?.h, (oneAxis?.h ?? 0) * 2, '两节点的轴线 = 2 × 单节点需要的高度（取最大值，不取均值）');
+        assert(!htReport.warnings.some((line) => line.includes('节点文字放不下')),
+            `重节点不该被压到最小字号：${htReport.warnings.join(' / ')}`);
+    }
 }
 // iconGrid：字形文本、标签、网格几何
 {
@@ -1952,9 +1988,34 @@ assert(hpReport.outline[7].includes('6 个图标'), `outline[7]：${hpReport.out
     const icon1 = xOf(h8, 'IconGrid 1 Icon');
     equal(icon1?.w, cmToEmu(1.1), 'iconGrid 图标边长 = iconSizeCm 默认值');
     equal((icon1?.x ?? 0) + (icon1?.w ?? 0) / 2, cmToEmu(0.9 + 10.29 / 2), '图标应在格内水平居中');
-    equal(xOf(h8, 'IconGrid 1 Label')?.y, cmToEmu(3.25 + 0.3 + 1.1 + 0.18), '标签应排在图标下方');
+    const label1 = xOf(h8, 'IconGrid 1 Label');
+    equal(label1?.y, (icon1?.y ?? 0) + (icon1?.w ?? 0) + cmToEmu(0.18), '标签应紧排在图标下方');
+    // 格高跟着内容收（3-2）：整块在版心内垂直居中，两行之间留 gapCm
+    {
+        const icon4 = xOf(h8, 'IconGrid 4 Icon');
+        const cellH = (icon4?.y ?? 0) - (icon1?.y ?? 0) - cmToEmu(0.6);
+        const usedH = cellH * 2 + cmToEmu(0.6);
+        const offsetY = (icon1?.y ?? 0) - cmToEmu(0.3) - cmToEmu(3.25);
+        assert(offsetY > 0, '两行图标的内容收高后不应再撑满版心');
+        assert(Math.abs(offsetY - (cmToEmu(14.45) - usedH) / 2) <= 1, 'iconGrid 整块应在版心内垂直居中');
+        assert(cellH >= cmToEmu(2.0) - 1, `格高不低于内容下限：${(cellH / cmToEmu(1)).toFixed(2)}cm`);
+        assert(cellH < cmToEmu(6.9), '格高应小于均分高度（收高生效）');
+    }
     assert(h8.includes('<a:t>搜索</a:t>') && h8.includes('<a:t>删除</a:t>'), '标签文字应写入');
     assert(h8.includes('<a:t>说明</a:t>'), 'iconGrid 的 body 应写入');
+    // gapCm 过大不能把格子压没（既有边界；分栏让窄版心更容易命中，见复核瑕疵 5）
+    {
+        const gp = create({ title: '大间隙', theme: 'plain', path: 'icon-gap.pptx' }, env);
+        gp.iconGrid({ title: '网格', columns: 6, gapCm: 5, items: [{ icon: 0xE72C, label: '甲' }] });
+        gp.image({ path: 'assets/wide.png', ratio: 0.7 });
+        const gpReport = gp.save();
+        const gpXml = new TextDecoder('utf-8').decode(unzip(gp.render()).get('ppt/slides/slide1.xml'));
+        const gpLabel = xOf(gpXml, 'IconGrid 1 Label');
+        assert((gpLabel?.w ?? 0) > cmToEmu(0.5),
+            `gapCm 过大时标签不该被压成 0 宽：${((gpLabel?.w ?? 0) / cmToEmu(1)).toFixed(3)}cm`);
+        assert(gpReport.warnings.some((line) => line.includes('gapCm') && line.includes('太大')),
+            `gapCm 过大应如实告警：${gpReport.warnings.join(' / ')}`);
+    }
 }
 // read() 回读：版式名与生成端一字不差（靠形状名标记认页）
 {
@@ -2154,6 +2215,235 @@ assert(hpReport.outline[7].includes('6 个图标'), `outline[7]：${hpReport.out
     assert(rfBack.outline[0].includes('3 张卡片'), `组合页 read() outline：${rfBack.outline[0]}`);
     assert(rfReport.warnings.every((line) => !line.includes('undefined') && !line.includes('NaN')),
         `组合页告警里不应出现 undefined/NaN：${rfReport.warnings.join(' / ')}`);
+}
+
+// ── 8.4b 版式与配图共存 / 画布对内容版式开放（第五十二轮 新-6） ─────────────
+//
+// 契约三条，逐条钉住：
+//   ① 版式助手页 + 不给摆位的 deck.image() = 同页配图，自动分栏（图右栏、版式左栏）；
+//   ② 任意开着画布的页 + 给了 x/y/w/h 的 deck.image() = 同页配图，按给的位置画；
+//   ③ 其余情况照旧「一次调用一页」：bullets 之后不给摆位的 image()、deck.page() 之后、
+//      满页背景页之后都另起一页；cover/section/closing 仍不开放画布。
+{
+    const PAGE_W = 12192000;                       // 16:9 页宽（EMU）
+    const MARGIN = cmToEmu(0.9);
+    const CONTENT_W = PAGE_W - MARGIN * 2;         // 版心宽 32.07cm
+    const CONTENT_RIGHT = MARGIN + CONTENT_W;
+    const xmlOf = (deck, index = 1) => new TextDecoder('utf-8')
+        .decode(unzip(deck.render()).get(`ppt/slides/slide${index}.xml`));
+
+    // ① 助手页 + 配图：分栏
+    const mix1 = create({ title: '版式配图', theme: 'plain', path: 'canvas-image.pptx' }, env);
+    mix1.cards({
+        title: '三张卡', columns: 3,
+        items: [{ title: '一', body: '说明一' }, { title: '二', body: '说明二' }, { title: '三', body: '说明三' }],
+    });
+    mix1.image({ path: 'assets/wide.png', caption: '右栏配图' });
+    const mix1Report = mix1.save();
+    const mix1Xml = xmlOf(mix1);
+    equal(mix1Report.stats.slides, 1, 'cards 之后 image() 应落在同一页');
+    equal(mix1Report.stats.layouts.cards, 1, '同页仍是 cards 页');
+    equal(mix1Report.stats.layouts.image, 0, '不应多出一张单图页');
+    equal(mix1Report.stats.layouts.shape, 0, '不应多出一张自由绘制页');
+    equal(mix1Report.stats.images, 1, '同页配图应计入 stats.images');
+    const pic1 = xOf(mix1Xml, 'Canvas Picture 1');
+    assert(pic1 !== undefined, '同页配图应写进这一页（cNvPr 名 Canvas Picture）');
+    assert(mix1Xml.includes('<a:t>右栏配图</a:t>'), '同页配图的题注应写入');
+    {
+        // 图在右栏：起点超过版心中线、右边界不出版心（厘米↔EMU 来回换算留 0.01cm 余量）
+        assert((pic1?.x ?? 0) > MARGIN + CONTENT_W / 2, '分栏后配图应落在版心右半');
+        assert((pic1?.x ?? 0) + (pic1?.w ?? 0) <= CONTENT_RIGHT + cmToEmu(0.01), '配图右边界不应出版心');
+        assert((pic1?.w ?? 0) > cmToEmu(10) && (pic1?.w ?? 0) < cmToEmu(16),
+            `配图宽度应在右栏量级（ratio 默认 0.42）：${((pic1?.w ?? 0) / cmToEmu(1)).toFixed(2)}cm`);
+        // 版式收到左栏：末张卡片右边界在图左侧
+        const card3 = xOf(mix1Xml, 'Card 3');
+        assert((card3?.x ?? 0) + (card3?.w ?? 0) <= (pic1?.x ?? 0) - cmToEmu(0.3),
+            '分栏后卡片网格应整体收进左栏（不与配图重叠）');
+        assert((card3?.x ?? 0) + (card3?.w ?? 0) <= MARGIN + CONTENT_W * 0.58 + 1,
+            '卡片网格右边界不应超过左栏');
+        // 页面级装饰仍横贯整幅版心（标题带、页脚线不跟着收窄）
+        const rule = xOf(mix1Xml, 'Footer Rule');
+        assert((rule?.w ?? 0) >= CONTENT_W - 1, '分栏页的页脚线仍应横贯整幅版心');
+        const title = xOf(mix1Xml, 'Title');
+        assert((title?.w ?? 0) > CONTENT_W * 0.9, '分栏页的标题仍应横贯整幅版心');
+    }
+    {
+        // read() 回读：版式名不变、配图数读得回来、outline 与生成端逐行一致
+        const mix1Back = read(mix1Report.path, env);
+        equal(mix1Back.pages[0].layout, 'cards', 'read() 把「cards + 配图」这一页仍认成 cards');
+        equal(mix1Back.pages[0].images, 1, 'read() 应数出同页的配图');
+        equal(mix1Back.stats.images, 1, 'read() 的 stats.images');
+        equal(mix1Back.outline.length, mix1Report.outline.length, '同页 outline 行数');
+        for (const [index, line] of mix1Back.outline.entries()) {
+            equal(line, mix1Report.outline[index], `同页 outline 第 ${index + 1} 行`);
+        }
+    }
+
+    // ② 内容版式页 + 显式摆位的配图：同页
+    const mix2 = create({ title: '显式摆位', theme: 'plain', path: 'canvas-image-placed.pptx' }, env);
+    mix2.bullets({ title: '要点', items: ['一', '二'] });
+    mix2.image({ path: 'assets/wide.png', x: 20, y: 6, w: 10, h: 6, frame: true });
+    const mix2Xml = xmlOf(mix2);
+    equal(mix2.inspect().stats.slides, 1, 'bullets 之后给了 x/y/w/h 的 image() 应落在同一页');
+    equal(mix2.inspect().stats.layouts.bullets, 1, '同页仍是 bullets 页');
+    equal(mix2.inspect().stats.images, 1, '显式摆位的配图应计入 stats.images');
+    {
+        const pic2 = xOf(mix2Xml, 'Canvas Picture 1');
+        equal(pic2?.x, cmToEmu(20), '显式摆位的 x 应照写');
+        equal(pic2?.w, cmToEmu(10), '显式摆位的 w 应照写（16:9 图在 10×6 框里正好占满宽度）');
+        assert((pic2?.y ?? 0) >= cmToEmu(6) && (pic2?.y ?? 0) + (pic2?.h ?? 0) <= cmToEmu(12),
+            '显式摆位的配图应落在给的框内（contain 居中）');
+    }
+
+    // ③ 内容版式页 + 元素级助手：同页（从前只有助手页开放画布）
+    const mix3 = create({ title: '版式叠层', theme: 'plain', path: 'canvas-base.pptx' }, env);
+    mix3.bullets({ title: '要点', items: ['一'] });
+    mix3.banner({ text: '页脚横幅', x: 1, y: 17, w: 30, h: 1.4 });
+    mix3.shape({ preset: 'rect', x: 1, y: 1, w: 3, h: 2, fill: '1D4ED8' });
+    equal(mix3.inspect().stats.slides, 1, 'bullets 之后的 banner / shape 应落在同一页');
+    equal(mix3.inspect().stats.layouts.bullets, 1, '叠层后仍是 bullets 页');
+    equal(mix3.inspect().stats.shapeKinds.banner, 1, '基础版式页上的 banner');
+    equal(mix3.inspect().stats.shapeKinds.rect, 1, '基础版式页上的 shape');
+    assert(xmlOf(mix3).includes('<a:t>页脚横幅</a:t>'), '基础版式页上的横幅文字应写入');
+
+    // ④ 不给摆位的 image() 照旧另起一页；deck.page() 也照旧
+    const mix4 = create({ title: '独立成页', theme: 'plain', path: 'canvas-image-page.pptx' }, env);
+    mix4.bullets({ title: '要点', items: ['一'] });
+    mix4.image({ path: 'assets/wide.png', title: '独立图页' });
+    equal(mix4.inspect().stats.slides, 2, 'bullets 之后不给摆位的 image() 仍另起一页');
+    equal(mix4.inspect().stats.layouts.image, 1, '独立图页的版式仍是 image');
+    mix4.page();
+    mix4.image({ path: 'assets/wide.png' });
+    equal(mix4.inspect().stats.slides, 3, 'deck.page() 之后 image() 另起一页');
+
+    // ⑤ 与版式同页的配图给了 title：如实报出去向，不静默丢
+    const mix5 = create({ title: '标题丢弃', theme: 'plain', path: 'canvas-image-title.pptx' }, env);
+    mix5.cards({ title: '卡片', items: [{ title: '一' }] });
+    mix5.image({ path: 'assets/wide.png', title: '增长曲线' });
+    const mix5Report = mix5.save();
+    assert(mix5Report.warnings.some((line) => line.includes('title「增长曲线」') && line.includes('已忽略')),
+        `同页配图的 title 应如实报出：${mix5Report.warnings.join(' / ')}`);
+
+    // ⑥ 显式摆位越界 / 缺图：都要进 warnings，且仍然落在同一页
+    const mix6 = create({ title: '配图越界', theme: 'plain', path: 'canvas-image-over.pptx' }, env);
+    mix6.cards({ title: '卡片', items: [{ title: '一' }] });
+    mix6.image({ path: 'assets/wide.png', x: 40, y: 1, w: 8, h: 6 });
+    mix6.page();
+    mix6.cards({ title: '卡片', items: [{ title: '一' }] });
+    mix6.image({ path: 'assets/not-here.png' });
+    const mix6Report = mix6.save();
+    equal(mix6Report.stats.slides, 2, '越界与缺图都仍落在各自的版式页上');
+    assert(mix6Report.warnings.some((line) => line.includes('image 超出页面')), '显式摆位越界应告警');
+    // 缺图警告要报**真的落点页码**：与版式同页时是当前这一页（不是下一页）
+    assert(mix6Report.warnings.some((line) => line.includes('第 2 页图片不存在：assets/not-here.png')),
+        `同页缺图应报当前页码：${mix6Report.warnings.join(' / ')}`);
+    assert(xmlOf(mix6, 2).includes('图片缺失：assets/not-here.png'), '缺图应画成写明路径的占位框');
+
+    // ⑦ cover 仍不开放画布：shape 另起一页，read() 报「封面之后的自由绘制页」
+    const mix7 = create({ title: '封面不开放', theme: 'plain', path: 'canvas-cover.pptx' }, env);
+    mix7.cover({ title: '封面' });
+    mix7.shape({ preset: 'rect', x: 1, y: 1, w: 3, h: 2, fill: '1D4ED8' });
+    const mix7Report = mix7.save();
+    equal(mix7Report.stats.slides, 2, 'cover 之后的 shape 仍另起一页');
+    const mix7Back = read(mix7Report.path, env);
+    assert(mix7Back.warnings.some((line) => line.includes('封面 / 章节页 / 结束页之后的自由绘制页')),
+        `read() 应报出封面之后的自由绘制页：${mix7Back.warnings.join(' / ')}`);
+    // 显式换页的自由绘制页不该被念「没有标题文本」（无法执行的告警 = 噪音）
+    {
+        const pg = create({ title: '显式换页', theme: 'plain', path: 'canvas-page-shape.pptx' }, env);
+        pg.bullets({ title: '要点', items: ['一'] });
+        pg.page();
+        pg.shape({ preset: 'rect', x: 1, y: 1, w: 3, h: 2, fill: '1D4ED8' });
+        const pgBack = read(pg.save().path, env);
+        assert(!pgBack.warnings.some((line) => line.includes('没有标题文本')),
+            `显式换页的自由绘制页不该报「没有标题文本」：${pgBack.warnings.join(' / ')}`);
+        assert(!pgBack.warnings.some((line) => line.includes('之后的自由绘制页')),
+            `bullets 之后是开放画布的版式，不该报「之后的自由绘制页」：${pgBack.warnings.join(' / ')}`);
+    }
+
+    // ⑧ 满页背景页不承接下一张配图
+    const mix8 = create({ title: '满页背景', theme: 'plain', path: 'canvas-fullbleed.pptx' }, env);
+    mix8.image({ path: 'assets/wide.png', fullBleed: true });
+    mix8.image({ path: 'assets/tall.png' });
+    equal(mix8.inspect().stats.slides, 2, '满页背景页不承接下一张配图');
+    equal(mix8.inspect().stats.layouts.image, 2, '两张图各自成页');
+
+    // ⑨ 一页只自动分栏一次：第二张不给坐标的配图另起一页（否则会落进收窄后的版心、压住助手）
+    const mix9 = create({ title: '两张配图', theme: 'plain', path: 'canvas-two-pics.pptx' }, env);
+    mix9.cards({ title: '卡片', items: [{ title: '一' }] });
+    mix9.image({ path: 'assets/wide.png' });
+    mix9.image({ path: 'assets/tall.png' });
+    equal(mix9.inspect().stats.slides, 2, '同一助手页上的第二张无坐标配图应另起一页');
+    equal(mix9.inspect().stats.images, 2, '两张图都应计入 stats.images');
+    equal(mix9.inspect().stats.layouts.cards, 1, '第一页仍是 cards 页');
+    equal(mix9.inspect().stats.layouts.image, 1, '第二张图独占一页');
+    equal(countOf(xmlOf(mix9, 1), /name="Canvas Picture \d+"/g), 1, '第一页只该有一张配图');
+    // 给了坐标的第二张仍同页
+    const mix10 = create({ title: '两张配图显式', theme: 'plain', path: 'canvas-two-pics-placed.pptx' }, env);
+    mix10.cards({ title: '卡片', items: [{ title: '一' }] });
+    mix10.image({ path: 'assets/wide.png' });
+    mix10.image({ path: 'assets/tall.png', x: 2, y: 12, w: 6, h: 4 });
+    equal(mix10.inspect().stats.slides, 1, '给了坐标的第二张配图仍落在同一页');
+    equal(countOf(xmlOf(mix10, 1), /name="Canvas Picture \d+"/g), 2, '同页两张配图都应写入');
+    // 名字带序号：同页两张配图不能重名（read 侧按名取几何只看得到第一张）
+    assert(xmlOf(mix10, 1).includes('name="Canvas Picture 1"')
+        && xmlOf(mix10, 1).includes('name="Canvas Picture 2"'), '同页两张配图应各有唯一名字');
+
+    // ⑩ 复核打穿项的回归：尺寸照收 / 裁切与 DPI 与 read 同口径 / 缺图有页面级告警 /
+    //    分栏页不再凭空报「超过版心」 / 半坐标按整幅版心补默认宽
+    {
+        // widthCm / heightCm 不能被静默丢掉
+        const sz = create({ title: '显式尺寸', theme: 'plain', path: 'canvas-image-size.pptx' }, env);
+        sz.cards({ title: '卡片', items: [{ title: '一' }] });
+        sz.image({ path: 'assets/wide.png', widthCm: 4, heightCm: 3 });
+        const szPic = xOf(xmlOf(sz), 'Canvas Picture 1');
+        equal(szPic?.w, cmToEmu(4), '同页配图的 widthCm 应生效');
+        equal(szPic?.h, cmToEmu(3), '同页配图的 heightCm 应生效');
+
+        // fit:'cover' 的裁切：生成端与 read 必须报同一个数
+        const cp = create({ title: '裁切', theme: 'plain', path: 'canvas-image-cover.pptx' }, env);
+        cp.cards({ title: '卡片', items: [{ title: '一' }] });
+        cp.image({ path: 'assets/wide.png', fit: 'cover' });
+        const cpReport = cp.save();
+        const cpBack = read(cpReport.path, env);
+        equal(cpReport.stats.cropped, 1, '生成端应报出同页配图的裁切');
+        equal(cpBack.stats.cropped, cpReport.stats.cropped, '裁切口径：read 与生成端一致');
+        assert(cpReport.warnings.some((line) => line.includes('已被裁切')), '裁切应进 warnings');
+
+        // 低 DPI 同理（用 80×45 的小图）
+        const low = create({ title: '低清', theme: 'plain', path: 'canvas-image-lowdpi.pptx' }, env);
+        low.cards({ title: '卡片', items: [{ title: '一' }] });
+        low.image({ path: 'assets/tiny.png' });
+        const lowReport = low.save();
+        const lowBack = read(lowReport.path, env);
+        equal(lowReport.stats.lowDpi, 1, '生成端应报出同页配图的低 DPI');
+        equal(lowBack.stats.lowDpi, lowReport.stats.lowDpi, 'DPI 口径：read 与生成端一致');
+        assert(lowReport.warnings.some((line) => line.includes('低于 96 DPI')), '低 DPI 应进 warnings');
+
+        // 缺图占位框要有页面级告警（不是只有输入期那句）
+        const miss = create({ title: '缺图', theme: 'plain', path: 'canvas-image-miss.pptx' }, env);
+        miss.cards({ title: '卡片', items: [{ title: '一' }] });
+        miss.image({ path: 'assets/nope.png' });
+        const missReport = miss.save();
+        assert(missReport.warnings.some((line) => line.includes('有 1 张图片缺失，已画占位框：assets/nope.png')),
+            `同页缺图应报页面级告警：${missReport.warnings.join(' / ')}`);
+
+        // 分栏页不该凭空报「文本框总面积超过版心」（容量按整幅版心算）
+        const cap = create({ title: '容量', theme: 'plain', path: 'canvas-image-capacity.pptx' }, env);
+        cap.imageText({ title: '图文', image: { path: 'assets/wide.png' }, items: ['一', '二'] });
+        cap.image({ path: 'assets/wide.png', caption: '右栏配图' });
+        const capReport = cap.save();
+        assert(!capReport.warnings.some((line) => line.includes('超过版心')),
+            `分栏页不该报「超过版心」：${capReport.warnings.join(' / ')}`);
+
+        // 只给 x 时默认宽度按整幅版心补（不是收窄后的左栏）
+        const half = create({ title: '半坐标', theme: 'plain', path: 'canvas-image-half.pptx' }, env);
+        half.cards({ title: '卡片', items: [{ title: '一' }] });
+        half.image({ path: 'assets/wide.png' });
+        half.image({ path: 'assets/wide.png', x: 2, y: 17 });
+        const halfPic = xOf(xmlOf(half), 'Canvas Picture 2');
+        assert((halfPic?.w ?? 0) > cmToEmu(20), `半坐标的默认宽度应按整幅版心补：${(halfPic?.w ?? 0) / cmToEmu(1)}cm`);
+    }
 }
 
 // ── 8.5 公式（原生 OMML）与三级字体 ─────────────────────────────────────────
@@ -2369,6 +2659,329 @@ assert(hpReport.outline[7].includes('6 个图标'), `outline[7]：${hpReport.out
     assert(fakeCache.artifacts === 1, `写缓存要记一次 artifact：${fakeCache.artifacts}`);
 }
 
+// ── 10.9 短公式兜底（第五十八轮 新-23） ─────────────────────────────────────
+//
+// 这一档钉两件事：① 「公式压根没进 math 通道」的短公式（`r=q·r0`，含中文夹带的写法）
+// 写侧与读侧都要报出来 —— 第四十八轮的 looksLikeLatex 要求文本里有 `\命令`，看不见它；
+// ② math run 在 mc:Fallback 里留的**纯文本近似**（`r = qr₀`）不许被当成短公式 ——
+// 那是这条判据最容易踩的坑，漏掉就会得到一条永远甩不掉的假告警。
+{
+    const pf = create({ title: '短公式兜底', theme: 'plain', path: 'plain-formula.pptx', size: '16:9' }, env);
+    pf.cover({ title: '短公式兜底' });
+    pf.bullets({
+        title: '写成了普通文本',
+        items: [
+            'r=q·r0',
+            '欧姆定律 r=q·r0',       // 中文夹带：命中
+            'E = mc²',               // 带空格的 Unicode 角标：命中
+            '合计 = 1200 元',         // 中文散文里的等号：不判
+            'D:\\work\\demo1',        // 路径：不判
+            'id=abc',                // 复核 P1-1：配置项（左边两个字母）不判
+            'MY_VAR=x',              // 复核 P1-1：蛇形标识符不判
+            'Plan→Build',            // 复核 P1-1：流程箭头不判
+        ],
+    });
+    pf.statement({ text: '公式通道对照', runs: [{ math: 'r=qr_0' }] });
+    // 复核 P1-2 的回归：解析失败的 math run 回落原文只进 formulaErrors，不许同时进 plainFormulas
+    pf.statement({ text: '解析失败', runs: [{ math: 'E=mc² \\foo' }] });
+    const pfReport = pf.save();
+    equal(pfReport.stats.plainFormulas, 3, `写侧短公式计数（只该命中那三条），实际 ${pfReport.stats.plainFormulas}`);
+    assert(pfReport.stats.formulaErrors >= 1, '解析失败的公式仍要计进 formulaErrors');
+    assert(!pfReport.stats.plainFormulaList.some((item) => item.text.includes('\\')),
+        `plainFormulaList 里不许出现 LaTeX 残留：${JSON.stringify(pfReport.stats.plainFormulaList)}`);
+    assert(pfReport.warnings.some((line) => line.includes('短公式同样要走 math 通道')), '写侧要点名「短公式要走 math 通道」');
+    assert(pfReport.warnings.some((line) => line.includes('r=q·r0')), '写侧要带出原文与页码/形状');
+    assert(pfReport.warnings.every((line) => !line.includes('r = qr')), 'mc:Fallback 里的公式近似不许被误报');
+    equal(pfReport.stats.formulas, 1, '对照组：走 math 通道那条仍然是公式');
+
+    const pfBack = read(pfReport.path, env);
+    equal(pfBack.stats.plainFormulas, pfReport.stats.plainFormulas, '读侧与写侧同名同口径');
+    assert(pfBack.warnings.some((line) => line.includes('短公式同样要走 math 通道')), '读侧同样要点名');
+    // 反向控制：把那条纯文本改成 math run，计数必须归零（判据要有鉴别力）
+    const control = create({ title: '短公式对照', theme: 'plain', path: 'plain-formula-control.pptx', size: '16:9' }, env);
+    control.cover({ title: '短公式对照' });
+    control.statement({ text: '公式通道对照', runs: [{ math: 'r=qr_0' }] });
+    const controlReport = control.save();
+    equal(controlReport.stats.plainFormulas, 0, `走了 math 通道的对照稿不该有短公式，实际 ${controlReport.stats.plainFormulas}`);
+}
+
+// ── 10.10 新版式助手：agenda / gallery / roadmap / matrix（第六十八轮 A） ──
+//
+// 四个独立 kind 各一整套：正常样例（几何、文本、统计、outline）+ 边界样例
+// （空 / 超量 / 缺图 / 非法参数）+ read() 往返识别。统计与 outline 是「这一页
+// 到底按什么版式排的」的唯一可信来源，所以每个 helper 都从生成侧与读回侧各钉一遍。
+{
+    env.writeFile('assets/gal-a.png', makePng(1400, 787));
+    env.writeFile('assets/gal-b.png', makePng(1050, 1400));
+    const nh = create({ title: '新版式助手', theme: 'business', path: 'helpers-new.pptx', size: '16:9' }, env);
+    // P1：目录（5 条、第 2 条高亮、带说明、默认编号）
+    nh.agenda({
+        title: '目录',
+        items: [
+            { text: '背景', desc: '行业现状' },
+            { text: '方案', desc: '三条主线', active: true },
+            { text: '验证' },
+            { text: '计划' },
+            { text: '附录' },
+        ],
+    });
+    // P2：不编号 + 顶层 active 快捷写法
+    nh.agenda({
+        title: '议程', numbered: false, active: 2,
+        items: [{ text: '一' }, { text: '二' }, { text: '三' }],
+    });
+    // P3：空条目
+    nh.agenda({ title: '空目录', items: [] });
+    // P4：超量（12 条）
+    nh.agenda({
+        title: '超量目录',
+        items: Array.from({ length: 12 }, (_, index) => ({ text: `第 ${index + 1} 节` })),
+    });
+    // P5：图片墙（3 列、图注 + 角标 + 替代文字 + 来源）
+    nh.gallery({
+        title: '现场照片', columns: 3,
+        items: [
+            { path: 'assets/gal-a.png', caption: '入口', badge: '实拍', alt: '入口照片' },
+            { path: 'assets/gal-missing.png', caption: '缺失图' },
+            { path: 'assets/gal-b.png', caption: '中庭', source: '摄影：张三' },
+        ],
+    });
+    // P6：列数非法 + ratio 越界
+    nh.gallery({
+        title: '参数非法', columns: 9, ratio: 5,
+        items: [{ path: 'assets/gal-a.png' }, { path: 'assets/gal-b.png' }],
+    });
+    // P7：空图片墙
+    nh.gallery({ title: '空图片墙', items: [] });
+    // P8：路线图（4 阶段、2 条带完成度、1 条越界）
+    nh.roadmap({
+        title: '实施路线',
+        phases: [
+            { label: '调研', items: ['访谈 12 家客户', '竞品拆解'], progress: 1 },
+            { label: '试点', items: ['两个场景上线'], progress: 0.4 },
+            { label: '推广', items: ['全量灰度'] },
+            { label: '收尾', items: ['复盘'], progress: 1.5 },
+        ],
+    });
+    // P9：6 阶段（超过 5 列）
+    nh.roadmap({
+        title: '多阶段',
+        phases: Array.from({ length: 6 }, (_, index) => ({ label: `阶段 ${index + 1}` })),
+    });
+    // P10：空阶段
+    nh.roadmap({ title: '空路线', phases: [] });
+    // P11：矩阵（13 个点：正常 / 缺坐标 / 越界 / 批量）
+    nh.matrix({
+        title: '任务优先级',
+        xAxis: { low: '不紧急', high: '紧急' },
+        yAxis: { low: '低影响', high: '高影响' },
+        items: [
+            { x: 0.8, y: 0.85, text: '线上故障', desc: '本周' },
+            { x: 0.15, y: 0.75, text: '架构规划' },
+            { x: 0.35, y: 0.25, text: '文档' },
+            { text: '缺坐标' },
+            { x: 1.4, y: -0.3, text: '越界' },
+            ...Array.from({ length: 8 }, (_, index) => ({
+                x: (index + 1) / 10, y: (index + 2) / 10, text: `点 ${index + 6}`,
+            })),
+        ],
+    });
+    // P12：空矩阵
+    nh.matrix({ title: '空矩阵', items: [] });
+    const nhReport = nh.save();
+    console.log(`新版式助手 warnings(${nhReport.warnings.length})`);
+    for (const line of nhReport.warnings) console.log(`  - ${line}`);
+    equal(nhReport.stats.slides, 12, '新版式助手页数');
+    // 统计：四种版式各按自己 key 计数，互不串味
+    equal(nhReport.stats.layouts.agenda, 4, '新版式助手 stats.layouts.agenda');
+    equal(nhReport.stats.layouts.gallery, 3, '新版式助手 stats.layouts.gallery');
+    equal(nhReport.stats.layouts.roadmap, 3, '新版式助手 stats.layouts.roadmap');
+    equal(nhReport.stats.layouts.matrix, 2, '新版式助手 stats.layouts.matrix');
+    equal(nhReport.stats.layouts.shape, 0, '新版式助手不该多出形状页');
+    // outline：`P3 agenda：目录｜5 条`
+    assert(nhReport.outline[0] === 'P1 agenda：目录｜5 条', `agenda outline：${nhReport.outline[0]}`);
+    assert(nhReport.outline[3].startsWith('P4 agenda：超量目录｜12 条'), `agenda 超量 outline：${nhReport.outline[3]}`);
+    assert(nhReport.outline[4].startsWith('P5 gallery：现场照片｜3 张图片'), `gallery outline：${nhReport.outline[4]}`);
+    assert(nhReport.outline[7].startsWith('P8 roadmap：实施路线｜4 个阶段'), `roadmap outline：${nhReport.outline[7]}`);
+    assert(nhReport.outline[10].startsWith('P11 matrix：任务优先级｜13 个坐标点'), `matrix outline：${nhReport.outline[10]}`);
+    // 边界告警：空、超量、缺图、非法参数、坐标问题都要给出可操作的一句
+    for (const text of [
+        '第 3 页 agenda 没有任何条目，该页只有标题',
+        '每行只有 0.9cm 高',
+        '没有标记 active 的条目',
+        '第 6 页只支持 1 / 2 / 3 列，已按 2 列排版（收到 9）',
+        'gallery 的 ratio 5 超出 0.2~1.5，已按 1.5 处理',
+        '有 1 张图片缺失，已画占位框：assets/gal-missing.png',
+        '第 7 页 gallery 没有任何图片，该页只有标题',
+        '第 8 页 roadmap 有 1 个阶段的 progress 超出 0~1',
+        '第 9 页 roadmap：6 个阶段排成 5 列 2 行',
+        '第 10 页 roadmap 没有任何阶段，该页只有标题',
+        '第 11 页 matrix 有 1 个点缺少 x/y 坐标',
+        '第 11 页 matrix 有 1 个点的坐标超出 0~1',
+        '13 个坐标点，标签容易互相压住',
+        '第 12 页 matrix 没有任何坐标点，该页只有坐标轴',
+    ]) {
+        assert(nhReport.warnings.some((line) => line.includes(text)), `新版式助手应覆盖告警：${text}`);
+    }
+    assert(nhReport.warnings.every((line) => !line.includes('undefined') && !line.includes('NaN')),
+        `新版式助手告警里不应出现 undefined/NaN：${nhReport.warnings.join(' / ')}`);
+
+    // 逐页 XML：形状名、顺序、关键属性
+    const nhParts = unzip(nh.render());
+    const slideOf = (index) => new TextDecoder('utf-8').decode(nhParts.get(`ppt/slides/slide${index}.xml`));
+    {
+        const xml = slideOf(1);
+        equal(countOf(xml, /name="Agenda Row \d+"/g), 5, 'agenda 应有 5 行条目');
+        equal(countOf(xml, /name="Agenda Row \d+ Badge"/g), 5, 'agenda 默认每条一个序号圆');
+        equal(countOf(xml, /name="Agenda Text \d+"/g), 5, 'agenda 应有 5 个条目文本框');
+        assert(xml.includes('name="Agenda Row 2"'), 'agenda 第 2 行存在（active 行）');
+        // 行序：第 1 行在第 2 行上面
+        const row1 = xOf(xml, 'Agenda Row 1');
+        const row2 = xOf(xml, 'Agenda Row 2');
+        assert(row1 !== undefined && row2 !== undefined && row1.y < row2.y,
+            `agenda 行序应自上而下：${JSON.stringify(row1)} / ${JSON.stringify(row2)}`);
+        // 高亮行整行换成强调色（accent），未高亮的行用卡片底色
+        const accentFill = xml.slice(xml.indexOf('name="Agenda Row 2"'));
+        assert(/<a:xfrm/.test(accentFill), 'agenda 第 2 行应有几何');
+        assert(countOf(accentFill.slice(0, 900), /<p:sp>/g) >= 1, 'agenda 第 2 行形状应是 p:sp');
+        assert(xml.includes('name="Agenda Text 2"') && xml.includes('方案'), 'agenda 第 2 行标题');
+        assert(xml.includes('行业现状'), 'agenda 说明文字');
+    }
+    {
+        // 素色主题的 FFFFFF 按约定等于「不填充」：active 行的序号圆不能退化成 noFill，
+        // 否则序号与高亮行同为 595959、肉眼看不见（第六十八轮真机出图时抓到的缺陷）。
+        const ph = create({ title: '素色目录', theme: 'plain', size: '16:9' }, env);
+        ph.agenda({ title: '目录', items: [{ text: '甲', desc: '说明', active: true }, { text: '乙' }] });
+        const plainXml = new TextDecoder('utf-8').decode(unzip(ph.render()).get('ppt/slides/slide1.xml'));
+        const badgeAt = plainXml.indexOf('name="Agenda Row 1 Badge"');
+        assert(badgeAt >= 0, '素色主题 agenda 应有序号圆');
+        assert(/<a:solidFill><a:srgbClr val="F8FAFC"\/>/.test(plainXml.slice(badgeAt, badgeAt + 900)),
+            '素色主题 active 行序号圆必须有可见底色（FFFFFF 会被当成不填充）');
+    }
+    {
+        const xml = slideOf(2);
+        equal(countOf(xml, /name="Agenda Row \d+ Badge"/g), 0, 'numbered:false 不应画序号圆');
+        equal(countOf(xml, /name="Agenda Row \d+ Mark"/g), 3, 'numbered:false 应改画左侧色条');
+        assert(xml.includes('name="Agenda Row 2 Mark"'), '顶层 active:2 应能定位到第 2 行');
+    }
+    {
+        const xml = slideOf(5);
+        equal(countOf(xml, /name="Gallery Cell \d+"/g), 3, 'gallery 应有 3 个格子');
+        equal(countOf(xml, /<p:pic>/g), 2, 'gallery 只应产出 2 个真图片（1 张缺图走占位）');
+        equal(countOf(xml, /name="Gallery Cell \d+ Picture"/g), 2, 'gallery 图片名');
+        assert(xml.includes('descr="入口照片"'), 'gallery alt 应写进 cNvPr 的 descr');
+        assert(xml.includes('name="Gallery Cell 1 Badge"'), 'gallery 角标');
+        assert(xml.includes('name="Gallery Cell 1 Caption"') && xml.includes('入口'), 'gallery 图注');
+        assert(xml.includes('中庭 ｜ 来源：摄影：张三'), 'gallery 图注应带来源');
+        assert(xml.includes('图片缺失'), 'gallery 缺图应画占位框');
+        // 3 列等宽：第 1 格与第 3 格同一行、x 递增
+        const cell1 = xOf(xml, 'Gallery Cell 1');
+        const cell3 = xOf(xml, 'Gallery Cell 3');
+        assert(cell1 !== undefined && cell3 !== undefined && cell1.y === cell3.y && cell1.x < cell3.x,
+            `gallery 3 列网格：${JSON.stringify(cell1)} / ${JSON.stringify(cell3)}`);
+    }
+    {
+        const xml = slideOf(8);
+        equal(countOf(xml, /name="Roadmap Phase \d+"/g), 4, 'roadmap 应有 4 个阶段卡');
+        equal(countOf(xml, /name="Roadmap Arrow \d+"/g), 3, 'roadmap 横排 4 阶段应有 3 个箭头');
+        equal(countOf(xml, /name="Roadmap Phase \d+ Progress Track"/g), 3, 'roadmap 有 3 个阶段给了 progress');
+        equal(countOf(xml, /name="Roadmap Phase \d+ Progress Fill"/g), 3, 'roadmap 进度条填充（含钳到 1 的那条）');
+        assert(xml.includes('100%') && xml.includes('40%'), 'roadmap 进度百分比应画出来');
+        // 阶段卡横排：第 1、2 张同一行、x 递增
+        const p1 = xOf(xml, 'Roadmap Phase 1');
+        const p2 = xOf(xml, 'Roadmap Phase 2');
+        assert(p1 !== undefined && p2 !== undefined && p1.y === p2.y && p1.x < p2.x,
+            `roadmap 阶段应横排：${JSON.stringify(p1)} / ${JSON.stringify(p2)}`);
+        assert(xml.includes('<a:t>访谈 12 家客户</a:t>'), 'roadmap 阶段要点');
+    }
+    {
+        const xml = slideOf(11);
+        equal(countOf(xml, /name="Matrix Quadrant \d+"/g), 4, 'matrix 应有 4 个象限');
+        equal(countOf(xml, /name="Matrix Point \d+"/g), 13, 'matrix 应有 13 个坐标点');
+        assert(xml.includes('name="Matrix Axis Vertical"') && xml.includes('name="Matrix Axis Horizontal"'),
+            'matrix 两条中线');
+        assert(xml.includes('name="Matrix Frame"'), 'matrix 外框');
+        assert(xml.includes('<a:t>紧急</a:t>') && xml.includes('<a:t>高影响</a:t>'), 'matrix 轴标签');
+        const dot1 = xOf(xml, 'Matrix Point 1');
+        const dot2 = xOf(xml, 'Matrix Point 2');
+        assert(dot1 !== undefined && dot2 !== undefined && dot1.x > dot2.x && dot1.y < dot2.y,
+            `matrix 坐标方向：${JSON.stringify(dot1)} / ${JSON.stringify(dot2)}`);
+        assert(xml.includes('name="Matrix Point 1 Text"') && xml.includes('<a:t>线上故障</a:t>'), 'matrix 点标签');
+        // 越界点钳到右下角：坐标点在绘图区范围内
+        const dot5 = xOf(xml, 'Matrix Point 5');
+        assert(dot5 !== undefined && dot5.x > dot2.x, 'matrix 越界点应钳到边界而不是消失');
+    }
+    // read() 往返：四页形状名能把版式认回来，且统计与写侧一致
+    const nhBack = read(nhReport.path, env);
+    equal(nhBack.stats.slides, 12, 'read() 新版式助手页数');
+    // 空助手页（没有任何条目/图片/阶段/坐标点）在包里只剩一个标题文本框，
+    // 按形状名认不出版式 —— read() 照实回落 shape。这是照实写明的边界，不是静默吞掉
+    equal(nhBack.stats.layouts.agenda, 3, 'read() stats.layouts.agenda（空目录页回落 shape）');
+    equal(nhBack.stats.layouts.gallery, 2, 'read() stats.layouts.gallery（空图墙页回落 shape）');
+    equal(nhBack.stats.layouts.roadmap, 2, 'read() stats.layouts.roadmap（空路线页回落 shape）');
+    equal(nhBack.stats.layouts.matrix, 1, 'read() stats.layouts.matrix（空矩阵页回落 shape）');
+    equal(nhBack.stats.layouts.shape, 4, 'read() 4 张空助手页应回落成 shape');
+    equal(nhBack.pages[2].layout, 'shape', 'read() 空 agenda 页照实是 shape');
+    equal(nhBack.pages[0].layout, 'agenda', 'read() 应把第 1 页认成 agenda');
+    equal(nhBack.pages[0].helperCount, 5, 'read() 应数出 5 条目录');
+    equal(nhBack.pages[4].layout, 'gallery', 'read() 应把第 5 页认成 gallery');
+    equal(nhBack.pages[4].helperCount, 3, 'read() 应数出 3 个图片格');
+    equal(nhBack.pages[7].layout, 'roadmap', 'read() 应把第 8 页认成 roadmap');
+    equal(nhBack.pages[7].helperCount, 4, 'read() 应数出 4 个阶段');
+    equal(nhBack.pages[10].layout, 'matrix', 'read() 应把第 11 页认成 matrix');
+    equal(nhBack.pages[10].helperCount, 13, 'read() 应数出 13 个坐标点');
+    equal(nhBack.outline[0], nhReport.outline[0], 'read() outline 与写侧一致（agenda）');
+    assert(nhBack.outline[4] === nhReport.outline[4], `read() outline 与写侧一致（gallery）：${nhBack.outline[4]}`);
+    assert(nhBack.warnings.every((line) => !line.includes('undefined') && !line.includes('NaN')),
+        `read() 新版式助手告警里不应出现 undefined/NaN：${nhBack.warnings.join(' / ')}`);
+}
+
+// ── 10.11 内容密度自检（第六十九轮）：bullets 页太空 / 太密各报一条 ──
+{
+    const dt = create({ title: '密度自检', theme: 'business', path: 'density.pptx', size: '16:9' }, env);
+    // P1 太空：三条短语（≈ 30 字）
+    dt.bullets({ title: '整体表现', items: ['营收增长 18%', '毛利率提升', '交付周期缩短'] });
+    // P2 太密：12 条 × 60 余字（> 400 字）
+    dt.bullets({
+        title: '塞满的一页',
+        items: Array.from({ length: 12 }, (_, index) => `第 ${index + 1} 条：`
+            + '支撑论点与数据细节，用来把这一页的字数顶过上限，观察是否给出拆页建议。'),
+    });
+    // P3 正常密度：6 条 × 约 20 字（≈ 120 字）—— 条数多但字数够，不该报太空。
+    // 第七十七轮用 5 份真实稿（98 页）量的口径：被点名的都是 3 条短要点页；
+    // 这条 fixture 钉住「6 条正常句子不误报」，也钉住阈值看的是总字数不是条数。
+    dt.bullets({
+        title: '正常密度',
+        items: [
+            '营收同比增长 18%，连续三个季度加速',
+            '毛利率提升 2.1 个百分点，主要来自供应链',
+            '交付周期缩短到 28 天，客户续约率同步上升',
+            '新增两家行业头部客户，合同额覆盖全年目标',
+            '研发投入占比 12%，两条新产品线进入试产',
+            '人员流失率降到 8%，关键岗位补齐',
+        ],
+    });
+    dt.save();
+
+    const off = read('density.pptx', env);
+    equal(off.warnings.filter((line) => /只有 \d+ 字|字偏多/.test(line)).length, 0,
+        '密度自检默认关闭（结构测试不受内容口径干扰）');
+
+    const on = read('density.pptx', env, { density: true });
+    assert(on.warnings.some((line) => line.includes('第 1 页只有')),
+        `太空页应报「只有 N 字」：${on.warnings.join(' / ')}`);
+    const thin = on.warnings.find((line) => line.includes('第 1 页只有'));
+    assert(thin !== undefined && thin.includes('平均') && thin.includes('字/行'),
+        `太空页提示要带每行平均字数（第七十七轮真实稿口径）：${thin}`);
+    assert(on.warnings.some((line) => line.includes('第 2 页') && line.includes('字偏多')),
+        `塞满页应报「字偏多」：${on.warnings.join(' / ')}`);
+    assert(!on.warnings.some((line) => line.includes('第 1 页') && line.includes('字偏多')),
+        '太空页不应同时被判「字偏多」');
+    const normalDensity = on.warnings.filter((line) => line.includes('第 3 页'));
+    assert(normalDensity.length === 0,
+        `6 条、约 120 字的页不该报密度：${normalDensity.join(' / ')}`);
+}
+
 // ── 11. 结果 ─────────────────────────────────────────────────────────────
 
 if (failures.length > 0) {
@@ -2386,3 +2999,4 @@ if (KEEP) {
     rmSync(TMP, { recursive: true, force: true });
     console.log(`临时产物已清理：${TMP}`);
 }
+

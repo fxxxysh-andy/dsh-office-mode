@@ -60,7 +60,7 @@ export const DEFAULT_PREPROCESS = Object.freeze({
 
 /**
  * 字符串/枚举/数值一律收敛，坏值退回默认（配置写坏不该弄崩插件）。
- * 与 `web.js` 的 `resolveBuiltinOptions` 同一取向。
+ * 与 `web.js` 的 `resolveWebOptions` 同一取向。
  */
 export function resolvePreprocessOptions(raw) {
     const source = raw !== null && typeof raw === 'object' ? raw : {};

@@ -15,8 +15,8 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
-// 测试中间产物统一落在仓库根的 .office/tmp/<suite>/ 下（不再用包内的 test/.tmp）
-const outDir = join(here, '..', '..', '..', '.office', 'tmp', 'revise');
+// 测试中间产物统一落在仓库根的 .office/runtime/tmp/<suite>/ 下（不再用包内的 test/.tmp）
+const outDir = join(here, '..', '..', '..', '.office', 'runtime', 'tmp', 'revise');
 rmSync(outDir, { recursive: true, force: true });
 mkdirSync(outDir, { recursive: true });
 

@@ -6,7 +6,7 @@
  * 这一步只用于开发期校验，不属于插件本身 —— 插件保持零依赖。
  *
  * 用法：
- *   node test/validate-libreoffice.mjs [--dir .office/tmp/e2e] [--kit <libreoffice-kit/lib/index.js>]
+ *   node test/validate-libreoffice.mjs [--dir .office/runtime/tmp/e2e] [--kit <libreoffice-kit/lib/index.js>]
  */
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -25,7 +25,7 @@ function argValue(name, fallback) {
 // --dir 相对「当前工作目录」解析，不是相对脚本目录：脚本目录下再套一层
 // test/ 会得到一个不存在的路径（这个坑已经踩过一次）。
 const targetDir = argValue('--dir', '') === ''
-    ? fileURLToPath(new URL('../../../.office/tmp/e2e/', import.meta.url))
+    ? fileURLToPath(new URL('../../../.office/runtime/tmp/e2e/', import.meta.url))
     : resolve(process.cwd(), argValue('--dir', ''));
 // libreoffice-kit 是随部署安装的 bundle，从宿主的解析位置找（见 host-modules.mjs）；
 // --kit 显式指过就用它。
@@ -64,7 +64,7 @@ if (files.length === 0) {
     process.exit(1);
 }
 
-const outDir = fileURLToPath(new URL('../../../.office/tmp/libreoffice-pdf/', import.meta.url));
+const outDir = fileURLToPath(new URL('../../../.office/runtime/tmp/libreoffice-pdf/', import.meta.url));
 rmSync(outDir, { recursive: true, force: true });
 mkdirSync(outDir, { recursive: true });
 

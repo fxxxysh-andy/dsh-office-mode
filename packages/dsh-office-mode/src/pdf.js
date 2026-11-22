@@ -766,6 +766,150 @@ export async function pdfPages(filePath, options = {}, env, cache, config = {}) 
     };
 }
 
+/* ── 按页拆分成多个小 PDF（大文件预览/入库用） ─────────────────────────── */
+
+/**
+ * PyMuPDF 拆分脚本：每份 ≤ target 字节；单页仍超 target 时单独成一份并标 too_large。
+ * 用二分找「从 start 开始最多能装到第几页」，避免按页反复重写整份大文件。
+ */
+const FITZ_SPLIT_SCRIPT = [
+    'import sys, os, json',
+    'import fitz',
+    'src, outdir, target = sys.argv[1], sys.argv[2], int(sys.argv[3])',
+    'doc = fitz.open(src)',
+    'if doc.needs_pass:',
+    "    sys.stderr.write('encrypted')",
+    '    raise SystemExit(3)',
+    'total = doc.page_count',
+    'parts = []',
+    'def write_part(first, last, path):',
+    '    sub = fitz.open()',
+    '    sub.insert_pdf(doc, from_page=first - 1, to_page=last - 1)',
+    '    sub.save(path, garbage=4, deflate=True)',
+    '    sub.close()',
+    '    return os.path.getsize(path)',
+    'start = 1',
+    'index = 0',
+    'while start <= total:',
+    '    index += 1',
+    "    name = 'part-%03d.pdf' % index",
+    '    path = os.path.join(outdir, name)',
+    '    lo, hi = start, total',
+    '    best, best_size = -1, 0',
+    '    while lo <= hi:',
+    '        mid = (lo + hi) // 2',
+    '        size = write_part(start, mid, path)',
+    '        if size <= target:',
+    '            best, best_size = mid, size',
+    '            lo = mid + 1',
+    '        else:',
+    '            hi = mid - 1',
+    '    too_large = False',
+    '    if best < 0:',
+    '        best = start',
+    '        best_size = write_part(start, start, path)',
+    '        too_large = True',
+    '    else:',
+    '        best_size = write_part(start, best, path)',
+    '    parts.append({"file": name, "from": start, "to": best, "pages": best - start + 1, "bytes": best_size, "tooLarge": too_large})',
+    '    start = best + 1',
+    'with open(os.path.join(outdir, "parts.json"), "w", encoding="utf-8") as fh:',
+    '    json.dump({"pages": total, "targetBytes": target, "parts": parts}, fh, ensure_ascii=False)',
+].join('\n');
+
+/**
+ * 把一份 PDF 按页拆成若干小文件。
+ *
+ * 为什么按页而不是按字节硬切：PDF 的交叉引用与对象流不能从中间截断；按页
+ * 重新封装（PyMuPDF insert_pdf）得到的每一份都是完整可读的 PDF，扫描件也不
+ * 会丢页。目标字节数只是上限，实际按页数取最大可容纳的连续页段。
+ *
+ * 没有 PyMuPDF 时明确报错，不假装支持；调用方（kbPreview）据此回退到
+ * 「只提示文件过大」，不会把半份 PDF 塞进知识库。
+ *
+ * @param {string} filePath
+ * @param {{targetBytes?: number, outDir?: string, maxParts?: number}} [options]
+ * @param {object} env
+ * @param {object} [cache]
+ */
+export async function pdfSplit(filePath, options = {}, env, cache = undefined) {
+    const absolute = env.resolve(filePath);
+    if (!existsSync(absolute)) throw new Error('找不到文件：' + filePath);
+    const info = await pdfInfo(filePath, env, { cache });
+    if (info.pages <= 0) throw new Error('读不出页数，无法拆分：' + filePath);
+    if (info.encrypted) throw new Error('这份 PDF 加密了，拆不开；请先解密。');
+    const engines = await pdfEngines();
+    if (!engines.render.includes('fitz')) {
+        throw new Error('本机没有 PyMuPDF，无法按页拆分 PDF。装一次即可：pip install pymupdf；'
+            + '没有它时请手动按页拆开再上传。');
+    }
+    const targetBytes = Math.min(64 * 1024 * 1024, Math.max(1, Math.trunc(Number(options.targetBytes) || 4 * 1024 * 1024)));
+    const stem = (basename(absolute).replace(/\.[^.]+$/, '').replace(/[\\/:*?"<>|]/g, '-').slice(0, 24) || 'doc');
+    const digest = createHash('sha1').update(readFileSync(absolute)).digest('hex').slice(0, 12);
+    const outDir = typeof options.outDir === 'string' && options.outDir.trim() !== ''
+        ? env.resolve(options.outDir)
+        : cache !== undefined && cache !== null && typeof cache.ensureDir === 'function'
+            ? cache.ensureDir('pdf/split-' + stem + '-' + digest + '-' + targetBytes)
+            : join(tmpdir(), 'office-pdf-split-' + process.pid + '-' + Date.now().toString(36));
+    mkdirSync(outDir, { recursive: true });
+    const errPath = join(outDir, 'split.err.txt');
+    const result = await runProcess(probePdfEngines().bin.python, ['-c', FITZ_SPLIT_SCRIPT, absolute, outDir, String(targetBytes)], {
+        timeoutMs: PROCESS_TIMEOUT_MS,
+        errPath,
+    });
+    const stderr = String(result.err ?? '').trim().split(/\r?\n/).filter((line) => line !== '').slice(-2).join(' ');
+    try { rmSync(errPath, { force: true }); } catch { /* 清不掉也无所谓 */ }
+    if (result.code !== 0) {
+        throw new Error('拆分 PDF 失败（PyMuPDF）：' + (stderr || result.error || ('退出码 ' + String(result.code))) + '。');
+    }
+    let manifest;
+    try {
+        manifest = JSON.parse(readFileSync(join(outDir, 'parts.json'), 'utf8'));
+    } catch (error) {
+        throw new Error('拆分 PDF 失败：没有拿到分片清单（' + String(error?.message ?? error) + '）。');
+    }
+    const parts = Array.isArray(manifest.parts) ? manifest.parts : [];
+    if (parts.length === 0) throw new Error('拆分 PDF 失败：没有产出任何分片。');
+    // 分片必须从第 1 页连续盖到最后一页：中间漏页或重叠时宁可报错，
+    // 也不能让「拆过」的文件悄悄少几页。
+    const totalPages = Number(manifest.pages);
+    let expectFrom = 1;
+    for (const part of parts) {
+        const from = Number(part?.from);
+        const to = Number(part?.to);
+        if (!Number.isInteger(from) || !Number.isInteger(to) || from !== expectFrom || to < from || to > totalPages) {
+            throw new Error('拆分 PDF 失败：分片页范围不连续（期望第 ' + expectFrom + ' 页起）。');
+        }
+        expectFrom = to + 1;
+    }
+    if (expectFrom !== totalPages + 1) {
+        throw new Error('拆分 PDF 失败：只覆盖到第 ' + (expectFrom - 1) + ' 页，共 ' + totalPages + ' 页。');
+    }
+    const maxParts = Math.min(200, Math.max(1, Math.trunc(Number(options.maxParts) || 40)));
+    if (parts.length > maxParts) {
+        throw new Error('这份 PDF 需要拆成 ' + parts.length + ' 份，超过本次上限 ' + maxParts + ' 份；请先手动按章拆开。');
+    }
+    if (cache !== undefined && cache !== null && typeof cache.noteArtifact === 'function') {
+        for (const part of parts) cache.noteArtifact();
+    }
+    return {
+        pages: info.pages,
+        targetBytes,
+        dir: displayPath(env.root, outDir),
+        parts: parts.map((part) => ({
+            file: part.file,
+            path: join(outDir, part.file),
+            displayPath: displayPath(env.root, join(outDir, part.file)),
+            from: part.from,
+            to: part.to,
+            pages: part.pages,
+            bytes: part.bytes,
+            tooLarge: part.tooLarge === true,
+        })),
+        bytes: parts.reduce((sum, part) => sum + (Number(part.bytes) || 0), 0),
+    };
+}
+
 /** 一份 PDF 是不是「图片型」（没有文本层）——反馈里给建议用。 */
 export function isImageOnlyPdf(info) {
     return info !== null && typeof info === 'object' && info.hasTextLayer !== true;

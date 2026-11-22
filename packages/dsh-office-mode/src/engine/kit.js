@@ -6,7 +6,7 @@
  *
  * @module dsh-office-mode/engine/kit
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 export const EMU_PER_PT = 12700;
@@ -259,6 +259,15 @@ export function createEnv(options = {}) {
 
     const resolvePath = (filePath) => (isAbsolute(filePath) ? resolve(filePath) : resolve(root, filePath));
 
+    /** 拿不到（不存在 / 没权限）时返回 undefined —— 与 `env.stat` 同口径，供下面的 sameFile 用。 */
+    const statOrUndefined = (absolute) => {
+        try {
+            return statSync(absolute);
+        } catch {
+            return undefined;
+        }
+    };
+
     const noteRead = (absolute, bytes) => {
         if (readPaths.has(absolute) || reads.length >= READ_TRACK_MAX) return;
         readPaths.add(absolute);
@@ -300,6 +309,85 @@ export function createEnv(options = {}) {
             const bytes = typeof data === 'string' ? Buffer.from(data, 'utf8') : Buffer.from(data);
             writeFileSync(absolute, bytes);
             const entry = { path: displayPath(root, absolute), absolute, bytes: bytes.length };
+            writes.push(entry);
+            return entry;
+        },
+        /**
+         * 两个路径是不是**同一个文件**。
+         *
+         * 只比路径字符串会漏掉两种别名（第五十一轮独立复核打穿的一条）：硬链接与符号链接
+         * 都指向同一个 inode，而 `office.files.move` 到自身的实现是「写目标 + 删源」——
+         * 在别名下就是自毁。三层判据，从严到宽：
+         *   1. `realpathSync` 归一（解开符号链接；任一侧不存在就跳过这层）；
+         *   2. inode + 设备号相同（`ino` / `dev` 为 0 或拿不到时**不判**：Windows 的某些
+         *      文件系统与网络盘不提供，误判成「同一个文件」会挡掉正常的复制）；
+         *   3. 路径字符串相同（Windows 上不区分大小写）。
+         */
+        sameFile(left, right) {
+            const a = resolvePath(left);
+            const b = resolvePath(right);
+            const equals = (x, y) => (process.platform === 'win32' ? x.toLowerCase() === y.toLowerCase() : x === y);
+            if (equals(a, b)) return true;
+            let realA;
+            let realB;
+            try {
+                realA = realpathSync(a);
+                realB = realpathSync(b);
+            } catch {
+                // 目标还不存在（复制到新名字）是最常见的情况：这一层跳过，交给下面两层。
+                realA = undefined;
+                realB = undefined;
+            }
+            if (realA !== undefined && realB !== undefined && equals(realA, realB)) return true;
+            const infoA = statOrUndefined(a);
+            const infoB = statOrUndefined(b);
+            if (infoA === undefined || infoB === undefined) return false;
+            if (!infoA.ino || !infoB.ino || infoA.dev !== infoB.dev) return false;
+            return infoA.ino === infoB.ino;
+        },
+        /**
+         * 整份复制一个文件（**二进制安全**：不经过 utf8，也不 JSON 化）。
+         *
+         * 与 `writeFile` 一样把目标记进 `writes`，所以复制出来的产物照样会被复检、
+         * 进台账。源文件另记一条 `reads` —— 这一份的内容确实来自它（台账的 `source`
+         * 回答的就是「这份产物依据了什么」）。
+         *
+         * 覆盖与否**不在这里判**：调用方（`office.files.copy` 的 overwrite 口径）先拦一道，
+         * 这里只做内核动作。源文件不存在时 `statSync` 抛 ENOENT，由调用方换成可读的报错。
+         */
+        copyFile(fromPath, toPath) {
+            const from = resolvePath(fromPath);
+            const to = resolvePath(toPath);
+            const info = statSync(from);
+            if (!info.isFile()) throw new Error(`${displayPath(root, from)} 不是文件（目录不能整份复制）`);
+            mkdirSync(dirname(to), { recursive: true });
+            copyFileSync(from, to);
+            noteRead(from, info.size);
+            const entry = { path: displayPath(root, to), absolute: to, bytes: info.size };
+            writes.push(entry);
+            return entry;
+        },
+        /**
+         * 移动 / 改名一个文件。同样是二进制安全的内核动作，目标记进 `writes`。
+         *
+         * 源文件**不记 `reads`**：移动之后那个路径已经不存在了，记进去会让台账的
+         * `source` 指向一个查不到的文件（复制与移动在这件事上口径不同，是有意的）。
+         * 跨设备时 `renameSync` 会抛 EXDEV，退回「复制 + 删源」。
+         */
+        moveFile(fromPath, toPath) {
+            const from = resolvePath(fromPath);
+            const to = resolvePath(toPath);
+            const info = statSync(from);
+            if (!info.isFile()) throw new Error(`${displayPath(root, from)} 不是文件（目录不能整份移动）`);
+            mkdirSync(dirname(to), { recursive: true });
+            try {
+                renameSync(from, to);
+            } catch (error) {
+                if (error?.code !== 'EXDEV') throw error;
+                copyFileSync(from, to);
+                rmSync(from, { force: true });
+            }
+            const entry = { path: displayPath(root, to), absolute: to, bytes: info.size };
             writes.push(entry);
             return entry;
         },

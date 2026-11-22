@@ -1,7 +1,7 @@
 /**
  * Excel 格式引擎自测（SPEC §5）。
  *
- * 跑法：`node test/format-excel.mjs`（加 `--keep` 则保留 .office/tmp/excel/ 里的产物，
+ * 跑法：`node test/format-excel.mjs`（加 `--keep` 则保留 .office/runtime/tmp/excel/ 里的产物，
  * 供随后的 COM 校验用；默认跑完即清理，不留垃圾文件）。
  *
  * 期望值都由测试自己按同一口径算出来（或写死的外部常数），不抄引擎的输出 ——
@@ -17,12 +17,18 @@ import { DEFAULT_THEME_ID, resolveTheme } from '../src/engine/theme.js';
 import { create, edit, read } from '../src/formats/excel.js';
 
 const KEEP = process.argv.includes('--keep');
-// 测试中间产物统一落在**仓库根**的 .office/tmp/<suite>/ 下（不再用包内的 test/.tmp）。
+// 测试中间产物统一落在**仓库根**的 .office/runtime/tmp/<suite>/ 下（不再用包内的 test/.tmp）。
 // 只占 excel/ 这个子目录：word / ppt 的自测同时在跑，
-// 清理时也只能删这一个子目录，绝不能 rmSync 整个 .office/tmp（会误伤同伴、也可能撞上占用）。
-const ROOT = fileURLToPath(new URL('../../../.office/tmp/excel/', import.meta.url));
+// 清理时也只能删这一个子目录，绝不能 rmSync 整个 .office/runtime/tmp（会误伤同伴、也可能撞上占用）。
+const ROOT = fileURLToPath(new URL('../../../.office/runtime/tmp/excel/', import.meta.url));
 const SAMPLE = 'excel-full.xlsx';
 const EDITED = 'excel-edited.xlsx';
+// 图片样例：base64 直接写在测试里，不依赖 test/fixtures（自测要能单文件跑）。
+// PNG 120×60、JPEG 80×40 —— 尺寸写死在下面，EMU 期望值由测试自己按 px/96*2.54 算。
+const IMG_PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAHgAAAA8CAIAAAAiz+n/AAAAn0lEQVR4nO3QMQ0AIADAMEANmlCHVFSwqzWwZHOfO/hvBQ2M7hgdMTpidMToiNERoyNGR4yOGB0xOmJ0xOiI0RGjI0ZHjI4YHTE6YnTE6IjREaMjRkeMjhgdMTpidMToiNERoyNGR4yOGB0xOmJ0xOiI0RGjI0ZHjI4YHTE6YnTE6IjREaMjRkeMjhgdMTpidMToiNERoyNGR4yOGD0aDwX0AZqBjjuCAAAAAElFTkSuQmCC';
+const IMG_JPEG_B64 = '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAUDBAQEAwUEBAQFBQUGBwwIBwcHBw8LCwkMEQ8SEhEPERETFhwXExQaFRERGCEYGh0dHx8fExciJCIeJBweHx7/2wBDAQUFBQcGBw4ICA4eFBEUHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh7/wAARCAAoAFADASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwC3RRRX5UfpYUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFAH/9k=';
+const IMAGES = 'excel-images.xlsx';
+const IMAGES_EDITED = 'excel-images-edited.xlsx';
 
 const failures = [];
 let checks = 0;
@@ -185,6 +191,41 @@ function buildStatsSample(env) {
     blank.note('这张表从未调用 table()');
     blank.summary({ at: 1, key: 'A', value: 'B' });          // 没有数据区 → 跳过
     blank.stats('B2:B5', { at: -3 });                        // at 非法 → 回落游标；源区间又没数字
+    return wb;
+}
+
+/**
+ * 造图片能力样例：一张表里图表 + PNG + JPEG + 同图重复 + 缺图 + 不支持格式，
+ * 第二张表再放一张图（验证媒体部件跨表复用、每表仍只挂一个 <drawing>）。
+ */
+function buildImageSample(env) {
+    const png = Buffer.from(IMG_PNG_B64, 'base64');
+    const jpeg = Buffer.from(IMG_JPEG_B64, 'base64');
+    // GIF89a 1×1：能嗅探出格式，但不是 OOXML 该嵌的两种 → 应 warn 跳过
+    const gif = Buffer.from('R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==', 'base64');
+    env.writeFile('assets/chart-demo.png', png);
+    env.writeFile('assets/product.jpeg', jpeg);
+    env.writeFile('assets/broken.gif', gif);
+    const wb = create({ path: IMAGES, title: '图片能力自测' }, env);
+    const first = wb.sheet('图文');
+    first.table({
+        columns: [{ title: '季度' }, { title: '营收' }],
+        rows: [['Q1', 1280], ['Q2', 1530], ['Q3', 1410]],
+    });
+    first.chart({
+        type: 'column',
+        categories: ['Q1', 'Q2', 'Q3'],
+        series: [{ name: '营收', values: [1280, 1530, 1410] }],
+        at: { col: 8, row: 1, toCol: 16, toRow: 15 },
+    });
+    first.image('assets/chart-demo.png', { alt: '趋势图' });                       // 默认锚 A1
+    first.image('assets/product.jpeg', { at: 'E3', alt: '产品照片', name: '产品图' });
+    first.image('assets/chart-demo.png', { at: { col: 6, row: 12 }, widthCm: 6, alt: '趋势图放大' });
+    first.image('assets/missing.png', { at: 'A20' });                              // 读不到 → warn
+    first.image('assets/broken.gif', { at: 'A22' });                               // 非 PNG/JPEG → warn
+    const second = wb.sheet('附图');
+    second.note('与第一张表共用同一份媒体部件');
+    second.image('assets/chart-demo.png', { at: 'C2', alt: '附图缩略图' });
     return wb;
 }
 
@@ -706,6 +747,147 @@ async function main() {
     }
     checkEqual(probeError, '', 'stats/summary 遇到非法输入只记 warning，不抛异常');
 
+    // ⑭ 图片（xl/media + oneCellAnchor）：图表与图片共存、媒体按路径复用、缺图/格式不符只 warn
+    // 期望尺寸由测试自己按 px/96*2.54 算成 EMU，不抄引擎的输出。
+    const EMU_PER_CM = 360000;
+    const emuOf = (px) => Math.round((px / 96) * 2.54 * EMU_PER_CM);
+    const imgWb = buildImageSample(env);
+    const imgReport = imgWb.save();
+    const imgBytes = readFileSync(env.resolve(IMAGES));
+    const imgParts = unzip(imgBytes);
+    const imgTexts = unzipText(imgBytes);
+    const imgNames = [...imgParts.keys()].sort();
+    checkEqual(imgReport.ok, true, 'image: 保存成功');
+    checkEqual(imgReport.parts, 19, 'image: 部件数 19（基座 5 + 媒体 2 + 表1 5 + 表2 4 + docProps 3）');
+
+    // 媒体部件：只认 PNG/JPEG，同一路径全局只存一份（第二张表的 png 复用 image1）
+    const mediaNames = imgNames.filter((name) => name.startsWith('xl/media/'));
+    checkEqual(mediaNames.join(','), 'xl/media/image1.png,xl/media/image2.jpeg',
+        'image: 媒体部件按首次出现编号，同图重复插入只存一份');
+    check(Buffer.from(imgParts.get('xl/media/image1.png')).equals(Buffer.from(IMG_PNG_B64, 'base64')),
+        'image: png 媒体部件是原始字节（没有按文本转码）');
+    check(Buffer.from(imgParts.get('xl/media/image2.jpeg')).equals(Buffer.from(IMG_JPEG_B64, 'base64')),
+        'image: jpeg 媒体部件是原始字节');
+
+    // [Content_Types].xml：图片按扩展名声明 Default（Override 只给 drawing/chart）
+    const imgCt = imgTexts.get('[Content_Types].xml');
+    checkIncludes(imgCt, '<Default Extension="png" ContentType="image/png"/>', 'image: Content_Types 声明 png Default');
+    checkIncludes(imgCt, '<Default Extension="jpeg" ContentType="image/jpeg"/>', 'image: Content_Types 声明 jpeg Default');
+    checkEqual((imgCt.match(/<Default Extension="png"/g) ?? []).length, 1, 'image: png Default 不重复');
+    checkIncludes(imgCt, '<Override PartName="/xl/drawings/drawing1.xml"', 'image: 第一张表的 drawing Override');
+    checkIncludes(imgCt, '<Override PartName="/xl/drawings/drawing2.xml"', 'image: 第二张表的 drawing Override');
+
+    // 一张表一个 drawing：图表用 twoCellAnchor，图片用 oneCellAnchor，互不挤掉
+    const drawing1 = imgTexts.get('xl/drawings/drawing1.xml');
+    const drawing2 = imgTexts.get('xl/drawings/drawing2.xml');
+    checkEqual((drawing1.match(/<xdr:oneCellAnchor>/g) ?? []).length, 3, 'image: drawing1 三个图片锚点');
+    checkEqual((drawing1.match(/<xdr:twoCellAnchor>/g) ?? []).length, 1, 'image: drawing1 一个图表锚点');
+    checkEqual((drawing2.match(/<xdr:oneCellAnchor>/g) ?? []).length, 1, 'image: drawing2 一个图片锚点');
+    checkEqual((drawing2.match(/<xdr:twoCellAnchor>/g) ?? []).length, 0, 'image: drawing2 没有图表锚点');
+
+    // ext 的 EMU：px/96*2.54 cm * 360000；只给 widthCm 时按原图 2:1 等比
+    const extOf = (xml) => [...xml.matchAll(/<xdr:ext cx="(\d+)" cy="(\d+)"\/>/g)]
+        .map((match) => [Number(match[1]), Number(match[2])]);
+    const imgExt = extOf(drawing1);
+    checkEqual(JSON.stringify(imgExt), JSON.stringify([
+        [emuOf(120), emuOf(60)],
+        [emuOf(80), emuOf(40)],
+        [6 * EMU_PER_CM, 3 * EMU_PER_CM],
+    ]), 'image: ext 的 EMU 值（默认尺寸按像素、只给宽度按比例）');
+    checkEqual(imgExt[2][0] / imgExt[2][1], 2, 'image: 只给 widthCm 时保持原图 2:1');
+    checkEqual(JSON.stringify(extOf(drawing2)), JSON.stringify([[emuOf(120), emuOf(60)]]),
+        'image: 第二张表按 png 原始像素给默认尺寸');
+    // widthCm + heightCm 都给 = 拉伸到给定尺寸（不按原图比例）
+    const stretchWb = create({ path: 'excel-images-stretch.xlsx' }, env);
+    stretchWb.sheet('拉伸').image('assets/chart-demo.png', { at: 'B2', widthCm: 4, heightCm: 6 });
+    checkEqual(JSON.stringify(extOf(unzipText(stretchWb.render()).get('xl/drawings/drawing1.xml'))),
+        JSON.stringify([[4 * EMU_PER_CM, 6 * EMU_PER_CM]]),
+        'image: widthCm + heightCm 都给时按给定尺寸拉伸');
+
+    // 锚点：A1 默认、A1 字符串、{col,row} 0 基
+    const fromOf = (xml) => [...xml.matchAll(
+        /<xdr:from><xdr:col>(\d+)<\/xdr:col><xdr:colOff>0<\/xdr:colOff><xdr:row>(\d+)<\/xdr:row><xdr:rowOff>0<\/xdr:rowOff><\/xdr:from>/g,
+    )].map((match) => [Number(match[1]), Number(match[2])]);
+    // drawing1 的第一个锚点是图表（twoCellAnchor，from 8,1），后面才是三张图片
+    checkEqual(JSON.stringify(fromOf(drawing1)), JSON.stringify([[8, 1], [0, 0], [4, 2], [6, 12]]),
+        'image: 图表锚 8,1；图片锚 A1 / E3 / {col:6,row:12}');
+    checkEqual(JSON.stringify(fromOf(drawing2)), JSON.stringify([[2, 1]]), 'image: 第二张表锚在 C2');
+
+    // blipFill r:embed：图表占 rId1，png 占 rId2（两个锚点共用），jpeg 占 rId3
+    const embeds = [...drawing1.matchAll(/r:embed="([^"]+)"/g)].map((match) => match[1]);
+    checkEqual(embeds.join(','), 'rId2,rId3,rId2', 'image: 同图两个锚点共用同一个图片关系');
+    checkIncludes(drawing1, 'descr="产品照片"', 'image: alt 写进 cNvPr descr');
+    checkIncludes(drawing1, 'name="产品图"', 'image: name 写进 cNvPr name');
+    checkIncludes(drawing1, 'descr="趋势图"', 'image: 默认锚点的 alt 也在');
+    checkIncludes(drawing2, 'descr="附图缩略图"', 'image: 第二张表的 alt 也在');
+
+    // drawing rels：图表 + 图片混排，rId 唯一稳定
+    const drawing1Rels = imgTexts.get('xl/drawings/_rels/drawing1.xml.rels');
+    const drawing2Rels = imgTexts.get('xl/drawings/_rels/drawing2.xml.rels');
+    checkEqual((drawing1Rels.match(/<Relationship /g) ?? []).length, 3,
+        'image: drawing1 三条关系（chart + png + jpeg）');
+    checkIncludes(drawing1Rels,
+        'Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"',
+        'image: 图表关系仍从 rId1 起');
+    checkIncludes(drawing1Rels,
+        'Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"',
+        'image: png 关系指向 media/image1.png');
+    checkIncludes(drawing1Rels,
+        'Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image2.jpeg"',
+        'image: jpeg 关系指向 media/image2.jpeg');
+    checkEqual((drawing2Rels.match(/<Relationship /g) ?? []).length, 1,
+        'image: drawing2 一条关系（跨表复用 media1）');
+    checkIncludes(drawing2Rels, 'Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"',
+        'image: drawing2 复用 image1.png');
+
+    // 解析器能读通（结构合法），且锚点顺序是「图表在前、图片按插入顺序」
+    const drawing1Root = parseXml(drawing1).children[0];
+    checkEqual(drawing1Root.name, 'xdr:wsDr', 'image: drawing1 是合法 XML、根为 xdr:wsDr');
+    checkEqual(drawing1Root.children.map((node) => node.name).join(','),
+        'xdr:twoCellAnchor,xdr:oneCellAnchor,xdr:oneCellAnchor,xdr:oneCellAnchor',
+        'image: 锚点顺序 = 一个图表 + 三张图片');
+    const jpegPic = children(drawing1Root, 'xdr:oneCellAnchor').map((node) => descendants(node, 'xdr:pic')[0])[1];
+    checkEqual(attr(descendants(jpegPic, 'xdr:cNvPr')[0], 'descr', ''), '产品照片',
+        'image: descr 属性可被解析读取');
+    checkEqual(drawing1Root.children.filter((node) => node.name === 'xdr:oneCellAnchor').length, 3,
+        'image: 解析后 oneCellAnchor 恰好三个');
+
+    // worksheet：图表与图片共存时也只挂一个 <drawing>，且必须是最后一段
+    const imgSheet1 = imgTexts.get('xl/worksheets/sheet1.xml');
+    const imgSheet2 = imgTexts.get('xl/worksheets/sheet2.xml');
+    checkEqual((imgSheet1.match(/<drawing /g) ?? []).length, 1,
+        'image: 图表+图片共存时 worksheet1 仍只有一个 <drawing>');
+    checkEqual((imgSheet2.match(/<drawing /g) ?? []).length, 1,
+        'image: worksheet2 只有一个 <drawing>');
+    check(imgSheet1.endsWith('<drawing r:id="rId1"/></worksheet>'), 'image: worksheet1 的 drawing 在最后');
+    check(imgSheet2.endsWith('<drawing r:id="rId1"/></worksheet>'), 'image: worksheet2 的 drawing 在最后');
+
+    // 缺图 / 格式不符只 warn，不影响同表其它图片与图表
+    const imgWarnings = imgReport.warnings ?? [];
+    check(imgWarnings.some((line) => line.includes('missing.png') && line.includes('读不到')),
+        'image: 缺图只记 warning');
+    check(imgWarnings.some((line) => line.includes('broken.gif') && line.includes('不是 PNG/JPEG')),
+        'image: 非 PNG/JPEG 只记 warning');
+
+    // read() 行为不变：仍然只统计图表，不把图片算进去
+    const imgBack = read(IMAGES, env);
+    checkEqual(imgBack.ok, true, 'image: read() 仍能读回');
+    checkEqual(imgBack.stats.charts, 1, 'image: read() 的 chart 统计不受图片影响');
+
+    // edit() 原样搬运媒体部件，且重新生成的 Content_Types 不能丢图片 Default
+    copyFileSync(env.resolve(IMAGES), env.resolve(IMAGES_EDITED));
+    const imgEdited = edit(IMAGES_EDITED, [{ sheet: '图文', cell: 'A1', value: '图文' }], env);
+    checkEqual(imgEdited.ok, true, 'image: edit() ok');
+    const imgEditedBytes = readFileSync(env.resolve(IMAGES_EDITED));
+    const imgEditedNames = [...unzip(imgEditedBytes).keys()];
+    check(imgEditedNames.includes('xl/media/image1.png') && imgEditedNames.includes('xl/media/image2.jpeg'),
+        'image: edit 后媒体部件原样保留');
+    const imgEditedTexts = unzipText(imgEditedBytes);
+    checkIncludes(imgEditedTexts.get('[Content_Types].xml'),
+        '<Default Extension="png" ContentType="image/png"/>', 'image: edit 后 png Default 不丢');
+    checkIncludes(imgEditedTexts.get('[Content_Types].xml'),
+        '<Default Extension="jpeg" ContentType="image/jpeg"/>', 'image: edit 后 jpeg Default 不丢');
+
     // ── 6. 打印结果 ────────────────────────────────────────────────────
     console.log('--- 生成报告 ---');
     console.log(`path=${saved.path} bytes=${saved.bytes} theme=${saved.theme} parts=${saved.parts}`);
@@ -728,6 +910,10 @@ async function main() {
     for (const line of statsReport.outline) console.log(`  ${line}`);
     console.log('warnings:');
     for (const line of statsReport.warnings) console.log(`  - ${line}`);
+    console.log('--- 图片 ---');
+    console.log(`path=${imgReport.path} bytes=${imgReport.bytes} parts=${imgReport.parts}`);
+    console.log('warnings:');
+    for (const line of imgReport.warnings) console.log(`  - ${line}`);
 
     if (!KEEP) rmSync(ROOT, { recursive: true, force: true });
     check(KEEP || !env.exists(SAMPLE), '测试产物已清理（--keep 时保留给 COM 校验）');
